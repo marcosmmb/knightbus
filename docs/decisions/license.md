@@ -17,7 +17,7 @@ identifies Apache-2.0 OR ISC OR MIT;
 identifies MIT OR Apache-2.0. These are mutable upstream metadata observations,
 not adopted versions, transitive audits or security approval. Before introduction,
 pin and audit the actual dependency graph, including crypto providers and SDK
-redistribution terms. See [inventory](../../third_party/README.md).
+redistribution terms. See [fuzz dependency inventory](../../crates/knightbus-usbip/tests/fuzz/README.md#test-dependencies).
 
 Both [Moonlight Qt](https://raw.githubusercontent.com/moonlight-stream/moonlight-qt/master/LICENSE)
 and [Sunshine](https://raw.githubusercontent.com/LizardByte/Sunshine/master/LICENSE)

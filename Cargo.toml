@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/knightbus-usbip"]
+exclude = ["crates/knightbus-usbip/tests/fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/marcosmmb/knightbus"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

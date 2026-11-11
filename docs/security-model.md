@@ -2,7 +2,7 @@
 
 This document specifies later implementation. M4 contains no code, listener or
 platform backend. A peer identifier or engine startup must never itself confer
-authority. See [SECURITY](../SECURITY.md).
+authority. The prototype has no production security-support claim.
 
 ## Remote identity and exporter grants
 

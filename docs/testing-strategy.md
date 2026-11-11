@@ -1,8 +1,8 @@
 # Testing strategy
 
-M4 reviews architecture and documentation only. No Cargo workspace, implementation,
-test harness or CI workflow is included. The following checks belong with the
-code they validate; they are not claims of executed tests on this branch.
+M4 reviewed architecture only. M5 now supplies the portable codec, fixtures, fuzz
+targets and CI. [M5 validation](milestone5-validation.md) records executed checks.
+The later rows below remain verification plans, not claims of implemented behavior.
 
 | Milestone | Required verification direction |
 | --- | --- |
@@ -12,10 +12,15 @@ code they validate; they are not claims of executed tests on this branch.
 | M11: security | Authentication, authorization, revocation, malformed traffic, replay, key handling and explicit rejection of downgrade |
 | M12: C/IPC SDK | ABI layout and C/C++ consumers, handle/buffer/callback lifetime, version negotiation, authenticated IPC framing and real-device parity between both hosts |
 
-Introduce CI in M5 with pinned reviewed actions, read-only permissions, finite
+M5 CI uses pinned reviewed actions, read-only permissions, finite
 timeouts and no implicit publication or deployment. Add checks as their code
 arrives. Portable builds must not require USB hardware, privileged capture or
 native driver installation. Record actual compiler and platform versions.
+
+M5's one-off Docker lab exercised stock Linux `vhci_hcd` with a synthetic device,
+including all transfer types and cancellation. Its measured results are retained
+in the validation report; the lab scripts are outside the repository and are not
+part of CI. Keep reusable fixtures and fuzz targets beside the crate tests.
 
 Hardware reports must distinguish generated fixtures, synthetic USB, physical USB
 and native application use. Preserve before/after ownership, OS completion status
@@ -23,4 +28,5 @@ and local recovery. Do not infer successful cleanup from timeout, cleared intern
 counters or driver rematching alone. Keep raw evidence local; committed reports
 can contain sanitized findings and hashes.
 
-[M4 review](milestone4-validation.md) records the scope of this documentation change.
+[M4 review](milestone4-validation.md) records the earlier documentation-only scope;
+[M5 validation](milestone5-validation.md) records the implemented codec checks.

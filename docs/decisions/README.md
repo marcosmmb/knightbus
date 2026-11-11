@@ -16,3 +16,6 @@ not a platform PASS or release approval. Historical gates are in
 | [Dual hosting and service boundaries](dual-mode-hosting.md) | Both required; Service initial default |
 | [macOS backend](macos-backend.md) | Generic USB path selected for continued work; distribution open |
 | [Remaining choices](open-decisions.md) | Explicit deferred decisions and closure milestones |
+
+M5 compiler and test-workspace choices are recorded in
+[language and boundaries](language-and-boundaries.md).

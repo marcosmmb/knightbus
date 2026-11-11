@@ -1,9 +1,10 @@
 # KnightBus architecture
 
-M4 defines an original Rust architecture and control boundaries. This is a
-documentation-only design; no workspace or implementation is included. The
-[measured gates](gate-status.md) remain visible; proceeding with this milestone
-is explicitly authorized in [the scope ADR](decisions/m4-scope.md).
+M4 established the Rust architecture and control boundaries as documentation.
+M5 implements the workspace and [USB/IP codec](protocol-usbip-1.1.1.md); the engine,
+host adapters and native backends below remain designs for later milestones.
+The [measured gates](gate-status.md) and [M4 scope ADR](decisions/m4-scope.md) remain
+in force. Codec tests do not establish native platform feasibility.
 
 ## One engine and its hosts
 
@@ -44,7 +45,7 @@ Rust APIs. Direct and IPC adapters must expose the same engine operations;
 neither may simulate successful authorization or attachment. Review concrete
 interfaces and host parity in M6/M12.
 
-Introduce packages when their implementation arrives. M5 creates the workspace,
+Introduce packages when their implementation arrives. M5 supplies the workspace,
 basic CI and `knightbus-usbip`, a pure specification-derived byte codec. M6 adds exporter/
 importer orchestration and policy to the engine, splitting crates when complexity
 requires it; later transport and platform crates own networking and OS resources.

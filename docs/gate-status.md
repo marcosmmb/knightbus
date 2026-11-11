@@ -67,3 +67,8 @@ release stay gated on measured lifecycle/resource safety, supported privileges,
 Microsoft signing and Apple distribution. No CONDITIONAL production scope has
 been approved. Architecture decisions below choose boundaries without promising
 that unresolved platform support will become available.
+
+M5 adds the portable codec and verification tooling. Its [validation report](milestone5-validation.md)
+records passing portable checks and stock Linux kernel interoperability with an
+original synthetic device, including all transfer types and cancellation. This
+codec proof does not change the product platform gate verdicts above.
