@@ -293,6 +293,38 @@ fn blocking_reads_use_the_full_validated_body_without_overreading() {
 }
 
 #[test]
+fn decoder_capacity_accounts_for_reserved_body_until_handoff() {
+    let limits = Limits::default();
+    let length = limits.transfer_bytes;
+    let mut bytes = fixture("bulk-out");
+    word(&mut bytes, 24, length as u32);
+    bytes.resize(TRANSFER_HEADER_LEN + length, 0);
+
+    let mut decoder = Decoder::new(Context::Requests, limits);
+    assert_eq!(decoder.buffered_len(), 0);
+    assert_eq!(decoder.allocated_capacity(), 0);
+
+    // A header plus one body byte reserves the entire declared 1 MiB body.
+    let prefix = TRANSFER_HEADER_LEN + 1;
+    assert_eq!(decoder.push(&bytes[..prefix]).unwrap(), (prefix, None));
+    assert_eq!(decoder.buffered_len(), prefix);
+    let reserved = decoder.allocated_capacity();
+    assert!(reserved >= length);
+    assert_eq!(decoder.finish(), Err(Error::Incomplete(bytes.len())));
+    assert_eq!(decoder.allocated_capacity(), reserved);
+
+    let (used, message) = decoder.push(&bytes[prefix..]).unwrap();
+    assert_eq!(used, bytes.len() - prefix);
+    let Some(Message::Submit(submit)) = message else {
+        panic!();
+    };
+    assert_eq!(submit.data.capacity(), reserved);
+    assert_eq!(submit.data, bytes[TRANSFER_HEADER_LEN..]);
+    assert_eq!(decoder.buffered_len(), 0);
+    assert_eq!(decoder.allocated_capacity(), 0);
+}
+
+#[test]
 fn streamed_payload_reuses_storage_without_retaining_excess_capacity() {
     struct BodyReader {
         inner: Cursor<Vec<u8>>,

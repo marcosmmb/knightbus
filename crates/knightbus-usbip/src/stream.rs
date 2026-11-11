@@ -105,9 +105,19 @@ impl Decoder {
             Err(Error::Incomplete(self.needed + self.header_len()))
         }
     }
-    /// Current buffered bytes, useful for resource accounting.
+    /// Received frame bytes currently buffered, including any saved header.
+    /// This is not allocated memory: use [`Self::allocated_capacity`] for the
+    /// decoder's heap buffer capacity.
     pub fn buffered_len(&self) -> usize {
         self.bytes.len() + self.header_len()
+    }
+    /// Current heap buffer capacity in bytes, including unused reserved space.
+    /// Excludes the inline decoder/header, allocator overhead, temporary parsing
+    /// allocations and returned messages. Completion releases or transfers the
+    /// buffer; callers must account for returned message allocations separately.
+    /// This reports an existing allocation, not a budget enforced before reserving.
+    pub fn allocated_capacity(&self) -> usize {
+        self.bytes.capacity()
     }
     fn header_len(&self) -> usize {
         if self.transfer_header.is_some() {

@@ -135,6 +135,17 @@ storage. Retained payload capacity may include a bounded amount of unused space.
 Callers must budget actual allocation capacities and outstanding frames/sessions,
 not just logical payload lengths. No unlimited queue is hidden here.
 
+`Decoder::buffered_len()` counts received frame bytes, including the saved header;
+it is not a memory quota metric. `Decoder::allocated_capacity()` reports the heap
+buffer's capacity, including unused reserved space. For example, a 48-byte transfer
+header plus one body byte can reserve a declared 1 MiB body while `buffered_len()`
+reports 49. Capacity excludes the inline decoder/header, allocator overhead,
+temporary parsing allocations and returned messages. After completion the buffer
+is released or transferred, so the caller must account for message allocations
+separately. Capacity reporting observes allocations already made; M6 must enforce
+aggregate admission budgets before allowing reservations, including transient
+parsing storage and completed messages, rather than checking only after `push`.
+
 Fixed strings require a NUL and zero-filled tail, accept non-UTF-8 bytes and never
 read beyond their field. Reserved bytes, version, opcode, phase, direction, endpoint,
 request status, lengths, count consistency and ISO ranges are checked. Unknown speed
