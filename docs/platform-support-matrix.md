@@ -1,14 +1,15 @@
 # Platform support and capability model
 
-**M4 contains documentation only.** No engine, backend or runtime capability API
-is implemented. Future compilation of a workspace, GUI or ABI library will not
-by itself constitute evidence of USB support.
+**M5 implements a portable codec, tested on macOS, Windows and Linux.** No
+engine, backend or runtime capability API is implemented. Compilation and codec
+tests do not by themselves constitute evidence of native USB support. See
+[M5 validation](milestone5-validation.md) for the exact external peer checks.
 
 | Platform / role | Measured feasibility | Product backend / release | Hosting/default |
 | --- | --- | --- | --- |
 | Apple Silicon macOS exporter | PASS for root-captured `046d:c215` control/interrupt-IN primitive and M3 native path; M2 overall UNPROVEN | UNPROVEN: supported privileged service/helper installation, signing/notarization, fault coverage and classes | Service default; actual daemon and Embedded process contexts UNPROVEN |
 | Windows 11 x64 importer | PASS for synthetic/native and real joystick uses; M1 overall UNPROVEN, queues retained | UNPROVEN: framework retirement, production signing, Secure Boot/HVCI, broad transfers | Service default; both hosts still need the same original native driver |
-| Linux exporter/importer | UNPROVEN in KnightBus | Not implemented; stock USB/IP is a future external interoperability peer | Service proposed; Embedded design retained |
+| Linux exporter/importer | M5 codec interoperability PASS with stock Linux importer and synthetic USB device; KnightBus native backend UNPROVEN | Not implemented; external kernel control/bulk/interrupt/ISO and cancellation checks pass within the documented lab scope | Service proposed; Embedded design retained |
 | Windows exporter | UNPROVEN | Not implemented; capture/rebinding and restoration need separate proof | Service proposed |
 | macOS importer | UNPROVEN | Not implemented; native virtual USB path/entitlements unproved | No supported package |
 | Android exporter / other OS roles | UNPROVEN | Not implemented; API leaves room for additional backends | Platform decision deferred |

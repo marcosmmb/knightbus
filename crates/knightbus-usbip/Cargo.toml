@@ -1,0 +1,11 @@
+[package]
+name = "knightbus-usbip"
+description = "Independent, bounded USB/IP 1.1.1 wire codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

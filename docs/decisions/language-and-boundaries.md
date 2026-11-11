@@ -1,10 +1,13 @@
 # ADR: original Rust workspace with inward dependencies
 
-Status: architecture direction accepted; workspace creation deferred to M5.
+Status: accepted; workspace introduced in M5.
 
-Use Rust for the reusable engine and native boundaries. Select the Rust edition,
-minimum compiler, Cargo resolver and lint configuration when introducing the
-workspace, with a lockfile and CI that test the selected versions.
+Use Rust for the reusable engine and native boundaries. M5 selects edition 2024,
+resolver 3 and MSRV/default toolchain 1.85.0, with a committed lockfile. CI checks
+1.85.0 and current stable on Linux/macOS/Windows. Forbid unsafe code; lint public
+API documentation and Clippy warnings. The only product crate uses std alone.
+Fuzzing has its own locked workspace under the crate's `tests/` directory, keeping
+its runtime dependencies out of product builds. CI also runs a Linux fuzz smoke.
 
 Separate portable contracts, the protocol codec, engine, host adapters and native
 backends. Add packages only when their milestone supplies a meaningful behavior
