@@ -3,7 +3,8 @@ use knightbus_usbip::*;
 use std::io::{self, Cursor, Read, Write};
 
 fn fixture(name: &str) -> Vec<u8> {
-    let header = format!("[{name}]\n");
+    // Match the section marker regardless of LF or CRLF checkout line endings.
+    let header = format!("[{name}]");
     let (_, text) = include_str!("fixtures.txt").split_once(&header).unwrap();
     let hex: String = text.split('[').next().unwrap().split_whitespace().collect();
     assert_eq!(hex.len() % 2, 0, "odd hex length in {name}");

@@ -1,5 +1,17 @@
 use crate::*;
 
+// Management opcodes: requests set the high bit; replies clear it.
+const OP_REQ_IMPORT: u16 = 0x8003;
+const OP_REP_IMPORT: u16 = 0x0003;
+const OP_REQ_DEVLIST: u16 = 0x8005;
+const OP_REP_DEVLIST: u16 = 0x0005;
+
+// Transfer commands: submit/cancel a USB transfer and report its completion.
+const USBIP_CMD_SUBMIT: u32 = 1;
+const USBIP_CMD_UNLINK: u32 = 2;
+const USBIP_RET_SUBMIT: u32 = 3;
+const USBIP_RET_UNLINK: u32 = 4;
+
 fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b).ok_or(Error::Limit("size overflow"))
 }
@@ -86,97 +98,111 @@ pub(crate) fn frame_len(
     limits: Limits,
     cursor: &mut FrameCursor,
 ) -> Result<usize, Error> {
-    if context == Context::Management {
-        need(b, 8, limits)?;
-        if u16_at(b, 0) != VERSION {
-            return Err(Error::Invalid("version"));
+    match context {
+        Context::Management => management_frame_len(b, limits, cursor),
+        Context::Requests | Context::Replies(_) => transfer_frame_len(b, context, limits),
+    }
+}
+
+fn management_frame_len(
+    b: &[u8],
+    limits: Limits,
+    cursor: &mut FrameCursor,
+) -> Result<usize, Error> {
+    need(b, 8, limits)?;
+    if u16_at(b, 0) != VERSION {
+        return Err(Error::Invalid("version"));
+    }
+    let status = u32_at(b, 4);
+    match u16_at(b, 2) {
+        OP_REQ_DEVLIST | OP_REQ_IMPORT => {
+            if status != 0 {
+                return Err(Error::Invalid("request status"));
+            }
+            let n = if u16_at(b, 2) == OP_REQ_IMPORT { 40 } else { 8 };
+            need(b, n, limits)?;
+            Ok(n)
         }
-        let status = u32_at(b, 4);
-        match u16_at(b, 2) {
-            0x8005 | 0x8003 => {
-                if status != 0 {
-                    return Err(Error::Invalid("request status"));
-                }
-                let n = if u16_at(b, 2) == 0x8003 { 40 } else { 8 };
-                need(b, n, limits)?;
-                Ok(n)
-            }
-            3 => {
-                let n = if status == 0 { 320 } else { 8 };
-                need(b, n, limits)?;
-                Ok(n)
-            }
-            5 => {
-                if status != 0 {
-                    return Ok(8);
-                }
-                need(b, 12, limits)?;
-                let count = bounded(u32_at(b, 8) as usize, limits.devices, "devices")?;
-                bounded(
-                    add(12, mul(count, 312)?)?,
-                    limits.frame_bytes,
-                    "device records",
-                )?;
-                let mut pos = cursor.list_end.max(12);
-                for _ in cursor.listed_devices..count {
-                    need(b, add(pos, 312)?, limits)?;
-                    let end = add(add(pos, 312)?, mul(b[pos + 311] as usize, 4)?)?;
-                    need(b, end, limits)?;
-                    pos = end;
-                    cursor.list_end = end;
-                    cursor.listed_devices += 1;
-                }
-                Ok(pos)
-            }
-            _ => Err(Error::Invalid("management opcode")),
+        OP_REP_IMPORT => {
+            let n = if status == 0 { 320 } else { 8 };
+            need(b, n, limits)?;
+            Ok(n)
         }
-    } else {
-        need(b, TRANSFER_HEADER_LEN, limits)?;
-        let command = u32_at(b, 0);
-        let reply = matches!(context, Context::Replies(_));
-        if !matches!((command, reply), (1 | 2, false) | (3 | 4, true)) {
-            return Err(Error::Invalid("transfer command or phase"));
-        }
-        let direction = Direction::parse(u32_at(b, 12))?;
-        if u32_at(b, 16) > 15 {
-            return Err(Error::Invalid("endpoint"));
-        }
-        if reply {
-            zero(&b[8..20])?;
-        }
-        if command == 2 || command == 4 {
-            zero(&b[12..20])?;
-            zero(&b[24..48])?;
-            return Ok(48);
-        }
-        let length = transfer_length(u32_at(b, 24), limits)?;
-        let count = packet_count(i32_at(b, 32), limits)?;
-        let payload_len = if reply {
-            zero(&b[40..48])?;
-            let r = context_for(context, u32_at(b, 4), limits)?;
-            if length > r.transfer_buffer_length as usize {
-                return Err(Error::Invalid("completion exceeds request"));
+        OP_REP_DEVLIST => {
+            if status != 0 {
+                return Ok(8);
             }
-            if count != packet_count(r.number_of_packets, limits)? {
-                return Err(Error::Invalid("completion ISO count"));
+            need(b, 12, limits)?;
+            let count = bounded(u32_at(b, 8) as usize, limits.devices, "devices")?;
+            bounded(
+                add(12, mul(count, 312)?)?,
+                limits.frame_bytes,
+                "device records",
+            )?;
+            let mut pos = cursor.list_end.max(12);
+            for _ in cursor.listed_devices..count {
+                need(b, add(pos, 312)?, limits)?;
+                let end = add(add(pos, 312)?, mul(b[pos + 311] as usize, 4)?)?;
+                need(b, end, limits)?;
+                pos = end;
+                cursor.list_end = end;
+                cursor.listed_devices += 1;
             }
-            if i32_at(b, 36) < 0 || u32_at(b, 36) as usize > count {
-                return Err(Error::Invalid("ISO error count"));
-            }
-            if r.direction == Direction::In {
-                length
-            } else {
-                0
-            }
-        } else if direction == Direction::Out {
+            Ok(pos)
+        }
+        _ => Err(Error::Invalid("management opcode")),
+    }
+}
+
+fn transfer_frame_len(b: &[u8], context: Context, limits: Limits) -> Result<usize, Error> {
+    need(b, TRANSFER_HEADER_LEN, limits)?;
+    let command = u32_at(b, 0);
+    let reply = matches!(context, Context::Replies(_));
+    if !matches!(
+        (command, reply),
+        (USBIP_CMD_SUBMIT | USBIP_CMD_UNLINK, false) | (USBIP_RET_SUBMIT | USBIP_RET_UNLINK, true)
+    ) {
+        return Err(Error::Invalid("transfer command or phase"));
+    }
+    let direction = Direction::parse(u32_at(b, 12))?;
+    if u32_at(b, 16) > 15 {
+        return Err(Error::Invalid("endpoint"));
+    }
+    if reply {
+        zero(&b[8..20])?;
+    }
+    if matches!(command, USBIP_CMD_UNLINK | USBIP_RET_UNLINK) {
+        zero(&b[12..20])?;
+        zero(&b[24..48])?;
+        return Ok(48);
+    }
+    let length = transfer_length(u32_at(b, 24), limits)?;
+    let count = packet_count(i32_at(b, 32), limits)?;
+    let payload_len = if reply {
+        zero(&b[40..48])?;
+        let r = context_for(context, u32_at(b, 4), limits)?;
+        if length > r.transfer_buffer_length as usize {
+            return Err(Error::Invalid("completion exceeds request"));
+        }
+        if count != packet_count(r.number_of_packets, limits)? {
+            return Err(Error::Invalid("completion ISO count"));
+        }
+        if i32_at(b, 36) < 0 || u32_at(b, 36) as usize > count {
+            return Err(Error::Invalid("ISO error count"));
+        }
+        if r.direction == Direction::In {
             length
         } else {
             0
-        };
-        let n = add(add(48, payload_len)?, mul(count, 16)?)?;
-        need(b, n, limits)?;
-        Ok(n)
-    }
+        }
+    } else if direction == Direction::Out {
+        length
+    } else {
+        0
+    };
+    let n = add(add(48, payload_len)?, mul(count, 16)?)?;
+    need(b, n, limits)?;
+    Ok(n)
 }
 
 fn device(b: &[u8]) -> Result<Device, Error> {
@@ -235,54 +261,61 @@ fn iso(b: &[u8], capacity: u32, reply_length: Option<u32>) -> Result<Vec<IsoPack
 pub fn decode(bytes: &[u8], context: Context, limits: Limits) -> Result<(Message, usize), Error> {
     let n = frame_len(bytes, context, limits, &mut FrameCursor::default())?;
     let b = &bytes[..n];
-    let message = if context == Context::Management {
-        let status = u32_at(b, 4);
-        match u16_at(b, 2) {
-            0x8005 => Message::DevListRequest,
-            0x8003 => Message::ImportRequest(WireString::parse(&b[8..40])?),
-            3 => Message::ImportReply {
-                status,
-                device: if status == 0 {
-                    Some(Box::new(device(&b[8..320])?))
-                } else {
-                    None
-                },
-            },
-            5 => {
-                let count = if status == 0 {
-                    u32_at(b, 8) as usize
-                } else {
-                    0
-                };
-                let mut devices = reserve(count)?;
-                let mut pos = 12;
-                for _ in 0..count {
-                    let d = device(&b[pos..pos + 312])?;
-                    pos += 312;
-                    let mut interfaces = reserve(d.interfaces as usize)?;
-                    for _ in 0..d.interfaces {
-                        zero(&b[pos + 3..pos + 4])?;
-                        interfaces.push(Interface {
-                            class: b[pos],
-                            subclass: b[pos + 1],
-                            protocol: b[pos + 2],
-                        });
-                        pos += 4;
-                    }
-                    devices.push(ListedDevice {
-                        device: d,
-                        interfaces,
-                    });
-                }
-                Message::DevListReply { status, devices }
-            }
-            _ => unreachable!(),
+    let message = match context {
+        Context::Management => management(b)?,
+        Context::Requests | Context::Replies(_) => {
+            let body = &b[TRANSFER_HEADER_LEN..];
+            transfer(&b[..TRANSFER_HEADER_LEN], body, context, limits, copy)?
         }
-    } else {
-        let body = &b[TRANSFER_HEADER_LEN..];
-        transfer(&b[..TRANSFER_HEADER_LEN], body, context, limits, copy)?
     };
     Ok((message, n))
+}
+
+// Framing has validated the opcode and complete message length.
+fn management(b: &[u8]) -> Result<Message, Error> {
+    let status = u32_at(b, 4);
+    let message = match u16_at(b, 2) {
+        OP_REQ_DEVLIST => Message::DevListRequest,
+        OP_REQ_IMPORT => Message::ImportRequest(WireString::parse(&b[8..40])?),
+        OP_REP_IMPORT => Message::ImportReply {
+            status,
+            device: if status == 0 {
+                Some(Box::new(device(&b[8..320])?))
+            } else {
+                None
+            },
+        },
+        OP_REP_DEVLIST => {
+            let count = if status == 0 {
+                u32_at(b, 8) as usize
+            } else {
+                0
+            };
+            let mut devices = reserve(count)?;
+            let mut pos = 12;
+            for _ in 0..count {
+                let d = device(&b[pos..pos + 312])?;
+                pos += 312;
+                let mut interfaces = reserve(d.interfaces as usize)?;
+                for _ in 0..d.interfaces {
+                    zero(&b[pos + 3..pos + 4])?;
+                    interfaces.push(Interface {
+                        class: b[pos],
+                        subclass: b[pos + 1],
+                        protocol: b[pos + 2],
+                    });
+                    pos += 4;
+                }
+                devices.push(ListedDevice {
+                    device: d,
+                    interfaces,
+                });
+            }
+            Message::DevListReply { status, devices }
+        }
+        _ => unreachable!(),
+    };
+    Ok(message)
 }
 
 // Framing has validated header and body. Parse metadata before assigning data.
@@ -297,7 +330,7 @@ fn transfer(
     let seqnum = u32_at(b, 4);
     let device_id = u32_at(b, 8);
     let message = match u32_at(b, 0) {
-        1 => {
+        USBIP_CMD_SUBMIT => {
             let direction = Direction::parse(u32_at(b, 12))?;
             let length = u32_at(b, 24);
             let payload_len = if direction == Direction::Out {
@@ -323,7 +356,7 @@ fn transfer(
                 iso_packets: packets,
             })
         }
-        3 => {
+        USBIP_RET_SUBMIT => {
             let request = context_for(context, seqnum, limits)?;
             let actual_length = u32_at(b, 24);
             let payload_len = if request.direction == Direction::In {
@@ -347,12 +380,12 @@ fn transfer(
                 iso_packets: packets,
             })
         }
-        2 => Message::Unlink {
+        USBIP_CMD_UNLINK => Message::Unlink {
             seqnum,
             device_id,
             target_seqnum: u32_at(b, 20),
         },
-        4 => Message::ReturnUnlink {
+        USBIP_RET_UNLINK => Message::ReturnUnlink {
             seqnum,
             status: i32_at(b, 20),
         },
@@ -367,6 +400,8 @@ fn set_payload(message: &mut Message, data: Vec<u8>) {
         _ => debug_assert!(data.is_empty()),
     }
 }
+// Unlike borrowed decode(), this takes ownership of the stream's body buffer
+// so its allocation can become the payload. Both paths share transfer().
 pub(crate) fn decode_owned_transfer(
     header: &[u8; TRANSFER_HEADER_LEN],
     mut body: Vec<u8>,
@@ -497,14 +532,14 @@ impl Writer {
     }
     fn message(&mut self, message: &Message, limits: Limits) -> Result<(), Error> {
         match message {
-            Message::DevListRequest => self.management(0x8005, 0)?,
+            Message::DevListRequest => self.management(OP_REQ_DEVLIST, 0)?,
             Message::ImportRequest(id) => {
-                self.management(0x8003, 0)?;
+                self.management(OP_REQ_IMPORT, 0)?;
                 self.put(id.wire())?;
             }
             Message::DevListReply { status, devices } => {
                 bounded(devices.len(), limits.devices, "devices")?;
-                self.management(5, *status)?;
+                self.management(OP_REP_DEVLIST, *status)?;
                 if *status != 0 {
                     if !devices.is_empty() {
                         return Err(Error::Invalid("error reply body"));
@@ -525,7 +560,7 @@ impl Writer {
                 }
             }
             Message::ImportReply { status, device } => {
-                self.management(3, *status)?;
+                self.management(OP_REP_IMPORT, *status)?;
                 match (*status, device) {
                     (0, Some(d)) => self.device(d)?,
                     (0, None) | (_, Some(_)) => return Err(Error::Invalid("import reply body")),
@@ -534,7 +569,13 @@ impl Writer {
             }
             Message::Submit(s) => {
                 transfer_length(s.transfer_buffer_length, limits)?;
-                self.basic(1, s.seqnum, s.device_id, s.direction, s.endpoint)?;
+                self.basic(
+                    USBIP_CMD_SUBMIT,
+                    s.seqnum,
+                    s.device_id,
+                    s.direction,
+                    s.endpoint,
+                )?;
                 self.u32(s.transfer_flags)?;
                 self.u32(s.transfer_buffer_length)?;
                 self.i32(s.start_frame)?;
@@ -571,7 +612,7 @@ impl Writer {
                 if s.error_count as usize > count {
                     return Err(Error::Invalid("ISO error count"));
                 }
-                self.basic(3, s.request.seqnum, 0, Direction::Out, 0)?;
+                self.basic(USBIP_RET_SUBMIT, s.request.seqnum, 0, Direction::Out, 0)?;
                 self.i32(s.status)?;
                 self.u32(s.actual_length)?;
                 self.i32(s.start_frame)?;
@@ -600,12 +641,12 @@ impl Writer {
                 device_id,
                 target_seqnum,
             } => {
-                self.basic(2, *seqnum, *device_id, Direction::Out, 0)?;
+                self.basic(USBIP_CMD_UNLINK, *seqnum, *device_id, Direction::Out, 0)?;
                 self.u32(*target_seqnum)?;
                 self.put(&[0; 24])?;
             }
             Message::ReturnUnlink { seqnum, status } => {
-                self.basic(4, *seqnum, 0, Direction::Out, 0)?;
+                self.basic(USBIP_RET_UNLINK, *seqnum, 0, Direction::Out, 0)?;
                 self.i32(*status)?;
                 self.put(&[0; 24])?;
             }
@@ -621,9 +662,12 @@ pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>, Error> {
         count: 0,
         limit: limits.frame_bytes,
     };
+    // With bytes: None, validate and count without storing output.
     writer.message(message, limits)?;
+    // Allocate the measured size; Some(buffer) enables writing in put().
     writer.bytes = Some(reserve(writer.count)?);
     writer.count = 0;
+    // Repeat the same checks while writing into the reserved buffer.
     writer.message(message, limits)?;
     Ok(writer.bytes.unwrap_or_default())
 }

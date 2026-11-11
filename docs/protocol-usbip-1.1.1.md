@@ -8,8 +8,7 @@ The wire contract comes from the [published Linux USB/IP specification](https://
 The [Linux v6.12 wire-structure declarations](https://github.com/torvalds/linux/blob/v6.12/drivers/usb/usbip/usbip_common.h)
 clarify signed fields and the four ISO descriptor words omitted from that document's
 tables. These are field-layout references, not sources of copied implementation.
-The M0 [independent test plan](research/protocol-interop-test-plan.md) supplies the
-failure cases. No third-party forwarding implementation or fixture was imported.
+No third-party forwarding implementation or fixture was imported.
 
 ## Wire map
 
@@ -55,7 +54,6 @@ are checked against their signed wire domain. Endpoint numbers are 0–15, witho
 a direction bit. Replies encode device, direction and endpoint as zero. UNLINK
 encodes direction/endpoint as zero and has its own sequence distinct from its target.
 Signed statuses are preserved, including cancellation `-104` and too-late `0`.
-The codec represents these outcomes; M6 owns cancellation races and request retirement.
 
 ## Transfer and ISO semantics
 
@@ -142,19 +140,13 @@ header plus one body byte can reserve a declared 1 MiB body while `buffered_len(
 reports 49. Capacity excludes the inline decoder/header, allocator overhead,
 temporary parsing allocations and returned messages. After completion the buffer
 is released or transferred, so the caller must account for message allocations
-separately. Capacity reporting observes allocations already made; M6 must enforce
-aggregate admission budgets before allowing reservations, including transient
-parsing storage and completed messages, rather than checking only after `push`.
+separately.
 
 Fixed strings require a NUL and zero-filled tail, accept non-UTF-8 bytes and never
 read beyond their field. Reserved bytes, version, opcode, phase, direction, endpoint,
 request status, lengths, count consistency and ISO ranges are checked. Unknown speed
 codes, URB flags and signed completion statuses are preserved rather than mis-mapped
 into a host API. Backends must validate supported flags and USB request semantics.
-
-M6 must additionally enforce sequence uniqueness, device identity, endpoint metadata,
-original ISO layout identity, authorization, deadlines and cancel/completion ordering.
-This codec alone cannot validate those session facts or authenticate a remote peer.
 
 ## Verification
 
@@ -181,7 +173,3 @@ both unlink orderings, non-ISO counts `0` and `-1`, and clean detach. USBFS
 cancellation status (`-ENOENT`) differs from wire RET_UNLINK (`-ECONNRESET`);
 the test checked each boundary separately. Wireshark 3.6.2 checked selected headers
 only and has known bodyless-error and `-1` count limitations.
-
-These are recorded experiments with a synthetic device, not physical ISO timing
-or a KnightBus backend. The one-off lab scripts stay outside the repository.
-See [M5 validation](milestone5-validation.md) for measured scope and limitations.

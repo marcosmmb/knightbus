@@ -14,7 +14,8 @@ against fixtures and deterministic noise in the normal offline suite.
 
 ```sh
 rustup toolchain install nightly-2026-05-25 --profile minimal
-cargo +nightly-2026-05-25 install cargo-fuzz --version 0.13.1 --locked
+rustup toolchain install 1.85.0 --profile minimal
+cargo +1.85.0 install cargo-fuzz --version 0.13.1 --locked
 cargo +nightly-2026-05-25 fetch --manifest-path crates/knightbus-usbip/tests/fuzz/Cargo.toml --locked
 cargo test -p knightbus-usbip --locked --offline --test protocol write_fuzz_seeds -- --ignored
 ASAN_OPTIONS=quarantine_size_mb=32 CARGO_NET_OFFLINE=true cargo +nightly-2026-05-25 fuzz run --fuzz-dir crates/knightbus-usbip/tests/fuzz decode -- -max_total_time=45 -max_len=8192 -rss_limit_mb=512
@@ -22,8 +23,10 @@ ASAN_OPTIONS=quarantine_size_mb=32 CARGO_NET_OFFLINE=true cargo +nightly-2026-05
 ```
 
 Linux/macOS x86-64 or AArch64 and a C++ compiler are required. Windows still runs
-the ordinary corpus/mutation tests. The committed fuzz lockfile pins dependencies;
-fetch with `--locked` before running offline because cargo-fuzz 0.13.1 does not
+the ordinary corpus/mutation tests. Build the cargo-fuzz CLI with Rust 1.85.0:
+its locked rustix dependency fails to build on Linux with the pinned nightly.
+Nightly remains required for fuzz target instrumentation. The committed fuzz lockfile
+pins dependencies; fetch with `--locked` before running offline because cargo-fuzz 0.13.1 does not
 accept a `run --locked` switch. CI verifies that running did not change the lock.
 Corpus, coverage, crash artifacts and raw logs stay untracked. Minimize any real
 failure and add an original regression test before changing the codec.
