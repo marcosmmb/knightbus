@@ -1,9 +1,10 @@
-# Shared control contract: design direction
+# Shared control contract
 
 Embedded and Service modes must expose the same logical engine operations through
-`InProcessControl` and `IpcControl`. These are proposed adapter names, not existing
-code. M4 defines the semantics to preserve; M6/M12 review concrete Rust types,
-wire schemas, C headers and tests with their implementations.
+`InProcessControl` and `IpcControl`. M6 implements these Rust adapters and a
+bounded framed Service harness over the same engine. See [M6](milestone6-validation.md)
+for concrete behavior and limits. Production OS-authenticated IPC, the public SDK
+schema and C headers remain M12 work.
 
 ## Operations and authority
 
@@ -30,13 +31,18 @@ snapshot reconciliation rather than blindly replaying attach/grant operations.
 Both adapters must preserve the same stable error meanings: invalid argument or
 state, unsupported operation, unavailable backend, permission denied, not found,
 version mismatch, deadline exceeded, cancellation, resource exhaustion and internal
-failure. Assign and freeze numeric codes with the implementation; M4 reserves no
-code values. Native diagnostics are sanitized metadata, not substitutes for these
+failure. M6 assigns v1 codes 1–12 respectively to invalid, state, unsupported, unavailable,
+denied, not-found, version, deadline, cancelled, exhausted, internal and cleanup.
+The Rust `Error` enum is the source of truth. Native diagnostics are sanitized metadata, not substitutes for these
 errors. Unauthorized requests must not reveal hidden inventory.
 
-Events need subscription sequence, session/generation and typed lifecycle,
+Events use subscription-local sequence numbers, session/generation and typed lifecycle,
 visibility, grant or resynchronization information. Bound events by count and
-aggregate bytes. Overflow/gaps require an authorized snapshot. Dispatch outside
+aggregate bytes. Overflow/gaps require an authorized snapshot. M6 applies quotas per peer across
+connections and reserves administrator slots plus their queue memory. Inventory
+notifications go only to administrators and affected grantees, including revocations.
+Closed session details are best-effort history and may be reclaimed under pressure;
+stale IDs never select a new session. Dispatch outside
 engine locks; slow clients must not block USB completion or cancellation.
 
 ## Local IPC

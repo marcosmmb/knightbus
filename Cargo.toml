@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/knightbus-usbip"]
+members = ["crates/knightbus-usbip", "crates/knightbus-core", "crates/knightbus-embedded", "crates/knightbus-ipc"]
 exclude = ["crates/knightbus-usbip/tests/fuzz"]
 resolver = "3"
 

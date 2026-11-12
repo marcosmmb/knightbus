@@ -1,4 +1,4 @@
-use crate::codec::{FrameCursor, decode_owned_transfer, frame_len};
+use crate::codec::{FrameCursor, decode_owned_transfer, frame_len, reserve_capacity};
 use crate::*;
 use std::io::{self, Read, Write};
 
@@ -33,10 +33,21 @@ impl Decoder {
     /// Consume as little input as needed for one frame; report consumed bytes.
     /// An incomplete frame returns `None`. Reuse after completion is rejected.
     pub fn push(&mut self, input: &[u8]) -> Result<(usize, Option<Message>), Error> {
+        self.push_with_admission(input, &mut |_| Ok(()))
+    }
+    /// Incremental decoding with admission before any frame or parsing allocation.
+    /// Use the same admission owner for the entire decoder. Its charges must cover
+    /// both this decoder and returned messages; do not mix with unadmitted pushes.
+    /// Failed admission poisons the decoder just like malformed input.
+    pub fn push_with_admission(
+        &mut self,
+        input: &[u8],
+        admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+    ) -> Result<(usize, Option<Message>), Error> {
         if self.poisoned || self.done {
             return Err(Error::Poisoned);
         }
-        match self.push_inner(input) {
+        match self.push_inner(input, admit) {
             Ok(result) => Ok(result),
             Err(e) => {
                 self.poisoned = true;
@@ -44,7 +55,11 @@ impl Decoder {
             }
         }
     }
-    fn push_inner(&mut self, input: &[u8]) -> Result<(usize, Option<Message>), Error> {
+    fn push_inner(
+        &mut self,
+        input: &[u8],
+        admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+    ) -> Result<(usize, Option<Message>), Error> {
         let mut used = 0;
         loop {
             if self.bytes.len() < self.needed {
@@ -52,9 +67,7 @@ impl Decoder {
                 if n == 0 {
                     return Ok((used, None));
                 }
-                self.bytes
-                    .try_reserve_exact(self.needed - self.bytes.len())
-                    .map_err(|_| Error::Allocation)?;
+                reserve_capacity(&mut self.bytes, self.needed, admit)?;
                 self.bytes.extend_from_slice(&input[used..used + n]);
                 used += n;
                 if self.bytes.len() < self.needed {
@@ -67,6 +80,7 @@ impl Decoder {
                     std::mem::take(&mut self.bytes),
                     self.context,
                     self.limits,
+                    admit,
                 )?;
                 self.transfer_header = None;
                 self.done = true;
@@ -75,7 +89,8 @@ impl Decoder {
             match frame_len(&self.bytes, self.context, self.limits, &mut self.framing) {
                 Ok(n) => {
                     debug_assert_eq!(n, self.bytes.len());
-                    let (message, _) = decode(&self.bytes, self.context, self.limits)?;
+                    let (message, _) =
+                        decode_with_admission(&self.bytes, self.context, self.limits, admit)?;
                     self.done = true;
                     self.bytes = Vec::new();
                     return Ok((used, Some(message)));

@@ -7,7 +7,7 @@ and Windows x64 importer for a flight joystick.
 
 ## Build and verify
 
-Rust 1.85.0 is the minimum and pinned formatting toolchain. The product crate has
+Rust 1.85.0 is the minimum and pinned formatting toolchain. The product crates have
 no third-party dependencies; after toolchain installation these checks run offline:
 
 ```sh

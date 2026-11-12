@@ -195,6 +195,71 @@ pub struct Submit {
     /// ISO descriptors in wire order.
     pub iso_packets: Vec<IsoPacket>,
 }
+/// Allocation-free SUBMIT metadata, shared by the wire and native transfer paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmitHeader {
+    /// Connection-local request sequence.
+    pub seqnum: u32,
+    /// (bus number << 16) | device number.
+    pub device_id: u32,
+    /// Transfer direction.
+    pub direction: Direction,
+    /// Endpoint number, without direction bit (0..=15).
+    pub endpoint: u32,
+    /// Raw USB/IP URB flags. Backend must validate supported flags separately.
+    pub transfer_flags: u32,
+    /// Requested buffer size, including ISO offset space.
+    pub transfer_buffer_length: u32,
+    /// Scheduling field; signed, including sentinel values used by peers.
+    pub start_frame: i32,
+    /// -1 or 0 for non-ISO; positive descriptor count for ISO.
+    pub number_of_packets: i32,
+    /// Scheduling interval, preserved as a signed wire value.
+    pub interval: i32,
+    /// Opaque USB setup bytes (USB little-endian fields are not swapped).
+    pub setup: [u8; 8],
+}
+impl From<&Submit> for SubmitHeader {
+    fn from(s: &Submit) -> Self {
+        Self {
+            seqnum: s.seqnum,
+            device_id: s.device_id,
+            direction: s.direction,
+            endpoint: s.endpoint,
+            transfer_flags: s.transfer_flags,
+            transfer_buffer_length: s.transfer_buffer_length,
+            start_frame: s.start_frame,
+            number_of_packets: s.number_of_packets,
+            interval: s.interval,
+            setup: s.setup,
+        }
+    }
+}
+impl SubmitHeader {
+    /// Combine metadata with already owned payload/ISO storage without copying.
+    pub fn with_payload(self, data: Vec<u8>, iso_packets: Vec<IsoPacket>) -> Submit {
+        Submit {
+            seqnum: self.seqnum,
+            device_id: self.device_id,
+            direction: self.direction,
+            endpoint: self.endpoint,
+            transfer_flags: self.transfer_flags,
+            transfer_buffer_length: self.transfer_buffer_length,
+            start_frame: self.start_frame,
+            number_of_packets: self.number_of_packets,
+            interval: self.interval,
+            setup: self.setup,
+            data,
+            iso_packets,
+        }
+    }
+}
+impl Submit {
+    /// Split ownership from metadata without cloning any payload or ISO storage.
+    pub fn into_parts(self) -> (SubmitHeader, Vec<u8>, Vec<IsoPacket>) {
+        ((&self).into(), self.data, self.iso_packets)
+    }
+}
 /// Original submit metadata required to frame and bound a completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplyContext {
@@ -209,6 +274,11 @@ pub struct ReplyContext {
 }
 impl From<&Submit> for ReplyContext {
     fn from(s: &Submit) -> Self {
+        Self::from(&SubmitHeader::from(s))
+    }
+}
+impl From<&SubmitHeader> for ReplyContext {
+    fn from(s: &SubmitHeader) -> Self {
         Self {
             seqnum: s.seqnum,
             direction: s.direction,

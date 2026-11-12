@@ -1,0 +1,17 @@
+[package]
+name = "knightbus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+knightbus-usbip = { path = "../knightbus-usbip" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+knightbus-embedded = { path = "../knightbus-embedded" }
+knightbus-ipc = { path = "../knightbus-ipc" }

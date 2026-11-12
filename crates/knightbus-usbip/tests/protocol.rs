@@ -814,3 +814,127 @@ fn fuzz_assertions_run_offline_on_seeds_and_deterministic_noise() {
         fuzz_support::stream_target(&data);
     }
 }
+
+#[test]
+fn admission_covers_all_codec_allocations_and_preserves_wire_results() {
+    let limits = Limits::default();
+    for (name, context) in cases() {
+        let bytes = fixture(name);
+        let expected = decode(&bytes, context, limits).unwrap();
+        let mut allocations = Vec::new();
+        let decoded = decode_with_admission(&bytes, context, limits, &mut |n| {
+            allocations.push(n);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded, expected, "{name}");
+        // Denying any allocation must abort, including later interface/ISO arrays.
+        for fail in 0..allocations.len() {
+            let mut calls = 0;
+            assert!(
+                decode_with_admission(&bytes, context, limits, &mut |_| {
+                    let reject = calls == fail;
+                    calls += 1;
+                    if reject {
+                        Err(Error::Limit("test admission"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err(),
+                "{name}, allocation {fail}"
+            );
+            assert_eq!(calls, fail + 1);
+        }
+        let mut output_bytes = 0;
+        let encoded = encode_with_admission(&decoded.0, limits, &mut |n| {
+            output_bytes += n;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(output_bytes, encoded.capacity());
+        assert_eq!(encoded, bytes);
+        assert!(
+            encode_with_admission(&decoded.0, limits, &mut |_| Err(Error::Limit(
+                "test admission"
+            )))
+            .is_err()
+        );
+        // Streaming admission also covers every framing stage and fallback copy.
+        let mut decoder = Decoder::new(context, limits);
+        let mut allocations = Vec::new();
+        let mut message = None;
+        for byte in &bytes {
+            let (_, m) = decoder
+                .push_with_admission(&[*byte], &mut |n| {
+                    allocations.push(n);
+                    Ok(())
+                })
+                .unwrap();
+            if m.is_some() {
+                message = m;
+            }
+        }
+        assert_eq!(message, Some(expected.0));
+        for fail in 0..allocations.len() {
+            let mut decoder = Decoder::new(context, limits);
+            let mut calls = 0;
+            let mut rejected = false;
+            for byte in &bytes {
+                if decoder
+                    .push_with_admission(&[*byte], &mut |_| {
+                        let reject = calls == fail;
+                        calls += 1;
+                        if reject {
+                            Err(Error::Limit("test admission"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+                {
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "{name}, streaming allocation {fail}");
+            assert_eq!(calls, fail + 1);
+            assert_eq!(decoder.push(&[]), Err(Error::Poisoned));
+        }
+    }
+}
+
+#[test]
+fn admission_rejects_body_before_reserving_it_and_header_split_moves_storage() {
+    let limits = Limits::default();
+    let mut bytes = fixture("bulk-out");
+    word(&mut bytes, 24, 1024 * 1024);
+    let mut decoder = Decoder::new(Context::Requests, limits);
+    decoder
+        .push_with_admission(&bytes[..48], &mut |_| Ok(()))
+        .unwrap();
+    let capacity = decoder.allocated_capacity();
+    assert!(
+        decoder
+            .push_with_admission(&[0], &mut |n| {
+                assert_eq!(n, 1024 * 1024);
+                Err(Error::Limit("aggregate bytes"))
+            })
+            .is_err()
+    );
+    assert_eq!(decoder.allocated_capacity(), capacity);
+    let Message::Submit(submit) = decode(&fixture("iso-out"), Context::Requests, limits)
+        .unwrap()
+        .0
+    else {
+        panic!()
+    };
+    let original = submit.clone();
+    let pointer = submit.data.as_ptr();
+    let iso_pointer = submit.iso_packets.as_ptr();
+    let (header, data, iso) = submit.into_parts();
+    assert_eq!(data.as_ptr(), pointer);
+    assert_eq!(iso.as_ptr(), iso_pointer);
+    assert_eq!(ReplyContext::from(&header), ReplyContext::from(&original));
+    assert_eq!(header.with_payload(data, iso), original);
+}

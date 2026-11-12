@@ -142,6 +142,21 @@ temporary parsing allocations and returned messages. After completion the buffer
 is released or transferred, so the caller must account for message allocations
 separately.
 
+For integrated aggregate budgeting, use `decode_with_admission`,
+`encode_with_admission` and `Decoder::push_with_admission`. Their caller-supplied
+hook approves additional bytes before each requested allocation, including decoded
+ISO/management records and temporary growth storage. Allocation refusal is fatal to
+an incremental decoder. Keep a consistent admission owner throughout decoding and
+retain its charges through returned messages; capacity reporting alone cannot do
+this. Hooks conservatively count temporary/reallocated storage; allocator-reported
+excess is charged before exposure and rejected excess storage is discarded.
+`knightbus-core` supplies the owned `Budget::decoder` / `DecodedMessage` bridge and
+charged encoding buffers without introducing a codec dependency on the engine.
+
+`SubmitHeader` holds allocation-free request metadata. `Submit::into_parts` and
+`SubmitHeader::with_payload` move payload/ISO ownership without copying, while the
+existing `Submit` representation and wire format remain compatible.
+
 Fixed strings require a NUL and zero-filled tail, accept non-UTF-8 bytes and never
 read beyond their field. Reserved bytes, version, opcode, phase, direction, endpoint,
 request status, lengths, count consistency and ISO ranges are checked. Unknown speed

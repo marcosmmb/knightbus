@@ -34,7 +34,18 @@ fn inputs(data: &[u8]) -> Option<(&[u8], Context, Limits)> {
 /// Successful parses must preserve exactly their consumed bytes when encoded.
 pub fn decode_target(data: &[u8]) {
     if let Some((bytes, context, limits)) = inputs(data) {
-        if let Ok((message, consumed)) = decode(bytes, context, limits) {
+        let expected = decode(bytes, context, limits);
+        let mut remaining = usize::from(data[0]) * 128 + usize::from(*data.last().unwrap()) * 64;
+        let admitted = decode_with_admission(bytes, context, limits, &mut |n| {
+            remaining = remaining
+                .checked_sub(n)
+                .ok_or(Error::Limit("fuzz allocation"))?;
+            Ok(())
+        });
+        if admitted != Err(Error::Limit("fuzz allocation")) {
+            assert_eq!(admitted, expected);
+        }
+        if let Ok((message, consumed)) = expected {
             assert!(consumed <= bytes.len());
             assert!(consumed <= limits.frame_bytes);
             let encoded = encode(&message, limits).unwrap();
@@ -52,9 +63,15 @@ pub fn stream_target(data: &[u8]) {
         let expected = decode(bytes, context, limits);
         let mut decoder = Decoder::new(context, limits);
         let mut pos = 0;
+        let mut remaining = usize::from(data[0]) * 128 + usize::from(*data.last().unwrap()) * 64;
         while pos < bytes.len() {
             let end = bytes.len().min(pos + 1 + bytes[pos] as usize % 31);
-            match decoder.push(&bytes[pos..end]) {
+            match decoder.push_with_admission(&bytes[pos..end], &mut |n| {
+                remaining = remaining
+                    .checked_sub(n)
+                    .ok_or(Error::Limit("fuzz allocation"))?;
+                Ok(())
+            }) {
                 Ok((used, Some(message))) => {
                     assert_eq!(expected, Ok((message, pos + used)));
                     assert!(decoder.finish().is_ok());
@@ -65,7 +82,9 @@ pub fn stream_target(data: &[u8]) {
                     pos += used;
                 }
                 Err(error) => {
-                    assert_eq!(expected, Err(error));
+                    if error != Error::Limit("fuzz allocation") {
+                        assert_eq!(expected, Err(error));
+                    }
                     assert_eq!(decoder.push(&[]), Err(Error::Poisoned));
                     return;
                 }

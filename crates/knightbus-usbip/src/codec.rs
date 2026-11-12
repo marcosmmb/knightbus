@@ -71,13 +71,42 @@ fn context_for(c: Context, seqnum: u32, limits: Limits) -> Result<ReplyContext, 
         _ => Err(Error::Context(seqnum)),
     }
 }
-fn reserve<T>(n: usize) -> Result<Vec<T>, Error> {
+// Charge the full new allocation before growth, including the old allocation's
+// possible overlap during reallocation. Admission owners may conservatively keep
+// charges until both decoder and returned message storage have been released.
+pub(crate) fn reserve_capacity<T>(
+    v: &mut Vec<T>,
+    n: usize,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if n > v.capacity() {
+        let size = std::mem::size_of::<T>();
+        admit(n.checked_mul(size).ok_or(Error::Allocation)?)?;
+        v.try_reserve_exact(n - v.len())
+            .map_err(|_| Error::Allocation)?;
+        let extra = (v.capacity() - n)
+            .checked_mul(size)
+            .ok_or(Error::Allocation)?;
+        if extra != 0 {
+            if let Err(error) = admit(extra) {
+                // Do not retain an allocation whose excess capacity was denied.
+                *v = Vec::new();
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+fn reserve<T>(
+    n: usize,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<Vec<T>, Error> {
     let mut v = Vec::new();
-    v.try_reserve_exact(n).map_err(|_| Error::Allocation)?;
+    reserve_capacity(&mut v, n, admit)?;
     Ok(v)
 }
-fn copy(b: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut v = reserve(b.len())?;
+fn copy(b: &[u8], admit: &mut dyn FnMut(usize) -> Result<(), Error>) -> Result<Vec<u8>, Error> {
+    let mut v = reserve(b.len(), admit)?;
     v.extend_from_slice(b);
     Ok(v)
 }
@@ -223,7 +252,12 @@ fn device(b: &[u8]) -> Result<Device, Error> {
         interfaces: b[311],
     })
 }
-fn iso(b: &[u8], capacity: u32, reply_length: Option<u32>) -> Result<Vec<IsoPacket>, Error> {
+fn iso(
+    b: &[u8],
+    capacity: u32,
+    reply_length: Option<u32>,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<Vec<IsoPacket>, Error> {
     let mut sum = 0u32;
     // Validate every descriptor before allocating its representation.
     for p in b.chunks_exact(16) {
@@ -240,7 +274,7 @@ fn iso(b: &[u8], capacity: u32, reply_length: Option<u32>) -> Result<Vec<IsoPack
     if !b.is_empty() && reply_length.is_some_and(|n| n != sum) {
         return Err(Error::Invalid("ISO actual sum"));
     }
-    let mut packets = reserve(b.len() / 16)?;
+    let mut packets = reserve(b.len() / 16, admit)?;
     for p in b.chunks_exact(16) {
         packets.push(IsoPacket {
             offset: u32_at(p, 0),
@@ -259,20 +293,44 @@ fn iso(b: &[u8], capacity: u32, reply_length: Option<u32>) -> Result<Vec<IsoPack
 /// Bytes after the frame are left to the caller. Other errors are fatal to the
 /// connection; do not scan ahead for a plausible header.
 pub fn decode(bytes: &[u8], context: Context, limits: Limits) -> Result<(Message, usize), Error> {
+    decode_with_admission(bytes, context, limits, &mut |_| Ok(()))
+}
+/// Decode with caller-owned aggregate admission. The hook receives additional
+/// allocation bytes before each allocation/growth, including parsing metadata.
+/// Keep its charges alive through all returned storage; failures may also have
+/// allocated storage. Existing input storage is the caller's separate charge.
+/// Requested capacities are admitted first; allocator-reported excess is charged
+/// before exposure. Allocator bookkeeping is not included.
+pub fn decode_with_admission(
+    bytes: &[u8],
+    context: Context,
+    limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<(Message, usize), Error> {
     let n = frame_len(bytes, context, limits, &mut FrameCursor::default())?;
     let b = &bytes[..n];
     let message = match context {
-        Context::Management => management(b)?,
+        Context::Management => management(b, admit)?,
         Context::Requests | Context::Replies(_) => {
             let body = &b[TRANSFER_HEADER_LEN..];
-            transfer(&b[..TRANSFER_HEADER_LEN], body, context, limits, copy)?
+            transfer(
+                &b[..TRANSFER_HEADER_LEN],
+                body,
+                context,
+                limits,
+                copy,
+                admit,
+            )?
         }
     };
     Ok((message, n))
 }
 
 // Framing has validated the opcode and complete message length.
-fn management(b: &[u8]) -> Result<Message, Error> {
+fn management(
+    b: &[u8],
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<Message, Error> {
     let status = u32_at(b, 4);
     let message = match u16_at(b, 2) {
         OP_REQ_DEVLIST => Message::DevListRequest,
@@ -280,7 +338,9 @@ fn management(b: &[u8]) -> Result<Message, Error> {
         OP_REP_IMPORT => Message::ImportReply {
             status,
             device: if status == 0 {
-                Some(Box::new(device(&b[8..320])?))
+                let device = device(&b[8..320])?;
+                admit(std::mem::size_of::<Device>())?;
+                Some(Box::new(device))
             } else {
                 None
             },
@@ -291,12 +351,12 @@ fn management(b: &[u8]) -> Result<Message, Error> {
             } else {
                 0
             };
-            let mut devices = reserve(count)?;
+            let mut devices = reserve(count, admit)?;
             let mut pos = 12;
             for _ in 0..count {
                 let d = device(&b[pos..pos + 312])?;
                 pos += 312;
-                let mut interfaces = reserve(d.interfaces as usize)?;
+                let mut interfaces = reserve(d.interfaces as usize, admit)?;
                 for _ in 0..d.interfaces {
                     zero(&b[pos + 3..pos + 4])?;
                     interfaces.push(Interface {
@@ -325,7 +385,8 @@ fn transfer(
     body: &[u8],
     context: Context,
     limits: Limits,
-    payload: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
+    payload: impl FnOnce(&[u8], &mut dyn FnMut(usize) -> Result<(), Error>) -> Result<Vec<u8>, Error>,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
 ) -> Result<Message, Error> {
     let seqnum = u32_at(b, 4);
     let device_id = u32_at(b, 8);
@@ -338,7 +399,7 @@ fn transfer(
             } else {
                 0
             };
-            let packets = iso(&body[payload_len..], length, None)?;
+            let packets = iso(&body[payload_len..], length, None, admit)?;
             let mut setup = [0; 8];
             setup.copy_from_slice(&b[40..48]);
             Message::Submit(Submit {
@@ -352,7 +413,7 @@ fn transfer(
                 number_of_packets: i32_at(b, 32),
                 interval: i32_at(b, 36),
                 setup,
-                data: payload(&body[..payload_len])?,
+                data: payload(&body[..payload_len], admit)?,
                 iso_packets: packets,
             })
         }
@@ -368,6 +429,7 @@ fn transfer(
                 &body[payload_len..],
                 request.transfer_buffer_length,
                 Some(actual_length),
+                admit,
             )?;
             Message::ReturnSubmit(ReturnSubmit {
                 request,
@@ -376,7 +438,7 @@ fn transfer(
                 start_frame: i32_at(b, 28),
                 number_of_packets: i32_at(b, 32),
                 error_count: u32_at(b, 36),
-                data: payload(&body[..payload_len])?,
+                data: payload(&body[..payload_len], admit)?,
                 iso_packets: packets,
             })
         }
@@ -407,6 +469,7 @@ pub(crate) fn decode_owned_transfer(
     mut body: Vec<u8>,
     context: Context,
     limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
 ) -> Result<Message, Error> {
     if context == Context::Management {
         return Err(Error::Invalid("transfer phase"));
@@ -419,15 +482,22 @@ pub(crate) fn decode_owned_transfer(
         return Err(Error::Invalid("transfer body length"));
     }
     let mut payload_len = 0;
-    let mut message = transfer(header, &body, context, limits, |data| {
-        payload_len = data.len();
-        Ok(Vec::new())
-    })?;
+    let mut message = transfer(
+        header,
+        &body,
+        context,
+        limits,
+        |data, _| {
+            payload_len = data.len();
+            Ok(Vec::new())
+        },
+        admit,
+    )?;
     if payload_len != 0 {
         // Keep ownership for substantial payloads. Copy small/sparse results
         // when unused capacity would exceed 1/8 of their useful payload size.
         let data = if body.capacity() - payload_len > payload_len / 8 {
-            copy(&body[..payload_len])?
+            copy(&body[..payload_len], admit)?
         } else {
             body.truncate(payload_len);
             body
@@ -657,6 +727,15 @@ impl Writer {
 /// Encode a validated message in canonical network order. No partial output is
 /// returned on error. Encoding allocates only after size and semantic validation.
 pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>, Error> {
+    encode_with_admission(message, limits, &mut |_| Ok(()))
+}
+/// Encode with admission before allocating output. Input storage remains charged
+/// separately; the caller must retain the output charge until its Vec is dropped.
+pub fn encode_with_admission(
+    message: &Message,
+    limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<Vec<u8>, Error> {
     let mut writer = Writer {
         bytes: None,
         count: 0,
@@ -665,7 +744,7 @@ pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>, Error> {
     // With bytes: None, validate and count without storing output.
     writer.message(message, limits)?;
     // Allocate the measured size; Some(buffer) enables writing in put().
-    writer.bytes = Some(reserve(writer.count)?);
+    writer.bytes = Some(reserve(writer.count, admit)?);
     writer.count = 0;
     // Repeat the same checks while writing into the reserved buffer.
     writer.message(message, limits)?;

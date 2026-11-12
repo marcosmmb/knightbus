@@ -1,8 +1,10 @@
 # KnightBus architecture
 
 M4 established the Rust architecture and control boundaries as documentation.
-M5 implements the workspace and [USB/IP codec](protocol-usbip-1.1.1.md); the engine,
-host adapters and native backends below remain designs for later milestones.
+M5 implements the workspace and [USB/IP codec](protocol-usbip-1.1.1.md).
+M6 implements the portable engine and initial Embedded/Service mock adapters;
+see [implementation, state machines and validation](milestone6-validation.md).
+Native backends, secure transport and production host deployment remain later work.
 The [measured gates](gate-status.md) and [M4 scope ADR](decisions/m4-scope.md) remain
 in force. Codec tests do not establish native platform feasibility.
 
@@ -40,10 +42,11 @@ USB/driver requirements. See [dual-mode hosting](decisions/dual-mode-hosting.md)
 | `knightbus-ffi` | Core and the shared engine | A second session/policy implementation or borrowed foreign buffers retained implicitly |
 | `knightbusd` | Shared engine/core | A daemon-only protocol implementation |
 
-These names describe intended responsibilities, not existing crates or frozen
-Rust APIs. Direct and IPC adapters must expose the same engine operations;
-neither may simulate successful authorization or attachment. Review concrete
-interfaces and host parity in M6/M12.
+These names describe responsibilities rather than a required crate count. M6 uses
+`knightbus-core` for contracts, exporter/importer lifecycle and policy, plus
+`knightbus-embedded` and `knightbus-ipc` for thin adapters. Both dispatch to the same
+engine; native attachment succeeds only when the injected backend acknowledges it.
+M12 still owns production IPC and foreign ABI stability.
 
 Introduce packages when their implementation arrives. M5 supplies the workspace,
 basic CI and `knightbus-usbip`, a pure specification-derived byte codec. M6 adds exporter/
@@ -90,9 +93,10 @@ not claim distributed atomicity or disturb unrelated devices on rollback.
 
 A lease binds peer identity, connection generation and exporter monotonic expiry.
 Reconnect must establish a new session; old replies/tokens cannot be replayed.
-A future EngineBuilder injects backends, authenticated transport, policy/store,
-clock/runtime and resource limits. Tokens, deadlines and fake clock support are
-M6 work; M4 selects no runtime dependency. A tentative 5-second
+M6's `Engine::new` injects a physical backend, clock, limits and host epoch;
+its `Budget` can also be shared with the importer. The host supplies runtime ticks
+and authenticated caller identity. Transport and persistent policy/store composition
+remain later work; no runtime dependency is selected. A tentative 5-second
 heartbeat/20-second lease and 5-second cleanup budget need measurement; they are
 not wire constants or production guarantees.
 
@@ -105,7 +109,7 @@ consumes completions and detaches. Neither sees TLS private keys or raw unbounde
 network buffers. Endpoint types come from validated descriptors, not SUBMIT alone.
 Capabilities remain per direction/device/context; see [platform matrix](platform-support-matrix.md).
 
-The future session owner serializes completion and cancellation. Backend buffers
+The M6 session owner serializes completion and cancellation. Backend buffers
 stay alive until callbacks retire even if a wire response was already committed.
 Successful unlink suppresses a later target reply; completion-winning races get
 the standard too-late result. Strict generation/sequence accounting rejects
