@@ -1,8 +1,10 @@
 # Security and privilege model
 
-This document specifies later implementation. M4 contains no code, listener or
-platform backend. A peer identifier or engine startup must never itself confer
-authority. The prototype has no production security-support claim.
+M4 established these security requirements. M6 now implements exporter grants,
+lease ownership, budget admission and mock host authority checks; it has no TLS,
+OS-authenticated listener or native backend. A peer identifier or engine startup
+must never itself confer authority. See [M6 boundaries](milestone6-validation.md);
+there is no production security-support claim.
 
 ## Remote identity and exporter grants
 

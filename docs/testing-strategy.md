@@ -2,7 +2,8 @@
 
 M4 reviewed architecture only. M5 now supplies the portable codec, fixtures, fuzz
 targets and CI. [M5 validation](milestone5-validation.md) records executed checks.
-The later rows below remain verification plans, not claims of implemented behavior.
+M6 adds deterministic core and shared host-adapter tests; [M6 validation](milestone6-validation.md)
+records their scope. The platform/security/SDK rows remain verification plans.
 
 | Milestone | Required verification direction |
 | --- | --- |
@@ -30,3 +31,6 @@ can contain sanitized findings and hashes.
 
 [M4 review](milestone4-validation.md) records the earlier documentation-only scope;
 [M5 validation](milestone5-validation.md) records the implemented codec checks.
+
+M6 requires no additional CI job: the existing offline workspace checks include
+all new core and adapter crates, with no new product dependencies.
