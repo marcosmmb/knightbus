@@ -600,6 +600,45 @@ impl Writer {
         }
         Ok(())
     }
+    fn submit(
+        &mut self,
+        s: &SubmitHeader,
+        data: &[u8],
+        packets: &[IsoPacket],
+        limits: Limits,
+    ) -> Result<(), Error> {
+        transfer_length(s.transfer_buffer_length, limits)?;
+        self.basic(
+            USBIP_CMD_SUBMIT,
+            s.seqnum,
+            s.device_id,
+            s.direction,
+            s.endpoint,
+        )?;
+        self.u32(s.transfer_flags)?;
+        self.u32(s.transfer_buffer_length)?;
+        self.i32(s.start_frame)?;
+        self.i32(s.number_of_packets)?;
+        self.i32(s.interval)?;
+        self.put(&s.setup)?;
+        let expected = if s.direction == Direction::Out {
+            s.transfer_buffer_length as usize
+        } else {
+            0
+        };
+        if data.len() != expected {
+            return Err(Error::Invalid("submit payload length"));
+        }
+        self.put(data)?;
+        self.iso(
+            packets,
+            s.number_of_packets,
+            s.transfer_buffer_length,
+            None,
+            limits,
+        )?;
+        Ok(())
+    }
     fn message(&mut self, message: &Message, limits: Limits) -> Result<(), Error> {
         match message {
             Message::DevListRequest => self.management(OP_REQ_DEVLIST, 0)?,
@@ -637,38 +676,7 @@ impl Writer {
                     (_, None) => (),
                 }
             }
-            Message::Submit(s) => {
-                transfer_length(s.transfer_buffer_length, limits)?;
-                self.basic(
-                    USBIP_CMD_SUBMIT,
-                    s.seqnum,
-                    s.device_id,
-                    s.direction,
-                    s.endpoint,
-                )?;
-                self.u32(s.transfer_flags)?;
-                self.u32(s.transfer_buffer_length)?;
-                self.i32(s.start_frame)?;
-                self.i32(s.number_of_packets)?;
-                self.i32(s.interval)?;
-                self.put(&s.setup)?;
-                let expected = if s.direction == Direction::Out {
-                    s.transfer_buffer_length as usize
-                } else {
-                    0
-                };
-                if s.data.len() != expected {
-                    return Err(Error::Invalid("submit payload length"));
-                }
-                self.put(&s.data)?;
-                self.iso(
-                    &s.iso_packets,
-                    s.number_of_packets,
-                    s.transfer_buffer_length,
-                    None,
-                    limits,
-                )?;
-            }
+            Message::Submit(s) => self.submit(&s.into(), &s.data, &s.iso_packets, limits)?,
             Message::ReturnSubmit(s) => {
                 transfer_length(s.request.transfer_buffer_length, limits)?;
                 transfer_length(s.actual_length, limits)?;
@@ -736,17 +744,38 @@ pub fn encode_with_admission(
     limits: Limits,
     admit: &mut dyn FnMut(usize) -> Result<(), Error>,
 ) -> Result<Vec<u8>, Error> {
+    encode_frame(limits, admit, |writer| writer.message(message, limits))
+}
+/// Encode SUBMIT directly from borrowed payload and ISO slices. Validation and
+/// admission match [`encode_with_admission`]; no temporary owned payload is needed.
+/// The caller retains the input storage and the output's allocation charge.
+pub fn encode_submit_with_admission(
+    header: &SubmitHeader,
+    data: &[u8],
+    packets: &[IsoPacket],
+    limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> Result<Vec<u8>, Error> {
+    encode_frame(limits, admit, |writer| {
+        writer.submit(header, data, packets, limits)
+    })
+}
+fn encode_frame(
+    limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+    write: impl Fn(&mut Writer) -> Result<(), Error>,
+) -> Result<Vec<u8>, Error> {
     let mut writer = Writer {
         bytes: None,
         count: 0,
         limit: limits.frame_bytes,
     };
     // With bytes: None, validate and count without storing output.
-    writer.message(message, limits)?;
+    write(&mut writer)?;
     // Allocate the measured size; Some(buffer) enables writing in put().
     writer.bytes = Some(reserve(writer.count, admit)?);
     writer.count = 0;
     // Repeat the same checks while writing into the reserved buffer.
-    writer.message(message, limits)?;
+    write(&mut writer)?;
     Ok(writer.bytes.unwrap_or_default())
 }

@@ -72,3 +72,23 @@ M5 adds the portable codec and verification tooling. Its [validation report](mil
 records passing portable checks and stock Linux kernel interoperability with an
 original synthetic device, including all transfer types and cancellation. This
 codec proof does not change the product platform gate verdicts above.
+
+M7 **passes its agreed fixture-based development scope**. The owner explicitly
+deferred physical-device and sleep/wake qualification for this milestone. The
+original Windows importer and separately built UDE driver pass native CDC,
+composite, HID and WinUSB fixture tests, process/network-loss cleanup and
+independent-owner isolation. Fixed software-controller slots and a kernel-held
+final-destruction event prevent resource reuse while a USB client still holds a
+file, even after importer exit. Measured driver-tagged pool returned to zero
+when the final client closed.
+
+The intermittent network stall was captured in Linux's NCM gadget timer. A
+controlled temporary correction to that test device passed repeated traffic and
+fault checks with KnightBus and stock `usbip_host` unchanged; the stock gadget was
+restored. Endpoint-halt clearing passes native error/reset/recovery checks.
+
+Physical-device, sleep/wake, broader transfer and production-release qualification
+remain separate gates. Physical bus reset is explicitly unsupported. See the
+[M7 findings](research/windows-rust-driver-feasibility.md) for exact scope,
+measurements and unsupported features. These results do not advance production
+platform approval.

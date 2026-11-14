@@ -1,0 +1,24 @@
+[package]
+name = "knightbus-windows-importer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded Windows USB importer and original UDE driver adapter"
+
+[dependencies]
+knightbus-core = { path = "../../knightbus-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Devices_Communication", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_Devices_Enumeration_Pnp", "Win32_Devices_Properties", "Win32_System_Threading", "Win32_System_Registry", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_Kernel"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Devices_Usb", "Wdk_System_Threading"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
