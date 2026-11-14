@@ -24,8 +24,8 @@ fn superspeed_requires_complete_companions_and_bos() {
             bytes: 8192,
             requests: 1,
         });
-        assert!(Descriptors::new(&budget, &DEVICE, &CONFIG, speed).is_err());
-        let d = Descriptors::with_bos(&budget, &DEVICE, &CONFIG, &BOS, speed).unwrap();
+        assert!(Descriptors::new(&budget, &DEVICE, &CONFIG, &[], speed).is_err());
+        let d = Descriptors::new(&budget, &DEVICE, &CONFIG, &BOS, speed).unwrap();
         drop(d);
         assert_eq!(budget.usage().bytes, 0);
         for n in 0..CONFIG.len() {

@@ -4,7 +4,7 @@ Date: 2026-11-10. Status: both modes required and accepted; **Service is the
 initial default** for macOS exporter and Windows importer packaging.
 
 The same `KnightBusEngine` implements policy, sessions and future USB/IP/backends.
-Embedded uses `InProcessControl` through `libknightbus` C ABI. Service hosts that
+Embedded uses `ControlConnection` through `libknightbus` C ABI. Service hosts that
 engine in `knightbusd` and exposes the same operations through `IpcControl` over
 OS-authenticated Unix sockets/named pipes. The CLI, standalone desktop manager
 and C++ streaming integrations consume that control contract. No frontend or

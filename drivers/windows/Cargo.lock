@@ -286,9 +286,21 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "knightbus-windows-driver"
 version = "0.1.0"
 dependencies = [
+ "knightbus-windows-protocol",
  "wdk-build",
  "wdk-panic",
  "wdk-sys",
+]
+
+[[package]]
+name = "knightbus-usb"
+version = "0.1.0"
+
+[[package]]
+name = "knightbus-windows-protocol"
+version = "0.1.0"
+dependencies = [
+ "knightbus-usb",
 ]
 
 [[package]]

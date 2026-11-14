@@ -1,5 +1,14 @@
 [workspace]
-members = ["crates/knightbus-usbip", "crates/knightbus-core", "crates/knightbus-embedded", "crates/knightbus-ipc", "crates/importers/knightbus-windows-importer", "crates/exporters/knightbus-macos-exporter"]
+members = [
+    "crates/knightbus-usbip",
+    "crates/knightbus-usb",
+    "crates/knightbus-core",
+    "crates/knightbus-ipc",
+    "crates/knightbus-transport",
+    "crates/knightbus-windows-protocol",
+    "crates/importers/knightbus-windows-importer",
+    "crates/exporters/knightbus-macos-exporter",
+]
 exclude = ["crates/knightbus-usbip/tests/fuzz", "drivers/windows"]
 resolver = "3"
 

@@ -30,16 +30,11 @@ impl Decoder {
             poisoned: false,
         }
     }
-    /// Consume as little input as needed for one frame; report consumed bytes.
-    /// An incomplete frame returns `None`. Reuse after completion is rejected.
-    pub fn push(&mut self, input: &[u8]) -> Result<(usize, Option<Message>), Error> {
-        self.push_with_admission(input, &mut |_| Ok(()))
-    }
     /// Incremental decoding with admission before any frame or parsing allocation.
     /// Use the same admission owner for the entire decoder. Its charges must cover
-    /// both this decoder and returned messages; do not mix with unadmitted pushes.
+    /// both this decoder and returned messages.
     /// Failed admission poisons the decoder just like malformed input.
-    pub fn push_with_admission(
+    pub fn push(
         &mut self,
         input: &[u8],
         admit: &mut dyn FnMut(usize) -> Result<(), Error>,
@@ -89,8 +84,7 @@ impl Decoder {
             match frame_len(&self.bytes, self.context, self.limits, &mut self.framing) {
                 Ok(n) => {
                     debug_assert_eq!(n, self.bytes.len());
-                    let (message, _) =
-                        decode_with_admission(&self.bytes, self.context, self.limits, admit)?;
+                    let (message, _) = decode(&self.bytes, self.context, self.limits, admit)?;
                     self.done = true;
                     self.bytes = Vec::new();
                     return Ok((used, Some(message)));
@@ -155,18 +149,16 @@ pub fn read_message(
     reader: &mut impl Read,
     context: Context,
     limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
 ) -> io::Result<Option<Message>> {
     let mut decoder = Decoder::new(context, limits);
     loop {
-        let (_, message) = decoder.push(&[]).map_err(io_error)?;
+        let (_, message) = decoder.push(&[], admit).map_err(io_error)?;
         if message.is_some() {
             return Ok(message);
         }
         let mut filled = decoder.bytes.len();
-        decoder
-            .bytes
-            .try_reserve_exact(decoder.needed - filled)
-            .map_err(|_| io_error(Error::Allocation))?;
+        reserve_capacity(&mut decoder.bytes, decoder.needed, admit).map_err(io_error)?;
         // Initialize once per framing stage, then fill the remaining slice on
         // short reads. No scratch copy or repeated zeroing of an unread tail.
         decoder.bytes.resize(decoder.needed, 0);
@@ -190,6 +182,11 @@ pub fn read_message(
 /// Does not flush. After an I/O error a prefix may have been written: close the
 /// stream rather than retrying the whole message. Nonblocking callers should
 /// use [`encode`] and track their own write offset.
-pub fn write_message(writer: &mut impl Write, message: &Message, limits: Limits) -> io::Result<()> {
-    writer.write_all(&encode(message, limits).map_err(io_error)?)
+pub fn write_message(
+    writer: &mut impl Write,
+    message: &Message,
+    limits: Limits,
+    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
+) -> io::Result<()> {
+    writer.write_all(&encode(message, limits, admit).map_err(io_error)?)
 }

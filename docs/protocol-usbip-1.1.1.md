@@ -142,8 +142,8 @@ temporary parsing allocations and returned messages. After completion the buffer
 is released or transferred, so the caller must account for message allocations
 separately.
 
-For integrated aggregate budgeting, use `decode_with_admission`,
-`encode_with_admission` and `Decoder::push_with_admission`. Their caller-supplied
+`encode`, `decode`, `Decoder::push`, and the blocking stream helpers require
+explicit allocation admission. Their caller-supplied
 hook approves additional bytes before each requested allocation, including decoded
 ISO/management records and temporary growth storage. Allocation refusal is fatal to
 an incremental decoder. Keep a consistent admission owner throughout decoding and

@@ -1,5 +1,15 @@
 # macOS crash investigation and recovery
 
+The tools live in the gitignored repository-root `lab/` directory and are
+absent from a fresh clone. `lab/Cargo.toml` depends directly on the actual
+exporter and core crates. Run the commands below from the repository root;
+there are no instrumented source copies or alternate workspaces.
+
+The current recorder logs harness actions only. It does not record individual
+IOUSBHost calls or native callbacks inside the exporter. Historical M8 records
+used finer native instrumentation that has since been removed; those results
+remain historical evidence, not a claim about the current recorder's coverage.
+
 The owner explicitly authorized continued M8 hardware investigation after the
 2026-11-13 panic, including further crashes, with durable evidence as a prerequisite.
 This authorizes diagnostic capture; it does not establish product support or
@@ -15,8 +25,8 @@ prepared artifacts, with a fresh run directory for every trial.
 
 ## Evidence before the first USB operation
 
-`tests/crash_lab.py prepare` creates a private directory under
-`/Users/marcos/Documents/KnightBusLab/`, never `/tmp`. It records:
+`lab/macos/crash_lab.py prepare` creates a private directory under
+`lab/evidence/`. It records:
 
 - The exact executable, SHA-256 and Mach-O UUID, a complete dSYM produced before
   subsequent builds can replace debug-map objects, and a source archive including
@@ -26,20 +36,18 @@ prepared artifacts, with a fresh run directory for every trial.
 - The exact test case/arguments, selected physical port and remote evidence path.
   No USB payloads or serial-string descriptors are logged. Local registry snapshots
   filter serial/signature properties. Kernel/panic logs can contain system information
-  and stay in the private lab directory, outside the repository.
+  and stay in the gitignored private lab directory.
 
 Those artifacts are copied to Linux at `/var/tmp/knightbus-m8/RUN_ID/` over SSH;
 executable, source, dSYM, script and kernel archive hashes are checked remotely.
 The recorder binds only Linux loopback. An SSH Unix-socket forward and a random
 per-run token authenticate the record stream. It is not an unauthenticated LAN service.
 
-Each native operation's BEGIN record contains a local wall/monotonic timestamp,
-process/thread, operation/cycle and physical generation. Rust writes and `fsync`s
-the local record, uses Apple's `F_FULLFSYNC`, then waits for the Linux sink to
-`fsync` its copy and acknowledge that sequence. Only then does the operation start.
-Return/callback and teardown records retain results and IOReturn codes. New work
-is refused after recording failure; necessary cleanup still runs with best-effort
-records. Kernel USB/HID log streaming is separately saved and mirrored, with a
+Each recorded harness action includes timestamps and its operation/cycle.
+The harness flushes BEGIN records locally, mirrors them over the authenticated
+connection, and waits for a durable ACK before continuing. This gives coarse
+trial boundaries; it does not identify every internal OS call or callback.
+Kernel USB/HID log streaming is separately saved and mirrored, with a
 32 MiB local limit and explicit truncation/error markers. New prepared trials
 also require the kernel stream's startup banner to be persisted locally and
 remotely before starting the USB child; a missing banner or failed recorder
@@ -53,16 +61,15 @@ limited to this opt-in lab path, consistent with Apple's
 
 ## Preparation and one supervised trial
 
-Use a fresh target directory for this investigation. The initial default-target
-`cargo check` reused stale core metadata despite updated source; rebuilding under
-`target/m8-instrumented` resolved that build-cache inconsistency.
+Build the standalone lab binary against the current product crates:
 
 ```sh
-cargo build -p knightbus-macos-exporter --target-dir target/m8-instrumented
-PYTHONDONTWRITEBYTECODE=1 KNIGHTBUS_M8_TEST_BINARY="$PWD/target/m8-instrumented/debug/knightbus-macos-exporter" python3 crates/exporters/knightbus-macos-exporter/tests/test_crash_lab.py -v
-python3 crates/exporters/knightbus-macos-exporter/tests/crash_lab.py prepare \
-  --repo "$PWD" --binary "$PWD/target/m8-instrumented/debug/knightbus-macos-exporter" \
-  --evidence /Users/marcos/Documents/KnightBusLab \
+cargo build --manifest-path lab/Cargo.toml --bin qualification --locked --offline
+PYTHONDONTWRITEBYTECODE=1 KNIGHTBUS_LAB_BINARY="$PWD/lab/target/debug/qualification" \
+  python3 -m unittest discover -s lab/macos -p 'test_*lab.py' -v
+python3 lab/macos/crash_lab.py prepare \
+  --repo "$PWD" --binary "$PWD/lab/target/debug/qualification" \
+  --evidence "$PWD/lab/evidence" \
   --remote root@192.168.88.242 --case capture-worker
 ```
 
@@ -78,17 +85,17 @@ reset the device explicitly, or install a daemon. Descriptor reads are still
 required for inventory and claim validation. `engine-one` is a separate single
 engine cycle including the existing standard control/configuration checks.
 `engine-three` repeats that cycle three times to investigate recapture after
-release/rematching. Every cycle and native operation is journaled; the run stops
+release/rematching. Cycle boundaries are journaled; the run stops
 on the first error. It is a separate prepared trial after reviewing the single-cycle
 evidence. Do not combine later cases into an unobserved long batch.
 `engine-ten` repeats ten engine cycles, matching the cycle count of the original
-failed batch while retaining the new per-operation instrumentation. It excludes
+failed batch with harness-level recording. It excludes
 the old batch's reset, process-kill and daemon stages. A passing result still
 does not resolve the effect of instrumentation on the original panic's timing.
 `original-prefix` adds the old batch's ordinary root interface-claim diagnostic
 immediately before those ten engine cycles. This tests the effect of that
 preceding open/claim/release sequence; it still excludes later reset, process-kill
-and daemon stages and records each operation.
+and daemon stages and records harness boundaries.
 
 `native-faults` checks a reserved-descriptor request returning STALL, a subsequent
 valid descriptor read, CLEAR_FEATURE(ENDPOINT_HALT) on the healthy `0x81` pipe,
@@ -120,8 +127,7 @@ Read `RECOVERY.txt` in the prepared directory. The collector performs no USB
 opens or captures:
 
 ```sh
-python3 /Users/marcos/Documents/KnightBusLab/RUN_ID/crash_lab.py collect \
-  /Users/marcos/Documents/KnightBusLab/RUN_ID
+python3 lab/evidence/RUN_ID/crash_lab.py collect lab/evidence/RUN_ID
 ```
 
 It preserves new panic/reset/process reports, hashes them, records the new boot
@@ -131,8 +137,8 @@ log tails back to Linux with SHA-256 verification, retaining the original live
 mirror unchanged. Older archived collectors lack this additional copy; run the
 current repository's `crash_lab.py collect RUN_DIRECTORY` when needed. The
 collector's script hash is saved alongside the recovery evidence. This can
-preserve a final locally flushed callback interrupted before its remote ACK;
-it does not retroactively mark that callback as live-acknowledged.
+preserve a final locally flushed harness record interrupted before its remote ACK;
+it does not retroactively mark that record as live-acknowledged.
 If the SSH agent was cleared, unlock the existing key in Terminal with
 `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` and rerun collection. Permission,
 network and retention failures are recorded instead of silently omitting evidence.
@@ -140,7 +146,7 @@ Root-only unified-log archives or further `sysdiagnose` collection can be added
 to the same run if the ordinary collector reports insufficient access.
 
 Find the final BEGIN lacking an END in both journals; correlate its cycle,
-registry ID and native API with the panic's thread stacks. Use the archived
+recorded action with the panic's thread stacks. Use the archived
 executable/dSYM and kernel UUID, not the latest build, for symbolication.
 Preserve failed runs unchanged before testing any proposed fix.
 

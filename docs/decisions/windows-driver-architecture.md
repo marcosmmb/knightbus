@@ -66,12 +66,10 @@ These choices follow [Microsoft's UDE requirements](https://learn.microsoft.com/
 owned requests, drains accepted configuration forwards, calls that DDI once, then
 waits finitely for owned endpoint queues within the same deadline.
 No callback accesses a consumed handle. A timeout quarantines the controller.
-Owner exit uses the same drain path. Independent controller instances can be
-selected explicitly by native instance ID; a two-controller native fixture test passes isolation and owner-exit cleanup.
-The normal installer stages the driver package. The common Rust backend creates
-and owns a controller for each attachment; explicit preinstalled-controller access
-is retained only for diagnostic tests. This does not qualify all multi-device
-hardware/power behavior.
+Owner exit uses the same drain path. The backend creates and owns a controller
+for each attachment after its driver package has been staged. Earlier lab tests
+covered two-controller isolation and owner-exit cleanup. Preinstalled-controller access was removed. Development packaging helpers
+live under the gitignored `lab/windows/` directory and use the real driver build. This does not qualify all multi-device hardware/power behavior.
 
 ## Deliberate limits and open work
 

@@ -1,4 +1,4 @@
-//! KnightBus original KMDF/UdeCx controller. Production qualification is gated.
+//! KnightBus KMDF/UdeCx virtual USB controller.
 //!
 //! Contracts: Microsoft's UDE controller DDIs and the measured WDK 28000 UDE 1.1
 //! table ABI. Table entries are not ordinary exported functions. The official
@@ -13,13 +13,11 @@ use core::{mem, ptr};
 use wdk_sys::{call_unsafe_wdf_function_binding, *};
 
 mod channel;
-#[path = "../../../crates/importers/knightbus-windows-importer/src/descriptors.rs"]
-mod descriptors;
 mod filter;
 mod lifetime;
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-compile_error!("Only the measured Windows x64 ABI is supported by this experiment");
+compile_error!("This driver requires the Windows x64 WDK ABI");
 
 // Official OS interface identifier, not an upstream forwarding project's ID.
 const HOST_CONTROLLER_INTERFACE: GUID = GUID {
@@ -32,57 +30,6 @@ const HOST_CONTROLLER_INTERFACE: GUID = GUID {
 const fn structure_size<T>() -> ULONG {
     assert!(mem::size_of::<T>() <= ULONG::MAX as usize);
     mem::size_of::<T>() as ULONG
-}
-
-/// Fixed numeric lab events only; never log pointers or USB/device payloads.
-///
-/// # Safety
-/// Called only inside live DriverEntry/device-add callbacks at PASSIVE_LEVEL,
-/// with that callback's live OS driver object.
-unsafe fn trace_stage(driver: PDRIVER_OBJECT, stage: ULONG, status: NTSTATUS) {
-    // SAFETY: Trusted static ASCII format, two Windows unsigned-long arguments,
-    // no retained buffers or user-controlled format. DbgPrintEx permits this
-    // callback IRQL. The generated SDK supplies the component ID and ABI.
-    unsafe {
-        wdk_sys::ntddk::DbgPrintEx(
-            _DPFLTR_TYPE::DPFLTR_IHVDRIVER_ID as ULONG,
-            3,
-            c"KnightBus stage=%lu status=0x%08lx\n".as_ptr(),
-            stage,
-            status as ULONG,
-        );
-    }
-    // A local debugger can miss print-buffer data around a failed load. This
-    // original lab diagnostic uses a customer-defined informational event code,
-    // fixed stage marker and status only. It needs no message-resource DLL;
-    // Event Viewer may show an unresolved description, so retain numeric data.
-    let bytes = mem::size_of::<IO_ERROR_LOG_PACKET>() + mem::size_of::<ULONG>();
-    if driver.is_null() || bytes > 128 {
-        return;
-    }
-    // SAFETY: Live callback-owned driver object; conservative 128-byte lab cap
-    // is within the WDK error-log entry limit and fits the UCHAR size argument.
-    let entry = unsafe { wdk_sys::ntddk::IoAllocateErrorLogEntry(driver.cast(), bytes as UCHAR) };
-    if entry.is_null() {
-        return; // Logging allocation failure must not affect driver operation.
-    }
-    // SAFETY: I/O manager provides aligned storage of the requested size. The
-    // C POD header is zero-valid. Extra ULONG storage accommodates DumpData's
-    // first element independently of bindgen's trailing-array representation.
-    // IoWriteErrorLogEntry consumes this allocation; never access it afterward.
-    unsafe {
-        ptr::write_bytes(entry.cast::<u8>(), 0, bytes);
-        let packet = entry.cast::<IO_ERROR_LOG_PACKET>();
-        (*packet).ErrorCode = 0x6000_004b_u32 as NTSTATUS;
-        (*packet).UniqueErrorValue = 0x4b42_0000 | stage;
-        (*packet).FinalStatus = status;
-        (*packet).SequenceNumber = stage;
-        (*packet).DumpDataSize = mem::size_of::<ULONG>() as USHORT;
-        ptr::addr_of_mut!((*packet).DumpData)
-            .cast::<ULONG>()
-            .write(status as ULONG);
-        wdk_sys::ntddk::IoWriteErrorLogEntry(entry);
-    }
 }
 
 /// Callback-scoped access to the SDK-owned table. Never cached across unload.
@@ -169,9 +116,6 @@ pub unsafe extern "system" fn driver_entry(
     if driver.is_null() || registry.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: OS driver object remains valid throughout DriverEntry, even if
-    // framework creation later fails. Stage zero precedes the first WDF call.
-    unsafe { trace_stage(driver, 0, STATUS_SUCCESS) };
     let mut config = WDF_DRIVER_CONFIG {
         Size: structure_size::<WDF_DRIVER_CONFIG>(),
         EvtDriverDeviceAdd: Some(device_add),
@@ -190,8 +134,6 @@ pub unsafe extern "system" fn driver_entry(
             &mut framework_driver,
         )
     };
-    // SAFETY: DriverEntry is still live at PASSIVE_LEVEL, regardless of status.
-    unsafe { trace_stage(driver, 1, status) };
     if status < 0 {
         status
     } else {
@@ -199,7 +141,7 @@ pub unsafe extern "system" fn driver_entry(
     }
 }
 
-unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTATUS {
+unsafe extern "C" fn device_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTATUS {
     if init.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -210,14 +152,8 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
         Ok(id) => id,
         Err(status) => return status,
     };
-    // SAFETY: The framework holds this driver alive for the device-add callback;
-    // retrieve its WDM object only for synchronous diagnostic calls below.
-    let driver_object =
-        unsafe { call_unsafe_wdf_function_binding!(WdfDriverWdmGetDriverObject, driver) };
     // SAFETY: Framework invokes device-add at PASSIVE_LEVEL with a live init.
     let status = unsafe { initialize_ude(init) };
-    // SAFETY: Live device-add callback remains at PASSIVE_LEVEL.
-    unsafe { trace_stage(driver_object, 2, status) };
     if status < 0 {
         return status;
     }
@@ -245,7 +181,7 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
         Buffer: acl_buffer.as_mut_ptr(),
     };
     // SAFETY: Fixed, bounded UTF-16 ACL remains live through this synchronous
-    // copy. Only SYSTEM/Administrators get lab access; this is not service policy.
+    // copy. Only SYSTEM and Administrators can open the private interface.
     let status =
         unsafe { call_unsafe_wdf_function_binding!(WdfDeviceInitAssignSDDLString, init, &acl) };
     if status < 0 {
@@ -267,13 +203,11 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfDeviceCreate, &mut init, &mut attributes, &mut device)
     };
-    // SAFETY: Device creation returned within the live passive callback.
-    unsafe { trace_stage(driver_object, 3, status) };
     if status < 0 {
         return status;
     }
     // Bind the kernel-held retirement event before a virtual hub/client can
-    // retain this controller. The legacy diagnostic ROOT path has no event.
+    // retain this controller.
     let status = unsafe { channel::bind_retirement(device, &instance) };
     if status < 0 {
         return status;
@@ -290,8 +224,6 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
     };
     // SAFETY: FDO exists, UDE init preceded creation, config/callbacks are valid.
     let status = unsafe { add_emulation(device, &mut config) };
-    // SAFETY: Still within the live passive callback; no payload is logged.
-    unsafe { trace_stage(driver_object, 4, status) };
     if status < 0 {
         return status;
     }
@@ -321,8 +253,6 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
             ptr::null_mut()
         )
     };
-    // SAFETY: Still within the live passive callback.
-    unsafe { trace_stage(driver_object, 5, status) };
     if status < 0 {
         return status;
     }
@@ -336,14 +266,11 @@ unsafe extern "C" fn device_add(driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) ->
             ptr::null()
         )
     };
-    // SAFETY: Interface creation returned within the live passive callback.
-    unsafe { trace_stage(driver_object, 6, status) };
     if status < 0 {
         return status;
     }
     // SAFETY: Live initialized controller, before exposing any synthetic child.
     let status = unsafe { channel::initialize(device) };
-    unsafe { trace_stage(driver_object, 7, status) };
     if status < 0 {
         status
     } else {

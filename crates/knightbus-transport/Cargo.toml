@@ -1,0 +1,14 @@
+[package]
+name = "knightbus-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded USB/IP TCP framing for importers and exporters"
+
+[dependencies]
+knightbus-core = { path = "../knightbus-core" }
+mio = { version = "=1.2.2", default-features = false, features = ["os-poll", "net"] }
+
+[lints]
+workspace = true

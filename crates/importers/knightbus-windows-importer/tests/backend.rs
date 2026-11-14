@@ -1,11 +1,11 @@
 //! Native ownership, bounded admission and independent descriptor validation.
 use knightbus_core::{
-    Budget, Completion, Device, DeviceId, DeviceKey, Error, ImporterBackend, ResourceLimits,
-    SessionId, usbip,
+    Budget, Completion, DescriptorSet as Descriptors, Device, DeviceId, DeviceKey, Error,
+    ImporterBackend, ResourceLimits, SessionId, usbip,
 };
 use knightbus_windows_importer::{
-    backend::{Backend, Driver},
-    channel::{Descriptors, MAX_TRANSFER, SLOTS},
+    backend::{self, Driver},
+    channel::{MAX_TRANSFER, SLOTS},
     descriptors::{Speed, validate},
 };
 use std::{
@@ -17,6 +17,15 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
+struct HostWake(std::sync::atomic::AtomicUsize);
+impl std::task::Wake for HostWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
 const DEVICE: [u8; 18] = [18, 1, 0, 2, 0, 0, 0, 64, 0x09, 0x12, 1, 0, 0, 1, 0, 0, 0, 1];
 const CONFIG: [u8; 32] = [
     9, 2, 32, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 2, 2, 64, 0, 0, 7, 5, 0x82,
@@ -66,6 +75,7 @@ fn wait(mut condition: impl FnMut() -> bool) {
 }
 #[derive(Default)]
 struct Lab {
+    wake: Option<Arc<knightbus_windows_importer::DriverWake>>,
     requests: VecDeque<Vec<u8>>,
     active: [u64; SLOTS],
     replies: Vec<Vec<u8>>,
@@ -75,6 +85,17 @@ struct Lab {
     snapshots: usize,
     fetches: Vec<(usize, u8)>,
     repeat: bool,
+}
+impl Lab {
+    fn notify(&self) {
+        if let Some(wake) = &self.wake {
+            wake.notify();
+        }
+    }
+    fn push(&mut self, request: Vec<u8>) {
+        self.requests.push_back(request);
+        self.notify();
+    }
 }
 struct Mock {
     lab: Arc<Mutex<Lab>>,
@@ -90,6 +111,14 @@ fn mock_slot(endpoint: u8) -> usize {
     }
 }
 impl Driver for Mock {
+    fn notifications(
+        &mut self,
+        wake: Arc<knightbus_windows_importer::DriverWake>,
+    ) -> knightbus_core::Result<()> {
+        wake.notify();
+        self.lab.lock().unwrap().wake = Some(wake);
+        Ok(())
+    }
     fn attach(&mut self, b: &[u8]) -> knightbus_core::Result<()> {
         assert_eq!(&b[..4], b"KBWD");
         self.lab.lock().unwrap().attached = true;
@@ -154,6 +183,7 @@ impl Driver for Mock {
             released = cv.wait(released).unwrap();
         }
         let mut lab = self.lab.lock().unwrap();
+        lab.wake = None;
         if let Some(error) = lab.cleanup_error {
             return Err(error);
         }
@@ -170,8 +200,8 @@ fn continuously_ready_pipes_are_batched_and_delivered_fairly() {
         ..Lab::default()
     }));
     let worker = lab.clone();
-    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::new(
+    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new(
         move || {
             Ok(Mock {
                 lab: worker,
@@ -185,12 +215,16 @@ fn continuously_ready_pipes_are_batched_and_delivered_fairly() {
     .unwrap();
     wait(|| matches!(backend.attach(SESSION, &device()), Poll::Ready(Ok(()))));
     let mut counts = [0; 2];
-    for _ in 0..100 {
+    for iteration in 0..100 {
         // Let both pipes become available before each single host dequeue.
         // Completing a low pipe immediately replenishes it, reproducing the
         // starvation of the former lowest-index mailbox selection.
-        let turn = lab.lock().unwrap().snapshots;
-        wait(|| lab.lock().unwrap().snapshots >= turn + 2);
+        wait(|| {
+            let lab = lab.lock().unwrap();
+            lab.fetches.len() >= iteration + 2
+                && lab.requests.is_empty()
+                && lab.snapshots > lab.fetches.last().unwrap().0
+        });
         let transfer = backend.next_transfer(SESSION, &b).unwrap().unwrap();
         let index = usize::from(transfer.header().direction == usbip::Direction::In);
         counts[index] += 1;
@@ -233,8 +267,8 @@ fn busy_pipe_completions_progress_and_idle_worker_backs_off() {
         ..Lab::default()
     }));
     let worker = lab.clone();
-    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::new(
+    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new(
         move || {
             Ok(Mock {
                 lab: worker,
@@ -246,6 +280,8 @@ fn busy_pipe_completions_progress_and_idle_worker_backs_off() {
         b.clone(),
     )
     .unwrap();
+    let host = Arc::new(HostWake(std::sync::atomic::AtomicUsize::new(0)));
+    backend.set_waker(Some(std::task::Waker::from(host.clone())));
     wait(|| matches!(backend.attach(SESSION, &device()), Poll::Ready(Ok(()))));
     let start = Instant::now();
     for sequence in 1..=256 {
@@ -274,14 +310,18 @@ fn busy_pipe_completions_progress_and_idle_worker_backs_off() {
             .unwrap();
     }
     wait(|| lab.lock().unwrap().replies.len() == 256);
+    assert!(
+        host.0.load(Ordering::Relaxed) > 1,
+        "native requests must wake the host"
+    );
+    backend.set_waker(None);
     // Report timing for local before/after comparison, not a flaky CI threshold.
     eprintln!("256 immediate pipe completions: {:?}", start.elapsed());
     let snapshots = lab.lock().unwrap().snapshots;
-    let idle = Instant::now();
     std::thread::sleep(Duration::from_millis(20));
     let turns = lab.lock().unwrap().snapshots - snapshots;
     assert!(
-        turns as u128 <= idle.elapsed().as_millis() * 4 + 20,
+        turns <= 2,
         "no pending work: worker must park, not busy-spin"
     );
     drop(backend); // Shutdown must also wake an idle worker.
@@ -312,8 +352,8 @@ fn cleanup_failure_is_not_hidden_by_an_earlier_native_response_error() {
         ..Lab::default()
     }));
     let worker = lab.clone();
-    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::new(
+    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new(
         move || {
             Ok(Mock {
                 lab: worker,
@@ -328,7 +368,7 @@ fn cleanup_failure_is_not_hidden_by_an_earlier_native_response_error() {
     wait(|| matches!(backend.attach(SESSION, &device()), Poll::Ready(Ok(()))));
     let mut invalid = request(2, 1);
     invalid[0] = 0; // Invalid driver ABI version after native publication.
-    lab.lock().unwrap().requests.push_back(invalid);
+    lab.lock().unwrap().push(invalid);
     wait(|| {
         matches!(
             backend.next_transfer(SESSION, &b),
@@ -350,8 +390,8 @@ fn concurrent_pipes_frozen_identity_duplicate_completion_and_cancellation() {
     let worker = lab.clone();
     let release = Arc::new((Mutex::new(true), Condvar::new()));
     let entered = Arc::new(AtomicBool::new(false));
-    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::new(
+    let descriptors = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new(
         move || {
             Ok(Mock {
                 lab: worker,
@@ -368,6 +408,7 @@ fn concurrent_pipes_frozen_identity_duplicate_completion_and_cancellation() {
         .unwrap()
         .requests
         .extend([request(2, 1), request(0x82, 2)]);
+    lab.lock().unwrap().notify();
     wait(|| {
         let lab = lab.lock().unwrap();
         lab.active[1] == 1 && lab.requests.is_empty()
@@ -375,6 +416,7 @@ fn concurrent_pipes_frozen_identity_duplicate_completion_and_cancellation() {
     let snapshots = {
         let mut lab = lab.lock().unwrap();
         lab.active[1] = 0;
+        lab.notify();
         lab.snapshots
     };
     wait(|| lab.lock().unwrap().snapshots >= snapshots + 2);
@@ -457,6 +499,7 @@ fn concurrent_pipes_frozen_identity_duplicate_completion_and_cancellation() {
             .is_err()
     );
     lab.lock().unwrap().active[1] = 0;
+    lab.lock().unwrap().notify();
     let mut cancellation = None;
     wait(|| {
         cancellation = backend.next_cancellation(SESSION);
@@ -492,8 +535,8 @@ fn alternate_settings_follow_successful_controls_and_configuration_resets() {
         let b = budget();
         let lab = Arc::new(Mutex::new(Lab::default()));
         let worker = lab.clone();
-        let descriptors = Descriptors::new(&b, &DEVICE, &config, Speed::Full).unwrap();
-        let mut backend = Backend::new(
+        let descriptors = Descriptors::new(&b, &DEVICE, &config, &[], Speed::Full).unwrap();
+        let mut backend = backend::new(
             move || {
                 Ok(Mock {
                     lab: worker,
@@ -508,7 +551,7 @@ fn alternate_settings_follow_successful_controls_and_configuration_resets() {
         wait(|| matches!(backend.attach(SESSION, &device()), Poll::Ready(Ok(()))));
         if !reset_configuration {
             // UDE can queue new-pipe work before delivering SET_INTERFACE.
-            lab.lock().unwrap().requests.push_back(request(0x82, 3));
+            lab.lock().unwrap().push(request(0x82, 3));
         }
         let controls = if reset_configuration { 2 } else { 1 };
         for step in 0..controls {
@@ -521,7 +564,7 @@ fn alternate_settings_follow_successful_controls_and_configuration_resets() {
             control[..4].copy_from_slice(&1u32.to_le_bytes());
             control[8..16].copy_from_slice(&(step as u64 + 1).to_le_bytes());
             control[24..32].copy_from_slice(&setup);
-            lab.lock().unwrap().requests.push_back(control);
+            lab.lock().unwrap().push(control);
             let mut transfer = None;
             wait(|| {
                 transfer = backend.next_transfer(SESSION, &b);
@@ -566,10 +609,14 @@ fn alternate_settings_follow_successful_controls_and_configuration_resets() {
             wait(|| lab.lock().unwrap().replies.len() == 2);
         } else {
             if reset_configuration {
-                lab.lock().unwrap().requests.push_back(request(0x82, 3));
+                lab.lock().unwrap().push(request(0x82, 3));
             }
-            let snapshots = lab.lock().unwrap().snapshots;
-            wait(|| lab.lock().unwrap().snapshots >= snapshots + 2);
+            let snapshots = {
+                let lab = lab.lock().unwrap();
+                lab.notify();
+                lab.snapshots
+            };
+            wait(|| lab.lock().unwrap().snapshots > snapshots);
             assert!(
                 backend.next_transfer(SESSION, &b).is_none(),
                 "an inactive endpoint must not reach the remote device"
@@ -590,8 +637,8 @@ fn drop_retains_credits_until_blocked_native_cleanup_retires() {
     let unlock = release.clone();
     let entered = Arc::new(AtomicBool::new(false));
     let observed = entered.clone();
-    let d = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::new(
+    let d = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new(
         move || {
             Ok(Mock {
                 lab,
@@ -621,8 +668,8 @@ fn native_admission_fails_before_opening_driver() {
     });
     let opened = Arc::new(AtomicBool::new(false));
     let check = opened.clone();
-    let d = Descriptors::new(&b, &DEVICE, &CONFIG, Speed::Full).unwrap();
-    let mut backend = Backend::<Mock, _>::new(
+    let d = Descriptors::new(&b, &DEVICE, &CONFIG, &[], Speed::Full).unwrap();
+    let mut backend = backend::new::<Mock>(
         move || {
             opened.store(true, Ordering::Release);
             Err(Error::Unavailable)

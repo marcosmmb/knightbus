@@ -15,8 +15,8 @@ identity and device grants before opening an attachment.
 | FETCH `0x22e404` | Four-byte endpoint-slot admission mask (31 bits) | 32-byte request header plus OUT payload; zero bytes when idle |
 | REPLY `0x22e408` | 32-byte reply header plus IN payload | Empty |
 | DETACH `0x22e40c` | Empty | Empty; owned native retirement acknowledgement |
+| NOTIFY `0x22e430` | Eight-byte user event handle; zero unregisters | Empty |
 | STATS `0x22e410` | Empty | 312-byte token/liveness snapshot |
-| LIFECYCLE `0x22e414` | Empty | 128-byte lab-only object counters |
 | RETIREMENT_READY `0x22e42c` | Empty | Empty; succeeds only with the protected-namespace final-destruction event bound |
 
 ATTACH envelope: `KBWD` at offset 0, u32 version 1 at 4, actual USB speed
@@ -42,6 +42,17 @@ FETCH request header:
 | 24 | 8 | USB setup packet for endpoint zero; zero otherwise |
 | 32 | variable | OUT bytes |
 
+NOTIFY is owner-only and processed in the requesting user process before queueing.
+The driver checks the event object type and `EVENT_MODIFY_STATE` access using
+`UserMode`, then retains an object reference rather than the user handle. An
+unnamed auto-reset event is shared with the worker's reply/shutdown notifications.
+Registration signals existing work; arrivals, cancellations and removal signal
+under the slot lock. Detach, owner cleanup and device cleanup signal and release
+the reference. Replacement and signaling use the same lock, so a closed user
+handle cannot invalidate a live kernel signal. No pending IOCTL or timer poll is
+needed. Older drivers reject registration; the importer fails and retires rather
+than silently reverting to polling.
+
 FETCH initializes only its returned header and OUT payload. An empty poll returns
 zero bytes, and the unused portion of the caller's maximum-sized buffer is never
 exposed. STATS initializes exactly its returned snapshot fields.
@@ -64,15 +75,11 @@ FETCH rotates among eligible slots after each successful delivery. The worker
 fetches a bounded batch of at most 31 eligible pipes before waiting, and its
 mailbox also rotates delivery to the transport. A replenished low-numbered pipe
 cannot monopolize either selection point.
-Active batches continue without a timed sleep. Mailbox completions and shutdown
-wake an idle worker; the 1 ms timeout only polls for native arrivals that currently
-have no asynchronous notification.
+Active batches continue without a timed sleep. Native arrivals, cancellations,
+mailbox completions, and shutdown signal the worker's latched notification.
 
-LIFECYCLE is version plus 14 image-lifetime observations (child, endpoint and
-owned queue create/cleanup/destroy; default-endpoint add; plugout calls/success;
-reserved; unpublished-child delete) and a current owned-queue mask. These are
-lab observations, not total WDF allocation counters. While attached, this query
-also requires the owner file; after detach it is available to authorized handles.
+The former LIFECYCLE opcode (`0x22e414`) is reserved and is not handled by
+the product driver. Object-observation counters and their query have been removed.
 
 ATTACH also requires the controller-owned virtual-root-hub filter to be ready;
 a missing filter returns DEVICE_NOT_READY before publishing a USB child.
@@ -114,5 +121,5 @@ on the owned path; it supplies no handle and does not itself acknowledge removal
 Its code changed from `0x22e428` to `0x22e42c` with the namespace change so mixed
 old/new drivers and adapters fail safely before attaching a USB child.
 A failed removal/acknowledgement retains both its slot reservation and native
-credits. The explicit `Controller::open` diagnostic path only retires
-the child and is not the production attachment-lifetime path.
+credits. The product importer always owns and retires the entire controller;
+preinstalled-controller diagnostics have been removed.

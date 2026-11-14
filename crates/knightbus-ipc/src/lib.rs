@@ -1,30 +1,28 @@
-//! Initial Service host contract and deterministic bounded IPC harness.
+//! Bounded control service and framed in-process client.
 //!
 //! Requests cross a strict binary framing boundary; service and embedded adapters
 //! delegate to the same control target. No sockets, OS authentication, daemon or
-//! C ABI are claimed here: M12 must bind an authenticated OS principal and replace
-//! the local link. USB transfers never enter this management protocol.
+//! C ABI are provided here. Hosts bind a verified OS principal to the link.
+//! USB transfers never enter this management protocol.
 mod wire;
 use knightbus_core::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 pub use wire::{decode_request, decode_response, encode_request, encode_response};
 
 /// One authenticated management connection. Host code supplies verified authority
 /// and connection epoch, never data decoded from a request. There is no implicit
 /// reconnection/replay; a restart requires a newly constructed service connection.
 pub struct Service<'a, T: ControlTarget> {
-    target: &'a mut T,
-    caller: Caller,
+    control: ControlConnection<'a, T>,
     epoch: u64,
     last_id: u64,
     capacity: usize,
     pending: BTreeMap<u64, Request>,
     replies: BTreeMap<u64, Response>,
-    subscriptions: BTreeSet<u64>,
 }
 impl<'a, T: ControlTarget> Service<'a, T> {
     /// Bind trusted OS peer authorization. A rejected peer gets no engine access.
-    /// The bounded harness accepts at most 256 outstanding control requests.
+    /// The service accepts at most 256 outstanding control requests.
     pub fn connect(
         target: &'a mut T,
         caller: Caller,
@@ -43,18 +41,16 @@ impl<'a, T: ControlTarget> Service<'a, T> {
             return Err(Error::Invalid);
         }
         Ok(Self {
-            target,
-            caller,
+            control: ControlConnection::new(target, caller, version)?,
             epoch,
             last_id: 0,
             capacity,
             pending: BTreeMap::new(),
             replies: BTreeMap::new(),
-            subscriptions: BTreeSet::new(),
         })
     }
     /// Admit one complete length-prefixed request after framing. Malformed frames
-    /// are rejected before dispatch. Stream framing/OS credentials belong to M12.
+    /// are rejected before dispatch. The host supplies stream framing and verified OS credentials.
     pub fn enqueue(&mut self, epoch: u64, frame: &[u8]) -> Result<()> {
         if self.epoch == 0 || epoch != self.epoch {
             return Err(Error::State);
@@ -96,22 +92,7 @@ impl<'a, T: ControlTarget> Service<'a, T> {
         let Some((id, request)) = self.pending.pop_first() else {
             return;
         };
-        let owned = match request.command {
-            Command::Poll(sub) | Command::Unsubscribe(sub) => self.subscriptions.contains(&sub),
-            _ => true,
-        };
-        let result = if !owned {
-            Err(Error::Denied)
-        } else {
-            self.target
-                .execute(self.caller, request.command.clone(), request.deadline)
-        };
-        if let Ok(Reply::Subscription(sub)) = &result {
-            self.subscriptions.insert(*sub);
-        }
-        if let (Command::Unsubscribe(sub), Ok(_)) = (request.command, &result) {
-            self.subscriptions.remove(&sub);
-        }
+        let result = self.control.call(request.command, request.deadline);
         self.replies.insert(id, Response { id, result });
     }
     /// Take a correlated result; slow consumers occupy a bounded control slot.
@@ -124,25 +105,21 @@ impl<'a, T: ControlTarget> Service<'a, T> {
     /// Retire all connection-local subscriptions and queued commands. Session
     /// leases belong to the engine, and survive a management UI disconnect.
     pub fn close(&mut self) {
-        for sub in std::mem::take(&mut self.subscriptions) {
-            let _ = self
-                .target
-                .execute(self.caller, Command::Unsubscribe(sub), u64::MAX);
-        }
+        self.control.close();
         self.pending.clear();
         self.replies.clear();
         self.epoch = 0;
     }
 }
 /// Service adapter over the deterministic framed local link. Production IPC will
-/// implement this same control contract after OS peer verification in M12.
+/// implement this contract after verifying the OS peer.
 pub struct IpcControl<'a, T: ControlTarget> {
     service: Service<'a, T>,
     epoch: u64,
     next_id: u64,
 }
 impl<'a, T: ControlTarget> IpcControl<'a, T> {
-    /// Create a bounded mock service connection with trusted host authority.
+    /// Create a bounded service connection with trusted host authority.
     pub fn new(
         target: &'a mut T,
         caller: Caller,

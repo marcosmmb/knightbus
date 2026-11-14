@@ -11,6 +11,10 @@ queue-lifetime crash and a bulk URB/mapped-buffer length bug; the corrected driv
 passed native regressions and the physical volume mounted. Windows C: remains
 dirty after the crash; the SSD F: is not dirty. See the
 [M9 validation and setup report](milestone9-validation.md) for scope and evidence.
+The subsequent code audit/refactor passed portable suites on macOS, Linux and
+Windows, plus native Windows publication, transfer/reset, retirement and ownership
+regressions. These checks preserve the existing support scope; physical integrity,
+reconnect and soak qualification remain open.
 
 **M8 PASS for the owner-approved development scope (2026-11-13).** The original
 Rust macOS exporter enumerates, claims and transfers with the exact Logitech

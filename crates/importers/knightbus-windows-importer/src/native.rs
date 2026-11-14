@@ -20,12 +20,9 @@ const INTERFACE: GUID = GUID {
 const MAX_INSTANCE_UNITS: usize = 4096;
 const MAX_INTERFACE_LIST_UNITS: u32 = 16384;
 const MULTI_SZ_TERMINATORS: u32 = 2;
-const LIFECYCLE_COUNTERS: usize = 16;
-const LIFECYCLE_BYTES: usize = LIFECYCLE_COUNTERS * size_of::<u64>();
 /// Exclusive native channel, opened only by an authorized privileged host.
 pub struct Controller {
     handle: HANDLE,
-    owned: bool,
     lifetime: Option<lifetime::Lifetime>,
     retired: bool,
     cleanup_failed: bool,
@@ -35,7 +32,7 @@ pub struct Controller {
 unsafe impl Send for Controller {}
 impl Drop for Controller {
     fn drop(&mut self) {
-        if self.owned && !self.retired {
+        if !self.retired {
             let _ = self.detach();
         }
         self.close_channel();
@@ -48,7 +45,6 @@ impl Controller {
     pub fn owned() -> Self {
         Self {
             handle: INVALID_HANDLE_VALUE,
-            owned: true,
             lifetime: None,
             retired: false,
             cleanup_failed: false,
@@ -63,19 +59,15 @@ impl Controller {
             self.handle = INVALID_HANDLE_VALUE;
         }
     }
-    /// Open an installed KnightBus controller. A device instance ID selects one
-    /// controller when several exist; omission requires exactly one match.
-    pub fn open(instance: Option<&str>) -> Result<Self> {
-        let id: Option<Vec<u16>> = instance.map(|s| s.encode_utf16().chain([0]).collect());
-        if id
-            .as_ref()
-            .is_some_and(|v| v.len() > MAX_INSTANCE_UNITS || v[..v.len() - 1].contains(&0))
-        {
+    // Open only the controller created by this attachment.
+    fn open_channel(instance: &str) -> Result<HANDLE> {
+        let id: Vec<u16> = instance.encode_utf16().chain([0]).collect();
+        if id.len() > MAX_INSTANCE_UNITS || id[..id.len() - 1].contains(&0) {
             return Err(Error::Invalid);
         }
-        let filter = id.as_ref().map_or(ptr::null(), |v| v.as_ptr());
+        let filter = id.as_ptr();
         let mut count = 0;
-        // SAFETY: Static GUID, optional terminated instance string, local output.
+        // SAFETY: Static GUID, terminated instance string, local output.
         let status = unsafe {
             CM_Get_Device_Interface_List_SizeW(
                 &mut count,
@@ -124,13 +116,7 @@ impl Controller {
         if handle == INVALID_HANDLE_VALUE {
             Err(last_error())
         } else {
-            Ok(Self {
-                handle,
-                owned: false,
-                lifetime: None,
-                retired: false,
-                cleanup_failed: false,
-            })
+            Ok(handle)
         }
     }
     fn ioctl(&mut self, code: u32, input: &[u8], output: &mut [u8]) -> Result<usize> {
@@ -170,32 +156,18 @@ impl Controller {
         }
         Ok(done as usize)
     }
-    /// Read owned-object lifecycle totals for hardware regression tests.
-    /// These counters do not replace debugger measurement of total WDF objects.
-    pub fn lifecycle(&mut self) -> Result<[u64; LIFECYCLE_COUNTERS]> {
-        let mut bytes = [0u8; LIFECYCLE_BYTES];
-        if self.ioctl(channel::LIFECYCLE, &[], &mut bytes)? != LIFECYCLE_BYTES {
-            return Err(Error::Invalid);
-        }
-        Ok(std::array::from_fn(|i| {
-            channel::u64_at(&bytes, i * size_of::<u64>())
-        }))
-    }
 }
 impl Driver for Controller {
     fn attach(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.owned {
-            if self.retired || self.lifetime.is_some() {
-                return Err(Error::State);
-            }
-            self.lifetime = Some(lifetime::Lifetime::reserve()?);
-            let instance = self.lifetime.as_mut().unwrap().start()?;
-            let mut channel = Self::open(Some(&instance))?;
-            self.handle = std::mem::replace(&mut channel.handle, INVALID_HANDLE_VALUE);
-            // Refuse an older driver before publishing USB: the owned path
-            // requires a kernel-held event and final-destruction acknowledgement.
-            self.ioctl(channel::RETIREMENT_READY, &[], &mut [])?;
+        if self.retired || self.lifetime.is_some() {
+            return Err(Error::State);
         }
+        self.lifetime = Some(lifetime::Lifetime::reserve()?);
+        let instance = self.lifetime.as_mut().unwrap().start()?;
+        self.handle = Self::open_channel(&instance)?;
+        // Require a kernel-held event and final-destruction acknowledgement
+        // before publishing the USB device.
+        self.ioctl(channel::RETIREMENT_READY, &[], &mut [])?;
         self.ioctl(channel::ATTACH, bytes, &mut []).map(|_| ())
     }
     fn fetch(&mut self, mask: u32, output: &mut [u8]) -> Result<usize> {
@@ -207,6 +179,14 @@ impl Driver for Controller {
             result => result.map(|_| ()),
         }
     }
+    fn notifications(&mut self, wake: std::sync::Arc<crate::DriverWake>) -> Result<()> {
+        self.ioctl(
+            knightbus_windows_protocol::wire::NOTIFY,
+            &(wake.handle() as usize as u64).to_le_bytes(),
+            &mut [],
+        )?;
+        Ok(())
+    }
     fn snapshot(&mut self, output: &mut [u8]) -> Result<()> {
         if self.ioctl(channel::STATS, &[], output)? != channel::STATS_BYTES {
             return Err(Error::Invalid);
@@ -214,9 +194,6 @@ impl Driver for Controller {
         Ok(())
     }
     fn detach(&mut self) -> Result<()> {
-        if !self.owned {
-            return self.ioctl(channel::DETACH, &[], &mut []).map(|_| ());
-        }
         if self.retired {
             return if !self.cleanup_failed {
                 Ok(())

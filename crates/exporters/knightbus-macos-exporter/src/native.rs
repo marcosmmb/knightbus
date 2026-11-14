@@ -2,13 +2,16 @@
 //! No forwarding implementation is imported: objc2 supplies ordinary API/ABI
 //! bindings. Native storage is retained until the terminal callback publishes
 //! with release ordering; only then may Rust inspect or free the buffer.
-use crate::constants::{limits, status, usb};
-use crate::{Driver, MAX_ISO, MAX_TRANSFER, SLOTS, SubmitError, descriptors, journal};
+use crate::constants::limits;
+use crate::{SLOTS, descriptors};
 use block2::RcBlock;
+use knightbus_core::exporter::{Driver, SubmitError};
+use knightbus_core::usbip::status;
 use knightbus_core::{
     Budget, Completion, Device, DeviceId, DeviceKey, Error, MemoryReservation, Result, Transfer,
-    TransferId, TransferKind, usbip::Direction,
+    TransferId, usbip::Direction,
 };
+use knightbus_usb as usb;
 use objc2::{AnyThread, rc::Retained};
 use objc2_foundation::{NSError, NSMutableData};
 use objc2_io_kit::{IOUSBDeviceRequest, tIOUSBHostConnectionSpeed as HostSpeed};
@@ -151,12 +154,12 @@ fn identity(entry: &Service) -> Option<Identity> {
         vendor: property(entry.0, c"idVendor")? as u16,
         product: property(entry.0, c"idProduct")? as u16,
         speed: match HostSpeed(u32::try_from(property(entry.0, c"USBSpeed")?).ok()?) {
-            HostSpeed::IOUSBHostConnectionSpeedFull => usb::SPEED_FULL,
-            HostSpeed::IOUSBHostConnectionSpeedLow => usb::SPEED_LOW,
-            HostSpeed::IOUSBHostConnectionSpeedHigh => usb::SPEED_HIGH,
-            HostSpeed::IOUSBHostConnectionSpeedSuper => usb::SPEED_SUPER,
+            HostSpeed::IOUSBHostConnectionSpeedFull => usb::Speed::Full as u32,
+            HostSpeed::IOUSBHostConnectionSpeedLow => usb::Speed::Low as u32,
+            HostSpeed::IOUSBHostConnectionSpeedHigh => usb::Speed::High as u32,
+            HostSpeed::IOUSBHostConnectionSpeedSuper => usb::Speed::Super as u32,
             HostSpeed::IOUSBHostConnectionSpeedSuperPlus
-            | HostSpeed::IOUSBHostConnectionSpeedSuperPlusBy2 => usb::SPEED_SUPER_PLUS,
+            | HostSpeed::IOUSBHostConnectionSpeedSuperPlusBy2 => usb::Speed::SuperPlus as u32,
             _ => return None,
         },
     })
@@ -188,16 +191,8 @@ pub fn inspect(id: Identity, key: DeviceKey) -> Result<Snapshot> {
     let gone = Arc::new(AtomicBool::new(false));
     let device = open_device(id, false, gone, Arc::default())?;
     let result = read_snapshot(&device, id, key);
-    let span = journal::begin(
-        "device.destroy.inspect",
-        &format!("registry={:x}", id.registry_id),
-    )
-    .ok();
     unsafe {
         device.destroy();
-    }
-    if let Some(span) = span {
-        span.finish("returned");
     }
     result
 }
@@ -208,21 +203,9 @@ fn open_device(
     wake: Arc<NativeWake>,
 ) -> Result<Retained<IOUSBHostDevice>> {
     let service = find(id)?;
-    let span = journal::begin(
-        "device.open",
-        &format!(
-            "registry={:x} location={:08x} vid={:04x} pid={:04x} service={} capture={capture}",
-            id.registry_id, id.location, id.vendor, id.product, service.0
-        ),
-    )?;
     let mut error = None;
     let callback = RcBlock::new(
         move |_object: NonNull<IOUSBHostObject>, message: u32, _arg: *mut c_void| {
-            journal::note(
-                "callback",
-                "device.interest",
-                &format!("registry={:x} message={message:08x}", id.registry_id),
-            );
             if message == objc2_io_kit::kIOMessageServiceIsTerminated {
                 gone.store(true, Ordering::Release);
                 wake.notify();
@@ -244,38 +227,33 @@ fn open_device(
         )
         .ok_or_else(|| native_error(error.as_deref()))
     };
-    span.finish(&format!(
-        "success={} ioreturn={:?}",
-        result.is_ok(),
-        error.as_ref().map(|e| e.code() as u32)
-    ));
     result
 }
 fn read_snapshot(device: &IOUSBHostDevice, id: Identity, key: DeviceKey) -> Result<Snapshot> {
     let descriptor = control(device, usb::READ_DEVICE_DESCRIPTOR)?;
-    if descriptor.len() != usb::DEVICE_DESCRIPTOR_LENGTH
-        || descriptor[usb::DEVICE_CONFIGURATION_COUNT_OFFSET] == 0
-        || descriptor[usb::DEVICE_CONFIGURATION_COUNT_OFFSET] as usize > limits::MAX_CONFIGURATIONS
+    if descriptor.len() != usb::device::BYTES
+        || descriptor[usb::device::CONFIGURATIONS] == 0
+        || descriptor[usb::device::CONFIGURATIONS] as usize > limits::MAX_CONFIGURATIONS
     {
         return Err(Error::Invalid);
     }
     let mut configurations = Vec::new();
-    for index in 0..descriptor[usb::DEVICE_CONFIGURATION_COUNT_OFFSET] {
+    for index in 0..descriptor[usb::device::CONFIGURATIONS] {
         let header = control(
             device,
             usb::setup(
                 usb::DIRECTION_IN,
                 usb::GET_DESCRIPTOR,
-                (u16::from(usb::DESCRIPTOR_CONFIGURATION) << u8::BITS) | u16::from(index),
+                (u16::from(usb::configuration::TYPE) << u8::BITS) | u16::from(index),
                 0,
-                usb::CONFIGURATION_DESCRIPTOR_LENGTH as u16,
+                usb::configuration::BYTES as u16,
             ),
         )?;
-        if header.len() != usb::CONFIGURATION_DESCRIPTOR_LENGTH {
+        if header.len() != usb::configuration::BYTES {
             return Err(Error::Invalid);
         }
-        let length = descriptors::word(&header, usb::CONFIG_TOTAL_LENGTH_OFFSET);
-        if usize::from(length) < usb::CONFIGURATION_DESCRIPTOR_LENGTH {
+        let length = usb::u16_at(&header, usb::configuration::TOTAL_LENGTH);
+        if usize::from(length) < usb::configuration::BYTES {
             return Err(Error::Invalid);
         }
         configurations.push(control(
@@ -283,7 +261,7 @@ fn read_snapshot(device: &IOUSBHostDevice, id: Identity, key: DeviceKey) -> Resu
             usb::setup(
                 usb::DIRECTION_IN,
                 usb::GET_DESCRIPTOR,
-                (u16::from(usb::DESCRIPTOR_CONFIGURATION) << u8::BITS) | u16::from(index),
+                (u16::from(usb::configuration::TYPE) << u8::BITS) | u16::from(index),
                 0,
                 length,
             ),
@@ -327,7 +305,6 @@ fn control(device: &IOUSBHostDevice, s: [u8; usb::SETUP_SIZE]) -> Result<Vec<u8>
     ])))
     .ok_or(Error::Exhausted)?;
     let mut count = 0;
-    let span = journal::begin("control.sync", &format!("setup={s:02x?}"))?;
     unsafe {
         let outcome = device.sendDeviceRequest_data_bytesTransferred_completionTimeout_error(
             setup(s),
@@ -335,10 +312,6 @@ fn control(device: &IOUSBHostDevice, s: [u8; usb::SETUP_SIZE]) -> Result<Vec<u8>
             &mut count,
             limits::CONTROL_TIMEOUT_SECONDS,
         );
-        span.finish(&format!(
-            "bytes={count} ioreturn={:?}",
-            outcome.as_ref().err().map(|e| e.code() as u32)
-        ));
         outcome.map_err(|e| native_error(Some(&e)))?;
         if count > data.length() {
             return Err(Error::Invalid);
@@ -392,17 +365,7 @@ impl Native {
     /// Claim every interface of the selected configuration transactionally.
     /// `capture` explicitly opts into displacing the OS owner. The hosting engine
     /// must authorize this exact generation first; this function never elevates.
-    /// An initialized diagnostic journal additionally restricts the target.
     pub fn open(snapshot: Snapshot, capture: bool, budget: Budget) -> Result<Self> {
-        if capture
-            && !journal::capture_allowed(
-                snapshot.identity.location,
-                snapshot.identity.vendor,
-                snapshot.identity.product,
-            )
-        {
-            return Err(Error::Unavailable);
-        }
         let bytes = limits::NATIVE_METADATA_MULTIPLIER
             * (snapshot.descriptor.capacity()
                 + snapshot.configurations.capacity() * std::mem::size_of::<Vec<u8>>()
@@ -494,10 +457,6 @@ impl Native {
                     if self.interfaces.contains_key(&number) {
                         continue;
                     }
-                    let span = journal::begin(
-                        "interface.open",
-                        &format!("number={number} service={}", service.0),
-                    )?;
                     let mut error = None;
                     let interface =
                         IOUSBHostInterface::initWithIOService_options_queue_error_interestHandler(
@@ -508,11 +467,6 @@ impl Native {
                             Some(&mut error),
                             ptr::null_mut(),
                         );
-                    span.finish(&format!(
-                        "success={} ioreturn={:?}",
-                        interface.is_some(),
-                        error.as_ref().map(|e| e.code() as u32)
-                    ));
                     let interface = interface.ok_or_else(|| native_error(error.as_deref()))?;
                     self.interfaces.insert(number, interface);
                     let alt = control(
@@ -556,22 +510,10 @@ impl Native {
                 .find(|i| i.number == number && i.alternate == alternate)
                 .ok_or(Error::Invalid)?;
             for endpoint in &setting.endpoints {
-                let span = journal::begin(
-                    "pipe.copy",
-                    &format!(
-                        "interface={number} alternate={alternate} address={:02x}",
-                        endpoint.address
-                    ),
-                )?;
                 let pipe = unsafe {
                     self.interfaces[&number]
                         .copyPipeWithAddress_error(usize::from(endpoint.address))
                 };
-                span.finish(&format!(
-                    "success={} ioreturn={:?}",
-                    pipe.is_ok(),
-                    pipe.as_ref().err().map(|e| e.code() as u32)
-                ));
                 let pipe = pipe.map_err(|e| native_error(Some(&e)))?;
                 if self.pipes.insert(endpoint.address, pipe).is_some() {
                     return Err(Error::Invalid);
@@ -581,19 +523,11 @@ impl Native {
         Ok(())
     }
     fn close_interfaces(&mut self) {
-        journal::note(
-            "begin",
-            "pipes.release",
-            &format!("count={}", self.pipes.len()),
-        );
         self.pipes.clear();
-        journal::note("end", "pipes.release", "");
-        for (number, interface) in std::mem::take(&mut self.interfaces) {
-            journal::note("begin", "interface.destroy", &format!("number={number}"));
+        for interface in std::mem::take(&mut self.interfaces).into_values() {
             unsafe {
                 interface.destroy();
             }
-            journal::note("end", "interface.destroy", &format!("number={number}"));
         }
         self.alternates.clear();
     }
@@ -604,12 +538,7 @@ impl Native {
             return Err(Error::State);
         }
         self.close_interfaces();
-        let span = journal::begin(
-            "device.reset",
-            &format!("registry={:x}", self.snapshot.identity.registry_id),
-        )?;
         let result = unsafe { self.device.resetWithError() }.map_err(|e| native_error(Some(&e)));
-        span.finish(&format!("result={result:?}"));
         self.gone.store(true, Ordering::Release);
         result
     }
@@ -625,65 +554,20 @@ impl Native {
             .flat_map(|i| &i.endpoints)
             .find(|e| e.address == address)
     }
-    fn validate(&self, t: &Transfer) -> Result<u8> {
-        let h = t.header();
-        if h.endpoint > u32::from(usb::ENDPOINT_NUMBER_MASK)
-            || h.transfer_buffer_length as usize != t.buffer().len()
-            || t.buffer().len() > MAX_TRANSFER
-            || t.layout().len() > MAX_ISO
-            || h.device_id
-                != ((self.snapshot.device.wire.bus_number << usb::WIRE_BUS_SHIFT)
-                    | self.snapshot.device.wire.device_number)
-        {
-            return Err(Error::Invalid);
-        }
-        if h.endpoint == 0 {
-            if h.transfer_flags != 0
-                || !t.layout().is_empty()
-                || usize::from(u16::from_le_bytes([
-                    h.setup[usb::SETUP_LENGTH],
-                    h.setup[usb::SETUP_LENGTH + 1],
-                ])) != t.buffer().len()
-                || (h.setup[usb::SETUP_TYPE] & usb::DIRECTION_IN != 0)
-                    != (h.direction == Direction::In)
-            {
-                return Err(Error::Invalid);
-            }
-            if h.setup[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK == 0
-                && h.setup[usb::SETUP_REQUEST] == usb::SET_ADDRESS
-            {
-                return Err(Error::Unsupported);
-            }
-            return Ok(0);
-        }
-        let address = h.endpoint as u8
-            | if h.direction == Direction::In {
+    fn validate(&self, transfer: &Transfer) -> Result<u8> {
+        let header = transfer.header();
+        let address = header.endpoint as u8
+            | if header.direction == Direction::In {
                 usb::DIRECTION_IN
             } else {
                 0
             };
-        let e = self.endpoint(address).ok_or(Error::Invalid)?;
-        if h.setup != [0; usb::SETUP_SIZE]
-            || h.transfer_flags & !e.allowed_flags != 0
-            || (e.kind == TransferKind::Isochronous) == t.layout().is_empty()
-        {
-            return Err(Error::Unsupported);
-        }
-        if e.kind == TransferKind::Isochronous {
-            // USB/IP frame numbers are importer-local. Only ASAP is safely
-            // translatable without an explicit cross-host frame-clock contract.
-            if h.transfer_flags & usb::ISO_ASAP == 0 {
-                return Err(Error::Unsupported);
-            }
-            let packet = (e.max_packet_size & usb::MAX_PACKET_SIZE_MASK) as u32
-                * (1 + u32::from(
-                    (e.max_packet_size >> usb::HS_TRANSACTIONS_SHIFT) & usb::HS_TRANSACTIONS_MASK,
-                ));
-            if t.layout().iter().any(|p| p.length > packet) {
-                return Err(Error::Invalid);
-            }
-        }
-        Ok(address)
+        transfer.validate_native(
+            (self.snapshot.device.wire.bus_number << knightbus_core::usbip::DEVICE_BUS_SHIFT)
+                | self.snapshot.device.wire.device_number,
+            self.endpoint(address),
+            Self::CAPABILITIES,
+        )
     }
     fn special(&mut self, s: [u8; usb::SETUP_SIZE]) -> Option<Result<()>> {
         if s[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK != 0 {
@@ -708,7 +592,6 @@ impl Native {
                 {
                     return Err(Error::Invalid);
                 }
-                let span = journal::begin("configuration.select", &format!("value={value}"))?;
                 self.close_interfaces();
                 changed = true;
                 unsafe {
@@ -716,7 +599,6 @@ impl Native {
                         .configureWithValue_matchInterfaces_error(value as usize, false)
                 }
                 .map_err(|e| native_error(Some(&e)))?;
-                span.finish("OS configuration returned success; reacquiring interfaces");
                 self.active = value as u8;
                 self.claim_interfaces()
             })()),
@@ -740,14 +622,9 @@ impl Native {
                     return Err(Error::Invalid);
                 }
                 let interface = self.interfaces.get(&(index as u8)).ok_or(Error::Invalid)?;
-                let span = journal::begin(
-                    "alternate.select",
-                    &format!("interface={index} value={value}"),
-                )?;
                 changed = true;
                 unsafe { interface.selectAlternateSetting_error(value as usize) }
                     .map_err(|e| native_error(Some(&e)))?;
-                span.finish("OS alternate returned success; rebuilding pipes");
                 self.alternates.insert(index as u8, value as u8);
                 self.rebuild_pipes()
             })()),
@@ -759,12 +636,7 @@ impl Native {
                         return Err(Error::Invalid);
                     }
                     let pipe = self.pipes.get(&(index as u8)).ok_or(Error::Invalid)?;
-                    let span =
-                        journal::begin("pipe.clear-stall", &format!("endpoint={index:02x}"))?;
-                    let result =
-                        unsafe { pipe.clearStallWithError() }.map_err(|e| native_error(Some(&e)));
-                    span.finish(&format!("result={result:?}"));
-                    result
+                    unsafe { pipe.clearStallWithError() }.map_err(|e| native_error(Some(&e)))
                 })())
             }
             _ => None,
@@ -775,7 +647,80 @@ impl Native {
         result
     }
 }
+impl Native {
+    fn enqueue(&self, op: &mut Operation) -> (bool, Option<Retained<NSError>>) {
+        let address = op.address;
+        let s = op.transfer.header().setup;
+        let signal = op.signal.clone();
+        let wake = self.wake.clone();
+        let callback = RcBlock::new(move |status: i32, count: usize| {
+            signal.status.store(status as u32, Ordering::Relaxed);
+            signal.count.store(count, Ordering::Relaxed);
+            signal.done.store(true, Ordering::Release);
+            wake.notify();
+        });
+        let mut error = None;
+        let accepted = unsafe {
+            if address == 0 {
+                self.device
+                    .enqueueDeviceRequest_data_completionTimeout_error_completionHandler(
+                        setup(s),
+                        Some(&op.data),
+                        limits::CONTROL_TIMEOUT_SECONDS,
+                        Some(&mut error),
+                        RcBlock::as_ptr(&callback),
+                    )
+            } else if op.transfer.layout().is_empty() {
+                self.pipes[&address]
+                    .enqueueIORequestWithData_completionTimeout_error_completionHandler(
+                        Some(&op.data),
+                        limits::PIPE_TIMEOUT_SECONDS,
+                        Some(&mut error),
+                        RcBlock::as_ptr(&callback),
+                    )
+            } else {
+                op.iso = op
+                    .transfer
+                    .layout()
+                    .iter()
+                    .map(|p| IOUSBHostIsochronousTransaction {
+                        status: 0,
+                        requestCount: p.length,
+                        offset: p.offset,
+                        completeCount: 0,
+                        timeStamp: 0,
+                        options: IOUSBHostIsochronousTransactionOptions::None,
+                    })
+                    .collect();
+                let signal = op.signal.clone();
+                let wake = self.wake.clone();
+                let iso_callback = RcBlock::new(
+                    move |status: i32, _list: NonNull<IOUSBHostIsochronousTransaction>| {
+                        signal.status.store(status as u32, Ordering::Relaxed);
+                        signal.done.store(true, Ordering::Release);
+                        wake.notify();
+                    },
+                );
+                self.pipes[&address].enqueueIORequestWithData_transactionList_transactionListCount_firstFrameNumber_options_error_completionHandler(&op.data,NonNull::new(op.iso.as_mut_ptr()).unwrap(),op.iso.len(),0,IOUSBHostIsochronousTransferOptions::None,Some(&mut error),RcBlock::as_ptr(&iso_callback))
+            }
+        };
+        (accepted, error)
+    }
+}
+
 impl Driver for Native {
+    fn endpoint(&self, address: u8) -> Option<knightbus_core::Endpoint> {
+        Native::endpoint(self, address).cloned()
+    }
+    const CAPABILITIES: knightbus_core::Capabilities = knightbus_core::Capabilities {
+        transfer_bytes: 1024 * 1024,
+        requests: 64,
+        iso_packets: 1024,
+        speeds: 0b1101110,
+        descriptor_bytes: 65535,
+        configurations: 16,
+        remote_wakeup: true,
+    };
     fn set_waker(&mut self, waker: Waker) {
         *self.wake.0.lock().unwrap() = Some(waker);
     }
@@ -820,16 +765,6 @@ impl Driver for Native {
             Ok(c) => c,
             Err(e) => return Err((SubmitError::Failed(e), transfer)),
         };
-        let span = match journal::begin(
-            "transfer.submit",
-            &format!(
-                "token={id:?} address={address:02x} length={} setup={s:02x?}",
-                transfer.buffer().len()
-            ),
-        ) {
-            Ok(span) => span,
-            Err(e) => return Err((SubmitError::Failed(e), transfer)),
-        };
         let data = NSMutableData::with_bytes(transfer.buffer());
         let mut op = Operation {
             id,
@@ -852,84 +787,19 @@ impl Driver for Native {
                 // leave the old topology usable. Drain the physical generation.
                 op.signal.status.store(
                     result.err().map_or(0, |e| {
-                        LAST_ERROR.get().unwrap_or(crate::backend::status(e) as u32)
+                        LAST_ERROR
+                            .get()
+                            .unwrap_or(knightbus_core::exporter::status(e) as u32)
                     }),
                     Ordering::Relaxed,
                 );
                 // Distinguish normalized synthetic status from IOReturn below.
                 op.signal.done.store(true, Ordering::Release);
-                span.finish(&format!("special=true result={result:?}"));
                 self.operations[slot] = Some(op);
                 return Ok(());
             }
         }
-        let signal = op.signal.clone();
-        let wake = self.wake.clone();
-        let callback = RcBlock::new(move |status: i32, count: usize| {
-            journal::note(
-                "callback",
-                "transfer.complete",
-                &format!("token={id:?} status={status:08x} bytes={count}"),
-            );
-            signal.status.store(status as u32, Ordering::Relaxed);
-            signal.count.store(count, Ordering::Relaxed);
-            signal.done.store(true, Ordering::Release);
-            wake.notify();
-        });
-        let mut error = None;
-        let accepted = unsafe {
-            if address == 0 {
-                self.device
-                    .enqueueDeviceRequest_data_completionTimeout_error_completionHandler(
-                        setup(s),
-                        Some(&op.data),
-                        limits::CONTROL_TIMEOUT_SECONDS,
-                        Some(&mut error),
-                        RcBlock::as_ptr(&callback),
-                    )
-            } else if op.transfer.layout().is_empty() {
-                self.pipes[&address]
-                    .enqueueIORequestWithData_completionTimeout_error_completionHandler(
-                        Some(&op.data),
-                        limits::PIPE_TIMEOUT_SECONDS,
-                        Some(&mut error),
-                        RcBlock::as_ptr(&callback),
-                    )
-            } else {
-                op.iso = op
-                    .transfer
-                    .layout()
-                    .iter()
-                    .map(|p| IOUSBHostIsochronousTransaction {
-                        status: 0,
-                        requestCount: p.length,
-                        offset: p.offset,
-                        completeCount: 0,
-                        timeStamp: 0,
-                        options: IOUSBHostIsochronousTransactionOptions::None,
-                    })
-                    .collect();
-                let signal = op.signal.clone();
-                let wake = self.wake.clone();
-                let iso_callback = RcBlock::new(
-                    move |status: i32, _list: NonNull<IOUSBHostIsochronousTransaction>| {
-                        journal::note(
-                            "callback",
-                            "transfer.iso.complete",
-                            &format!("token={id:?} status={status:08x}"),
-                        );
-                        signal.status.store(status as u32, Ordering::Relaxed);
-                        signal.done.store(true, Ordering::Release);
-                        wake.notify();
-                    },
-                );
-                self.pipes[&address].enqueueIORequestWithData_transactionList_transactionListCount_firstFrameNumber_options_error_completionHandler(&op.data,NonNull::new(op.iso.as_mut_ptr()).unwrap(),op.iso.len(),0,IOUSBHostIsochronousTransferOptions::None,Some(&mut error),RcBlock::as_ptr(&iso_callback))
-            }
-        };
-        span.finish(&format!(
-            "accepted={accepted} ioreturn={:?}",
-            error.as_ref().map(|e| e.code() as u32)
-        ));
+        let (accepted, error) = self.enqueue(&mut op);
         if !accepted {
             // A rejected enqueue schedules no callback. Preserve its exact USB
             // error as a retired completion, rather than flattening stalls into
@@ -950,11 +820,6 @@ impl Driver for Native {
         if op.cancelled || op.signal.done.load(Ordering::Acquire) {
             return Ok(());
         }
-        journal::note(
-            "begin",
-            "transfer.abort",
-            &format!("token={id:?} address={:02x}", op.address),
-        );
         let result = unsafe {
             if op.address == 0 {
                 self.device
@@ -963,15 +828,6 @@ impl Driver for Native {
                 self.pipes[&op.address].abortWithOption_error(IOUSBHostAbortOption::Asynchronous)
             }
         };
-        journal::note(
-            "end",
-            "transfer.abort",
-            &format!(
-                "token={id:?} success={} ioreturn={:?}",
-                result.is_ok(),
-                result.as_ref().err().map(|e| e.code() as u32)
-            ),
-        );
         // Retry failed aborts. Never manufacture retirement on an API error.
         op.cancelled = result.is_ok();
         result.map_err(|error| native_error(Some(&error)))
@@ -1039,19 +895,9 @@ impl Driver for Native {
         }
         if !self.released {
             self.close_interfaces();
-            journal::note(
-                "begin",
-                "device.destroy.capture",
-                &format!("registry={:x}", self.snapshot.identity.registry_id),
-            );
             unsafe {
                 self.device.destroy();
             }
-            journal::note(
-                "end",
-                "device.destroy.capture",
-                &format!("registry={:x}", self.snapshot.identity.registry_id),
-            );
             self.released = true;
         }
         Ok(())
@@ -1140,12 +986,14 @@ pub fn usb_status(code: u32) -> i32 {
     }
 }
 
-/// Convenience identity for a stand-alone lab process. Production hosts must
-/// persist their own inventory mapping rather than authorize by VID/PID.
-pub fn lab_key(id: Identity) -> DeviceKey {
-    DeviceKey {
-        id: DeviceId(u64::from(id.location)),
-        generation: id.registry_id,
+impl Identity {
+    /// Identity within this boot: location selects the port; registry ID selects
+    /// its physical generation. Hosts persisting inventory must supply their own key.
+    pub fn device_key(self) -> DeviceKey {
+        DeviceKey {
+            id: DeviceId(u64::from(self.location)),
+            generation: self.registry_id,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 # Shared control contract
 
 Embedded and Service modes must expose the same logical engine operations through
-`InProcessControl` and `IpcControl`. M6 implements these Rust adapters and a
+`ControlConnection` and `IpcControl`. M6 implements these Rust adapters and a
 bounded framed Service harness over the same engine. See [M6](milestone6-validation.md)
 for concrete behavior and limits. Production OS-authenticated IPC, the public SDK
 schema and C headers remain M12 work.

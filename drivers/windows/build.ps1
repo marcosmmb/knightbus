@@ -23,9 +23,9 @@ $pdb = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc\debug\knightbus_w
 $symbols = & (Join-Path $env:LIBCLANG_PATH 'llvm-pdbutil.exe') dump -symbols $pdb
 if ($LASTEXITCODE -ne 0) { throw 'Could not inspect driver stack frames' }
 $frames = [regex]::Matches(($symbols -join "`n"), '(?s)S_[LG]PROC32[^`]*`([^`]+)`.*?S_FRAMEPROC.*?size = ([0-9]+),')
-$owned = @($frames | Where-Object {$_.Groups[1].Value -like 'knightbus_windows_driver::*'})
-if (!$owned.Count) { throw 'No original-driver stack records found' }
+$owned = @($frames | Where-Object {$_.Groups[1].Value -like 'knightbus_windows_driver::*' -or $_.Groups[1].Value -like 'knightbus_windows_protocol::*' -or $_.Groups[1].Value -like 'knightbus_usb::*'})
+if (!$owned.Count) { throw 'No driver/protocol stack records found' }
 foreach ($frame in $owned) {
     if ([int]$frame.Groups[2].Value -gt 4096) { throw "Kernel stack frame exceeds 4 KiB: $($frame.Groups[1].Value)" }
 }
-Write-Output "Checked $($owned.Count) original-driver stack frames (4 KiB maximum each)."
+Write-Output "Checked $($owned.Count) driver/protocol/USB stack frames (4 KiB maximum each)."

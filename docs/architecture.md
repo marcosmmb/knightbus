@@ -1,19 +1,19 @@
 # KnightBus architecture
 
-M4 established the Rust architecture and control boundaries as documentation.
-M5 implements the workspace and [USB/IP codec](protocol-usbip-1.1.1.md).
-M6 implements the portable engine and initial Embedded/Service mock adapters;
-see [implementation, state machines and validation](milestone6-validation.md).
-Native backends, secure transport and production host deployment remain later work.
-The [measured gates](gate-status.md) and [M4 scope ADR](decisions/m4-scope.md) remain
-in force. Codec tests do not establish native platform feasibility.
+The workspace implements the portable engine, [USB/IP codec](protocol-usbip-1.1.1.md),
+bounded TCP transport, macOS exporter and Windows importer. The Windows kernel
+driver is built separately. Embedded and framed control adapters share the same
+engine and connection ownership rules. Authenticated transport integration and
+production host deployment remain separate work; the standalone programs require
+an authenticated tunnel supplied by their host.
+See the [measured gates](gate-status.md) for supported scope and remaining tests.
 
 ## One engine and its hosts
 
 ```mermaid
 flowchart TD
     UI[Desktop manager / CLI / streaming adapter] --> SDK[Versioned control contract]
-    SDK --> E[Embedded C ABI / InProcessControl]
+    SDK --> E[Embedded C ABI / ControlConnection]
     SDK --> I[IpcControl / OS-authenticated local IPC]
     I --> D[knightbusd]
     E --> K[Same KnightBusEngine implementation]
@@ -34,6 +34,52 @@ USB/driver requirements. See [dual-mode hosting](decisions/dual-mode-hosting.md)
 
 ## Package boundaries
 
+The current implementation has these boundaries:
+
+| Crate | Responsibility |
+| --- | --- |
+| `knightbus-usbip` | Wire validation, flags, status codes and encoding with explicit allocation admission; no OS code |
+| `knightbus-usb` | USB constants, setup packets and allocation-free `no_std` descriptor structure and topology |
+| `knightbus-core` | Policy, sessions, admission, descriptor inventory, native worker scheduling and retirement |
+| `knightbus-transport` | Bounded TCP framing, exporter serving, importer bootstrap/forwarding and event waits |
+| `knightbus-windows-protocol` | `no_std` Windows channel validation and native descriptor restrictions, using `knightbus-usb` |
+| `knightbus-ipc` | Framed control host using core’s `ControlConnection`; embedded callers use it directly |
+| Platform exporter/importer | OS handles, callbacks, native encoding, device discovery and host entry points |
+
+Codec callers use one `encode` and one `decode` entry point, both with explicit
+admission. Borrowed transfer frames avoid temporary payload copies. `Engine::new`
+validates its configuration and then gives its budget to a backend factory;
+native work therefore uses the same admission owner. `Forwarder` takes its budget
+and timeout from its wire connection rather than accepting conflicting copies.
+Device-specific qualification commands live in examples and tests.
+
+Native implementations use `core::exporter::Driver` or `core::importer::Driver`
+through their shared workers. Required capabilities declare limits before native
+publication. The exporter worker owns per-endpoint order, topology barriers,
+cancellation and retirement. Its driver reports the OS's selected endpoint and
+performs the native request. The importer worker owns sequence/token correlation,
+cancellation delivery, selected settings, credits and event-driven scheduling.
+Its driver supplies typed requests, native liveness and retirement operations.
+
+`transport::importer::connect` composes discovery, capability checks, configuration
+verification, the native worker and forwarding with one budget. Exporter hosts
+compose the shared worker through `Engine::new` and use `transport::exporter::serve`.
+Neither OS crate owns a USB/IP forwarding loop. See [implementing an adapter](native-adapters.md)
+for required operations, ownership rules, tests and current shared limitations.
+
+Both core backend traits require `set_waker`; there is no polling fallback.
+The shared `WakeSource` registers and wakes the host outside its lock, including
+on registration so earlier work cannot be missed. Adapters signal lifecycle,
+removal, request, cancellation and completion changes after publishing state.
+The core has no runtime dependency. The transport uses Mio for OS socket readiness
+and wakeups; hosts retain bounded deadline and cleanup checks. Reads return as soon as one frame is complete. Read/write batches remain
+bounded, and writable readiness is enabled only after socket backpressure so an
+idle connection does not spin. Poller metadata has a separate fixed admission
+allowance retained through the last wake owner; OS allocations remain subject to
+platform qualification.
+
+The broader host design assigns these responsibilities:
+
 | Proposed component | May depend on | Must not own |
 | --- | --- | --- |
 | `knightbus-core` | Rust standard library | OS handles, platform FFI, sockets, runtime, USB/IP parser or UI |
@@ -44,8 +90,9 @@ USB/driver requirements. See [dual-mode hosting](decisions/dual-mode-hosting.md)
 
 These names describe responsibilities rather than a required crate count. M6 uses
 `knightbus-core` for contracts, exporter/importer lifecycle and policy, plus
-`knightbus-embedded` and `knightbus-ipc` for thin adapters. Both dispatch to the same
-engine; native attachment succeeds only when the injected backend acknowledges it.
+`knightbus-ipc` for framed control. Embedded callers use core’s `ControlConnection`
+directly. Both paths dispatch to the same engine; native attachment succeeds only
+when the injected backend acknowledges it.
 M12 still owns production IPC and foreign ABI stability.
 
 Introduce packages when their implementation arrives. M5 supplies the workspace,

@@ -1,5 +1,10 @@
 # Windows driver build, lab tests and rollback
 
+Lab tools live under the gitignored repository-root `lab/` directory and are
+absent from a fresh clone. The standalone `lab/Cargo.toml` depends directly on
+the actual importer and shared crates. Driver helpers consume the real driver's
+build output. Run all commands below from the repository root.
+
 This is a development-only driver. Read the [M7 gate report](research/windows-rust-driver-feasibility.md)
 before installation. Use an isolated Windows x64 test VM with a recoverable
 snapshot and debugger; keep its management NIC independent of tested USB devices.
@@ -17,7 +22,8 @@ Fetch the locked kernel dependencies once with network access, then build offlin
 ```powershell
 cargo +1.97.1 fetch --locked --manifest-path drivers/windows/Cargo.toml
 & drivers/windows/build.ps1
-& drivers/windows/package.ps1 -CertificateThumbprint YOUR_EXISTING_LAB_CERT_THUMBPRINT
+& lab/windows/package.ps1 -CertificateThumbprint YOUR_EXISTING_LAB_CERT_THUMBPRINT `
+  -DriverImage "$PWD\drivers\windows\target\x86_64-pc-windows-msvc\debug\knightbus_windows_driver.dll"
 ```
 
 The build script configures the x64 WDK environment, uses the official UDE 1.1
@@ -40,9 +46,9 @@ enable test signing or disable Secure Boot as a product installation step.
 From an elevated PowerShell on an already configured test-signing VM:
 
 ```powershell
-& drivers/windows/install.ps1 -Action Stage -Record C:\Lab\knightbus-install.json
+& lab/windows/install.ps1 -Action Stage -Record lab/windows/target/installation.json
 # Run the tests, then remove only this recorded installation:
-& drivers/windows/install.ps1 -Action Remove -Record C:\Lab\knightbus-install.json
+& lab/windows/install.ps1 -Action Remove -Record lab/windows/target/installation.json
 ```
 
 The record directory must already exist. The default `Stage` action installs the
@@ -52,13 +58,9 @@ including the parent-checked virtual-hub filter. Remove reserves all 64 controll
 slots and refuses active or quarantined owners; it then uninstalls only the
 hash-verified package. Fixed software-controller records can be reused on restaging.
 
-`-Action Install` remains an explicit diagnostic option for older tests requiring
-one persistent root controller. Its record additionally identifies the exact root
-node, hub and previous filters. Remove deletes only its KnightBus filter entry,
-preserves other filters, and removes that recorded subtree/package. Do not use
-this persistent-controller path as the normal attachment lifetime: it retains UDE
-control queues across attachments. Native command failures preserve the record
-for inspection; no wildcard removal, `/force`, or security-policy change is used.
+The helper supports `Stage` and `Remove`. It no longer creates persistent
+legacy controllers. Removal still accepts previously recorded legacy installs
+so they can be rolled back using their exact node/package identities.
 
 If PowerShell policy prevents a reviewed local script, use a process-scoped
 execution-policy override, not a machine policy change. No security-setting
@@ -70,40 +72,34 @@ that as a failed teardown result even if rollback subsequently succeeds.
 
 ## Repeatable native tests
 
-First run normal workspace checks. Native tests are ignored by default because
-GitHub-hosted CI has no staged KnightBus driver. With the package staged, an
-elevated lab shell and no active attachments, run the normal ownership path:
+The lab tests use the actual importer crate. For process-death checks, build and
+select its real CLI explicitly. All native tests are ignored by default:
 
 ```powershell
-cargo +1.85.0 test -p knightbus-windows-importer --test native native_owned_ -- --ignored --test-threads=1
-cargo +1.85.0 test -p knightbus-windows-importer --lib native::lifetime::tests -- --ignored --test-threads=1
+cargo build -p knightbus-windows-importer --target-dir lab/product-target --locked --offline
+cargo test --manifest-path lab/Cargo.toml --all-targets --no-run --locked --offline
+$env:KNIGHTBUS_IMPORTER_BINARY=(Resolve-Path lab/product-target/debug/knightbus-windows-importer.exe).Path
 ```
 
-These cover repeated native CDC transfers, failed attachment, process/network loss,
-simultaneous owners, and a native COM file held open after the importer exits.
-The held-file regression checks that the kernel retains an unsignaled slot event
-until the last client closes, then acknowledges destruction. It deliberately
-expects cleanup failure rather than premature credit reuse when the file remains
-open past the deadline. The slot test reserves all names briefly and must run
-without other lab owners. For the lower-level `native_cdc_bulk`,
-`native_channel_rejects`, `native_owner_exit`, and explicit two-controller tests,
-use separately recorded `-Action Install` diagnostic controllers.
+With the matching driver staged, administrator access, and no active attachments:
 
-The reservation tests also impersonate a privilege-stripped token with the
-Administrators SID disabled. It must be denied creation in the protected object
-directory while it can occupy all 64 old global names with mutexes. After reverting
-to the elevated token, all protected controller slots must remain available.
-Use matched adapter/driver builds: the protected-namespace readiness IOCTL differs
-from the earlier global-event contract.
+```powershell
+cargo test --manifest-path lab/Cargo.toml --test windows_native native_owned_ -- --ignored --test-threads=1
+```
 
-The tests serialize access to the lab controller. The original local CDC exporter
-proves Windows enumeration, 20 checked bulk loopbacks, normal removal, abrupt
-socket shutdown and importer-process termination. It uses native `usbser` COM
-handles, not a fake client that reads the private IOCTL stream. Owned-object
-counters are necessary checks but do not detect the known UDE control-queue growth.
+These tests cover failed attachment, repeated CDC transfers, process/network
+loss, simultaneous controllers, and a COM client held open after importer exit.
+The held-client test observes the kernel reservation event through the OS.
+It does not depend on private importer modules or lab-only driver counters.
+
+The SuperSpeed publication test is selected with
+`native_superspeed_descriptor_publication_and_retirement`.
+Legacy preinstalled-controller tests and private notification/slot tests were
+retired with their implementation copies; historical results remain in the
+validation reports. Future tests must target the actual public/OS contract.
 
 For endpoint-stall recovery, stage the small test-only
-[`tests/winusb.inf`](../crates/importers/knightbus-windows-importer/tests/winusb.inf)
+[`winusb.inf`](../lab/windows/winusb.inf)
 package in the isolated VM. It binds Microsoft's inbox WinUSB to synthetic
 `1209:0004`; it contains no driver binary. Copy that INF to a separate lab folder,
 generate its catalog with the installed `Inf2Cat /driver:LAB_FOLDER /os:10_NI_X64`,
@@ -113,7 +109,7 @@ signature, stage with `pnputil /add-driver LAB_FOLDER\winusb.inf`, and record th
 returned OEM name and INF hash. Never change certificate trust for this test.
 
 ```powershell
-cargo +1.85.0 test -p knightbus-windows-importer --test native native_bulk_stall_reset -- --ignored --nocapture
+cargo test --manifest-path lab/Cargo.toml --test windows_native native_bulk_stall_reset -- --ignored --nocapture
 ```
 
 The fixture stays halted until the actual remote CLEAR_FEATURE arrives. A direct
@@ -123,23 +119,14 @@ reset succeeds only after the peer observes its clear, followed by
 recorded, hash-verified test package afterward with `pnputil /delete-driver
 OEM_NAME /uninstall`. No physical device is needed for this regression.
 
-The separately ignored `native_two_controllers_isolate_owner_exit` test requires
-`KNIGHTBUS_TEST_CONTROLLERS` containing two exact instance IDs separated by `;`.
-It exercises both native COM devices, terminates one owner, then proves the
-surviving controller still transfers data. Create the extra lab devnode explicitly
-using the same staged package; record its returned instance ID, bind its own
-virtual-hub filter with the same parent validation, and remove that exact node
-afterward. A controller without its filter deliberately rejects ATTACH. This test does not require
-or perform automatic hub recycling.
-
 For stock Linux interoperability, use an isolated kernel with `dummy_hcd`,
 `libcomposite`, stock `usbip_host`/USB/IP tools and `iptables`. The original bounded
-[CDC fixture](../crates/importers/knightbus-windows-importer/tests/linux_fixture.py) owns one named
+[CDC fixture](../lab/windows/linux_fixture.py) owns one named
 configfs gadget, limits its raw TCP port to the specified Windows peer, echoes
 CDC bytes, and removes its gadget/exporter/firewall rule on exit:
 
 ```sh
-sudo python3 crates/importers/knightbus-windows-importer/tests/linux_fixture.py --peer WINDOWS_LAB_IP --composite
+sudo python3 lab/windows/linux_fixture.py --peer WINDOWS_LAB_IP --composite
 ```
 
 It prints the actual bus ID. `--composite` exposes two independent CDC functions;
@@ -154,7 +141,7 @@ $env:KNIGHTBUS_TEST_EXPORTER='LINUX_LAB_IP:43240'
 $env:KNIGHTBUS_TEST_BUS_ID='BUS_ID_PRINTED_BY_FIXTURE'
 $env:KNIGHTBUS_TEST_PORT_COUNT='2' # Use 1 without --composite.
 try {
-    cargo +1.85.0 test -p knightbus-windows-importer --test native native_owned_controller_retirement -- --ignored --nocapture
+    cargo test --manifest-path lab/Cargo.toml --test windows_native native_owned_controller_retirement -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) { throw 'Native interoperability test failed' }
 } finally {
     Remove-Item Env:KNIGHTBUS_TEST_EXPORTER,Env:KNIGHTBUS_TEST_BUS_ID,Env:KNIGHTBUS_TEST_PORT_COUNT
@@ -174,13 +161,13 @@ stock `usbip bind`, use its actual bus ID, and drive it through its native Windo
 application. The development runner is:
 
 ```powershell
-cargo run -p knightbus-windows-importer -- --insecure-lab LINUX_LAB_IP:PORT BUS_ID 30
+cargo run -p knightbus-windows-importer -- --insecure LINUX_LAB_IP:PORT BUS_ID 30
 ```
 
 It fetches real descriptors and forwards native requests for the requested short
 run. Exercise controls during that window and verify local recovery after unbind.
-The optional final argument is an exact controller instance ID. This is not a
-production authenticated network listener or a general configuration UI.
+The importer creates its own controller for each attachment. Raw USB/IP requires
+an authenticated tunnel; this CLI is not a general configuration UI.
 
 Before/after each lifecycle experiment, collect:
 

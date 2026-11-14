@@ -160,37 +160,15 @@ impl Budget {
     }
     /// Encode to an owned, charged transport buffer. The source message's storage
     /// remains separately charged until its owner is released.
-    pub fn encode(
+    pub fn encode<'a>(
         &self,
-        message: &crate::usbip::Message,
+        message: impl Into<crate::usbip::Frame<'a>>,
         limits: crate::usbip::Limits,
     ) -> std::result::Result<Buffer, crate::usbip::Error> {
         let mut credit = self
             .reserve(0, 0)
             .map_err(|_| crate::usbip::Error::Limit("aggregate bytes"))?;
-        let bytes =
-            crate::usbip::encode_with_admission(message, limits, &mut |n| admit(&mut credit, n))?;
-        Ok(Buffer {
-            bytes,
-            _credit: credit,
-        })
-    }
-    /// Encode borrowed SUBMIT storage directly into one charged wire buffer.
-    /// The caller keeps the payload/ISO owner and its credits alive separately.
-    pub fn encode_submit(
-        &self,
-        header: &crate::usbip::SubmitHeader,
-        data: &[u8],
-        packets: &[crate::usbip::IsoPacket],
-        limits: crate::usbip::Limits,
-    ) -> std::result::Result<Buffer, crate::usbip::Error> {
-        let mut credit = self
-            .reserve(0, 0)
-            .map_err(|_| crate::usbip::Error::Limit("aggregate bytes"))?;
-        let bytes =
-            crate::usbip::encode_submit_with_admission(header, data, packets, limits, &mut |n| {
-                admit(&mut credit, n)
-            })?;
+        let bytes = crate::usbip::encode(message, limits, &mut |n| admit(&mut credit, n))?;
         Ok(Buffer {
             bytes,
             _credit: credit,
@@ -230,9 +208,7 @@ impl IncomingDecoder {
         input: &[u8],
     ) -> std::result::Result<(usize, Option<DecodedMessage>), crate::usbip::Error> {
         let credit = self.credit.as_mut().ok_or(crate::usbip::Error::Poisoned)?;
-        let (used, message) = self
-            .decoder
-            .push_with_admission(input, &mut |n| admit(credit, n))?;
+        let (used, message) = self.decoder.push(input, &mut |n| admit(credit, n))?;
         Ok((
             used,
             message.map(|message| DecodedMessage {

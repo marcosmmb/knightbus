@@ -1,6 +1,6 @@
 use crate::{Caller, DeviceKey, Error, PeerId, Result, Session, SessionId};
 
-/// Major version of the mock-host control contract (independent of USB/IP).
+/// Major version of the control contract (independent of USB/IP).
 pub const CONTROL_VERSION: u16 = 1;
 /// Host-neutral management request. Contains no USB payloads or credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub trait ControlTarget {
 pub struct Request {
     /// Control protocol version.
     pub version: u16,
-    /// Correlation ID (represented as a full u64 in the M6 typed IPC harness).
+    /// Connection-local correlation ID.
     pub id: u64,
     /// Absolute local deadline; the receiving host owns this clock.
     pub deadline: u64,
@@ -109,4 +109,65 @@ pub struct Response {
     pub id: u64,
     /// Stable operation result.
     pub result: std::result::Result<Reply, Error>,
+}
+
+/// A control connection bound to trusted caller authority. Owns subscriptions,
+/// checks their scope, and releases them on close without ending device leases.
+pub struct ControlConnection<'a, T: ControlTarget> {
+    target: &'a mut T,
+    caller: Caller,
+    subscriptions: std::collections::BTreeSet<u64>,
+}
+impl<'a, T: ControlTarget> ControlConnection<'a, T> {
+    /// Check the protocol version before exposing engine operations.
+    pub fn new(target: &'a mut T, caller: Caller, version: u16) -> Result<Self> {
+        if version != CONTROL_VERSION {
+            return Err(Error::Version);
+        }
+        Ok(Self {
+            target,
+            caller,
+            subscriptions: Default::default(),
+        })
+    }
+    /// Release connection-local subscriptions. Device leases remain engine-owned.
+    pub fn close(&mut self) {
+        for id in std::mem::take(&mut self.subscriptions) {
+            let _ = self
+                .target
+                .execute(self.caller, Command::Unsubscribe(id), u64::MAX);
+        }
+    }
+}
+impl<T: ControlTarget> KnightBusControl for ControlConnection<'_, T> {
+    fn call(&mut self, command: Command, deadline: u64) -> Result<Reply> {
+        let unsubscribe = match command {
+            Command::Poll(id) | Command::Unsubscribe(id) => {
+                if !self.subscriptions.contains(&id) {
+                    return Err(Error::Denied);
+                }
+                if matches!(command, Command::Unsubscribe(_)) {
+                    Some(id)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let result = self.target.execute(self.caller, command, deadline);
+        if let Ok(Reply::Subscription(id)) = &result {
+            self.subscriptions.insert(*id);
+        }
+        if result.is_ok() {
+            if let Some(id) = unsubscribe {
+                self.subscriptions.remove(&id);
+            }
+        }
+        result
+    }
+}
+impl<T: ControlTarget> Drop for ControlConnection<'_, T> {
+    fn drop(&mut self) {
+        self.close();
+    }
 }

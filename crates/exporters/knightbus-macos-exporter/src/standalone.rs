@@ -1,10 +1,8 @@
-//! Explicit single-device development host; loopback only, no implicit grants.
+//! Single-device host; loopback only, with an explicit grant.
+use knightbus_core::exporter::Backend;
 use knightbus_core::*;
-use knightbus_macos_exporter::{
-    Backend,
-    native::{self, Native},
-    transport::{self, Mono},
-};
+use knightbus_macos_exporter::native::{self, Native};
+use knightbus_transport::exporter::{self as transport, Mono};
 use std::{
     net::{Ipv4Addr, TcpListener},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -24,7 +22,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
         .into_iter()
         .find(|d| d.registry_id == registry)
         .ok_or(Error::NotFound)?;
-    let snapshot = native::inspect(id, native::lab_key(id))?;
+    let snapshot = native::inspect(id, id.device_key())?;
     if snapshot
         .device
         .configurations
@@ -41,7 +39,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
     let key = device.key;
     let bus = String::from_utf8_lossy(device.wire.bus_id.as_bytes()).into_owned();
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let mut engine = Engine::with_backend_factory(
+    let mut engine = Engine::new(
         Mono::default(),
         Config {
             resources: ResourceLimits {
@@ -61,8 +59,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
         },
     )?;
     engine.register(device)?;
-    // This is explicitly an insecure local lab principal, not a certificate or
-    // proof of remote identity. The operator establishes the external SSH tunnel.
+    // Loopback authority only. The host must authenticate the remote tunnel peer.
     let caller = Caller {
         peer: PeerId([0x4d; 32]),
         administrator: false,
@@ -80,9 +77,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
         u64::MAX,
     )?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-    eprintln!(
-        "Development-only raw USB/IP on loopback; use an authenticated tunnel to the selected importer."
-    );
+    eprintln!("Raw USB/IP on loopback; use an authenticated tunnel to the selected importer.");
     println!(
         "listening={} bus_id={bus} registry=0x{registry:x}",
         listener.local_addr()?

@@ -13,7 +13,7 @@ backends. It does not change the native feasibility or production release gates.
 | `backend.rs` | Nonblocking physical/virtual backend contracts and importer lifecycle |
 | `engine.rs` | Exporter policy, leases, concurrent transfers and rollback |
 | `control.rs` | Shared versioned management operations and fixed-size events |
-| `knightbus-embedded` | Thin `InProcessControl`, with host-bound caller authority |
+| `knightbus-core::ControlConnection` | In-process control with host-bound caller authority; the former embedded wrapper crate has been removed |
 | `knightbus-ipc` | Bounded Service harness, request/reply framing and `IpcControl` |
 | `knightbus-core/tests/engine.rs` | One mock apparatus and shared host contract scenarios |
 

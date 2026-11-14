@@ -21,7 +21,7 @@ Current measured scope on the selected joystick:
 | Native cancellation and explicit reset | Passed; canceled completion `-125`, reset retired the generation |
 | Active-I/O physical hot-unplug | Passed after fixing disconnected Mach-port mapping; session closed, inventory removed, credits zero |
 | Idle physical unplug | Passed via service-termination callback with no pending transfers; session closed, inventory removed, credits zero |
-| Root in-process host and temporary system launchd host | Both passed using the shared engine/backend and `InProcessControl` |
+| Root in-process host and temporary system launchd host | Both passed using the shared engine/backend and `ControlConnection` |
 | Ordinary-user capture | Correctly refused with `Denied` |
 | Exporter SIGKILL and reclaim | New generation appeared; subsequent full engine cycle passed |
 | Local application input after release/reclaim | Ordinary UID 501 IOHID consumer received three seven-byte reports after each host/reclaim trial |
@@ -329,7 +329,7 @@ the owner-approved M8 development completion scope.
 ### First finalization trial: normal capture and local recovery pass
 
 `m8-1113-234306-3b2f` passed a root shared-engine cycle without native journal
-initialization, routing authorization and attachment through `InProcessControl`.
+initialization, routing authorization and attachment through `ControlConnection`.
 Device/report reads, configuration/alternate reselection, interrupt input, queued
 unlink and shutdown passed; owned credits returned to zero. An ordinary-user
 capture attempt returned `Denied` (exit 1). An independent UID 501 IOHID consumer

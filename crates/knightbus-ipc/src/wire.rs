@@ -36,7 +36,7 @@ const EVENT_INVENTORY: u8 = 0;
 const EVENT_SESSION: u8 = 1;
 const EVENT_RESYNC: u8 = 2;
 
-// Error discriminants are owned by the shared control contract.
+// Error discriminants are defined by the control API.
 const STATUS_OK: u16 = 0;
 const STATUS_INVALID: u16 = Error::Invalid as u16;
 const STATUS_STATE: u16 = Error::State as u16;
@@ -51,7 +51,7 @@ const STATUS_EXHAUSTED: u16 = Error::Exhausted as u16;
 const STATUS_INTERNAL: u16 = Error::Internal as u16;
 const STATUS_CLEANUP: u16 = Error::Cleanup as u16;
 
-/// Encode a bounded M6 management request, with a little-endian u32 body length.
+/// Encode a bounded management request with a little-endian u32 body length.
 /// This provisional harness format is independent of standard USB/IP framing.
 pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
     let mut b = Vec::new();
