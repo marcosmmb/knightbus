@@ -114,6 +114,11 @@ impl Transfer {
     pub fn buffer_mut(&mut self) -> &mut [u8] {
         self.buffer.as_mut_slice()
     }
+    /// Charge platform scratch storage to this transfer's aggregate budget.
+    /// Keep the returned guard until all native access has retired.
+    pub fn reserve_native_memory(&self, bytes: usize) -> Result<crate::MemoryReservation> {
+        self.credit.budget.reserve_memory(bytes)
+    }
     /// ISO completion descriptors; identity/bounds rechecked at retirement.
     pub fn packets_mut(&mut self) -> &mut [IsoPacket] {
         &mut self.packets
@@ -138,10 +143,20 @@ impl Transfer {
     pub(crate) fn retire(&mut self) {
         self.credit.retire();
     }
-    pub(crate) fn validate(&self, device: &Device) -> Result<()> {
+    pub(crate) fn validate(&self, device: &Device, managed: bool) -> Result<()> {
         let s = &self.header;
         if s.device_id != device.wire_id() {
             return Err(Error::Invalid);
+        }
+        // Dynamic backends validate endpoint existence/type/flags against their
+        // live topology at ordered submission, including queued configuration
+        // changes. Authorization, budgets and correlation remain engine-owned.
+        if managed && s.endpoint != 0 {
+            return if s.setup == [0; 8] {
+                Ok(())
+            } else {
+                Err(Error::Invalid)
+            };
         }
         let (kind, flags) = if s.endpoint == 0 {
             (TransferKind::Control, 0)
@@ -170,7 +185,9 @@ impl Transfer {
             }
             // Configuration/alternate changes require topology coordination, not
             // a raw transfer that could invalidate outstanding endpoint requests.
-            if s.setup[0] & 0x60 == 0 && matches!(s.setup[1], 5 | 9 | 11) {
+            if s.setup[0] & 0x60 == 0
+                && (s.setup[1] == 5 || (!managed && matches!(s.setup[1], 9 | 11)))
+            {
                 return Err(Error::Unsupported);
             }
         } else if s.setup != [0; 8] {

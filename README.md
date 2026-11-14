@@ -7,8 +7,9 @@ and Windows x64 importer for a flight joystick.
 
 ## Build and verify
 
-Rust 1.85.0 is the minimum and pinned formatting toolchain. The product crates have
-no third-party dependencies; after toolchain installation these checks run offline:
+Rust 1.85.0 is the minimum and pinned formatting toolchain. Portable core/protocol
+crates use the standard library; native backends use ordinary OS bindings.
+After toolchain installation and `cargo fetch --locked`, these checks run offline:
 
 ```sh
 cargo fmt --all --check
@@ -33,6 +34,7 @@ the validation report records the measured Linux interoperability results.
 - [Measured gates](docs/gate-status.md) and [platform matrix](docs/platform-support-matrix.md)
 - [Architecture decisions](docs/decisions/README.md)
 - [Testing strategy](docs/testing-strategy.md) and [M4 review](docs/milestone4-validation.md)
+- [M8 macOS implementation and kernel-panic hold](docs/milestone8-validation.md)
 
 Original work is licensed under **MIT**;
 see [LICENSE](LICENSE) and the [license decision](docs/decisions/license.md).

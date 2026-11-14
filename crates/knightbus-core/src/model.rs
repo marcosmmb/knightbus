@@ -139,7 +139,9 @@ impl DeviceId {
     }
 }
 impl Device {
-    pub(crate) fn storage_bytes(&self) -> Result<usize> {
+    /// Allocated descriptor-topology capacity, excluding this fixed-size value.
+    /// Backend owners use this to reserve shared metadata credits before cloning.
+    pub fn storage_bytes(&self) -> Result<usize> {
         let mut bytes = self
             .configurations
             .capacity()

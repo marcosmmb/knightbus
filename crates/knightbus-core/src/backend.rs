@@ -12,6 +12,17 @@ pub trait Clock {
 /// storage on unexpected host destruction; dropping this Rust owner alone is
 /// never evidence that native callbacks stopped. No callback may outlive storage.
 pub trait ExporterBackend {
+    /// A backend opting in validates requests against its live configuration and
+    /// alternates, serializes topology changes, and retains old pipes until drain.
+    /// The default keeps the M6 fixed-topology validation contract.
+    fn manages_topology(&self) -> bool {
+        false
+    }
+    /// Report a terminated physical generation, including idle devices. The
+    /// engine revokes its availability and drains any affected leases.
+    fn poll_removed(&mut self) -> Option<DeviceKey> {
+        None
+    }
     /// Poll acquisition, idempotent for the same session/device. Pending owns
     /// provisional resources; release must retire them even if claim never wins.
     fn claim(&mut self, session: SessionId, device: &Device) -> Poll<Result<()>>;

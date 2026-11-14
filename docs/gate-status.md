@@ -1,5 +1,17 @@
 # Inputs and current gate status
 
+**M8 PASS for the owner-approved development scope (2026-11-13).** The original
+Rust macOS exporter enumerates, claims and transfers with the exact Logitech
+joystick. Refusal, STALL/recovery, cancellation, reset, active/idle removal,
+root in-process and launchd hosting, captured-owner death/reclaim and local HID
+recovery passed. Normal explicit capture needs no lab recorder. Final workspace
+checks passed on macOS (86 tests) and Linux via Apple `container` (81 tests), with
+zero failures. The [M8 report](milestone8-validation.md) defines exact scope and
+archived evidence. The owner explicitly deferred investigation of the earlier
+kernel panic; it remains unresolved and recorded. Bulk/ISO hardware breadth,
+M9 end-to-end integration, M12 full host parity and production release are separate
+gates, not implied by this development pass.
+
 M4 reads the committed findings on their original branches. It does not merge
 spike code or raw evidence into the production workspace. These are historical
 measured reports, not new M4 hardware runs.
