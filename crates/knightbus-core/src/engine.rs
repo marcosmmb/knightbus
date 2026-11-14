@@ -116,6 +116,27 @@ pub enum UnlinkState {
 impl<B: ExporterBackend, C: Clock> Engine<B, C> {
     /// Inject backend, clock, bounds, and a fresh nonzero host epoch.
     pub fn new(backend: B, clock: C, config: Config, epoch: u64) -> Result<Self> {
+        Self::with_budget(backend, clock, config, epoch, Budget::new(config.resources))
+    }
+    /// Build a backend against the same aggregate admission budget as the
+    /// engine, before any platform handles or asynchronous work are acquired.
+    pub fn with_backend_factory(
+        clock: C,
+        config: Config,
+        epoch: u64,
+        factory: impl FnOnce(&Budget) -> Result<B>,
+    ) -> Result<Self> {
+        let budget = Budget::new(config.resources);
+        let backend = factory(&budget)?;
+        Self::with_budget(backend, clock, config, epoch, budget)
+    }
+    fn with_budget(
+        backend: B,
+        clock: C,
+        config: Config,
+        epoch: u64,
+        budget: Budget,
+    ) -> Result<Self> {
         if epoch == 0
             || config.events == 0
             || config.batch == 0
@@ -129,7 +150,6 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
             return Err(Error::Invalid);
         }
         let now = clock.now();
-        let budget = Budget::new(config.resources);
         let replies = ReplyPool::new(&budget, config.resources.requests)?;
         let size = std::mem::size_of::<(VecDeque<Event>, Credit)>();
         let mut admin_credit = budget.reserve(
@@ -441,7 +461,7 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
         {
             return Err(Error::Denied);
         }
-        transfer.validate(&device.device)?;
+        transfer.validate(&device.device, self.backend.manages_topology())?;
         // Retired replies also occupy a slot: slow consumers backpressure even
         // zero-byte operations after native request credits have been released.
         let queued = self.replies.len();
@@ -531,6 +551,13 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
             self.shutdown();
         }
         self.last_now = now;
+
+        for _ in 0..self.config.devices {
+            let Some(key) = self.backend.poll_removed() else {
+                break;
+            };
+            let _ = self.remove(key);
+        }
 
         // Preserve race resolution: deadlines before completions, then claims and releases.
         self.expire_deadlines(now);

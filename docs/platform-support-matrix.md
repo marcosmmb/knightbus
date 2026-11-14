@@ -1,5 +1,13 @@
 # Platform support and capability model
 
+**M8 development scope PASS:** the exact Logitech joystick passes ordinary
+explicit root capture, descriptors, interrupt input, errors/cancellation/reset,
+active and idle unplug, in-process/temporary launchd hosting, process-death reclaim
+and local HID input recovery. Unprivileged capture is correctly denied. The owner
+deferred investigation of the earlier macOS 27.2.1 panic; no fix or production
+approval is claimed. See the [M8 report](milestone8-validation.md) for evidence
+and the remaining M9/M10/M12/release boundaries.
+
 M5 implements the portable codec; M6 adds the portable engine and host APIs.
 M7 adds a development Windows importer/UDE backend with integrated attachment-owned
 controllers and passing native fault/isolation/final-reference retirement tests. The intermittent NCM stall
@@ -12,7 +20,7 @@ for current limits and measurements.
 
 | Platform / role | Measured feasibility | Product backend / release | Hosting/default |
 | --- | --- | --- | --- |
-| Apple Silicon macOS exporter | PASS for root-captured `046d:c215` control/interrupt-IN primitive and M3 native path; M2 overall UNPROVEN | UNPROVEN: supported privileged service/helper installation, signing/notarization, fault coverage and classes | Service default; actual daemon and Embedded process contexts UNPROVEN |
+| Apple Silicon macOS exporter | PASS for root-captured `046d:c215` control/interrupt-IN primitive and M3 native path; M2 overall UNPROVEN | UNPROVEN: supported privileged service/helper installation, signing/notarization, fault coverage and classes | Service default; M8 root in-process and temporary launchd contexts PASS; ordinary-user capture Denied; M12 full parity unqualified |
 | Windows 11 x64 importer | PASS for synthetic/native and real joystick uses; M1 overall UNPROVEN, queues retained | UNPROVEN: framework retirement, production signing, Secure Boot/HVCI, broad transfers | Service default; both hosts still need the same original native driver |
 | Linux exporter/importer | M5 codec interoperability PASS with stock Linux importer and synthetic USB device; KnightBus native backend UNPROVEN | Not implemented; external kernel control/bulk/interrupt/ISO and cancellation checks pass within the documented lab scope | Service proposed; Embedded design retained |
 | Windows exporter | UNPROVEN | Not implemented; capture/rebinding and restoration need separate proof | Service proposed |

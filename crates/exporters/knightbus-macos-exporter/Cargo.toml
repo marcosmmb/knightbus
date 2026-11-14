@@ -1,0 +1,25 @@
+[package]
+name = "knightbus-macos-exporter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Original macOS IOUSBHost physical USB exporter"
+
+[dependencies]
+knightbus-core = { path = "../../knightbus-core" }
+knightbus-embedded = { path = "../../knightbus-embedded" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+block2 = "=0.6.2"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSData", "NSError", "NSString"] }
+objc2-io-usb-host = "=0.3.2"
+objc2-io-kit = "=0.3.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
