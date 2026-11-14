@@ -77,6 +77,74 @@ fn every_independent_golden_vector_round_trips_byte_for_byte() {
     }
 }
 #[test]
+fn borrowed_submit_preserves_golden_bytes_and_validation_before_admission() {
+    for (name, context) in cases() {
+        let bytes = fixture(name);
+        let (message, _) = decode(&bytes, context, Limits::default()).unwrap();
+        let Message::Submit(submit) = message else {
+            continue;
+        };
+        let header = SubmitHeader::from(&submit);
+        let mut admitted = 0;
+        let encoded = encode_submit_with_admission(
+            &header,
+            &submit.data,
+            &submit.iso_packets,
+            Limits::default(),
+            &mut |n| {
+                admitted += n;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(encoded, bytes, "{name}");
+        assert_eq!(admitted, encoded.capacity());
+        assert!(matches!(
+            encode_submit_with_admission(
+                &header,
+                &submit.data,
+                &submit.iso_packets,
+                Limits::default(),
+                &mut |_| Err(Error::Limit("test budget"))
+            ),
+            Err(Error::Limit("test budget"))
+        ));
+        let mut invalid = header;
+        invalid.endpoint = 16;
+        let mut allocated = false;
+        assert!(
+            encode_submit_with_admission(
+                &invalid,
+                &submit.data,
+                &submit.iso_packets,
+                Limits::default(),
+                &mut |_| {
+                    allocated = true;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            encode_submit_with_admission(
+                &header,
+                &submit.data,
+                &submit.iso_packets,
+                Limits {
+                    frame_bytes: bytes.len() - 1,
+                    ..Limits::default()
+                },
+                &mut |_| {
+                    allocated = true;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(!allocated, "invalid input must fail before allocation");
+    }
+}
+#[test]
 fn golden_values_have_correct_meaning_not_just_round_trips() {
     let limits = Limits::default();
     let (m, _) = decode(&fixture("devlist-two"), Context::Management, limits).unwrap();

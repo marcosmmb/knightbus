@@ -44,6 +44,11 @@ pub trait ImporterBackend {
         session: SessionId,
         budget: &crate::Budget,
     ) -> Option<Result<Transfer>>;
+    /// Native cancellation of an already delivered request. The transport must
+    /// unlink that sequence and keep its transfer owner until remote retirement.
+    fn next_cancellation(&mut self, _session: SessionId) -> Option<u32> {
+        None
+    }
     /// Consume a validated completion, retaining its credits until driver access
     /// retires. Failure returns ownership so the session can drain safely.
     #[allow(clippy::result_large_err)] // Preserve ownership without allocating on failure.

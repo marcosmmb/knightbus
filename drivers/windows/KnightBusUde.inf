@@ -1,0 +1,64 @@
+; KnightBus-owned lab controller package. Not a production or signed package.
+; Only our synthetic hardware ID matches. The installer separately binds this
+; service as a lower filter on its own virtual root hub, never a physical hub.
+; System is the documented vendor-available bus class. USB setup class is
+; documented as OS-reserved. See the lab report for tested UDE/PnP scope.
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=11/11/2026,0.1.0.0
+CatalogFile=KnightBusUde.cat
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...22000
+
+[Models.NTamd64.10.0...22000]
+%ControllerDescription%=Controller,ROOT\KNIGHTBUS_UDE
+
+[Controller.NT]
+CopyFiles=ControllerFiles
+
+; PnP applies device/class security after AddDevice. Specify this per-device
+; policy explicitly; never change the shared System setup-class descriptor.
+[Controller.NT.HW]
+AddReg=ControllerSecurity
+
+[ControllerSecurity]
+HKR,,Security,0x00000000,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Controller.NT.Services]
+AddService=KnightBusUde,0x00000002,ControllerService
+
+[ControllerService]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\KnightBusUde.sys
+
+[Controller.NT.Wdf]
+KmdfService=KnightBusUde,ControllerFramework
+
+[ControllerFramework]
+KmdfLibraryVersion=1.33
+
+[DestinationDirs]
+ControllerFiles=13
+
+[ControllerFiles]
+KnightBusUde.sys
+
+[SourceDisksNames]
+1=%DiskDescription%,,,
+
+[SourceDisksFiles]
+KnightBusUde.sys=1
+
+[Strings]
+Provider="KnightBus Lab"
+ControllerDescription="KnightBus USB controller"
+ServiceDescription="KnightBus UDE driver"
+DiskDescription="KnightBus locally built development package"

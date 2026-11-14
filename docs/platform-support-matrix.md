@@ -1,9 +1,14 @@
 # Platform support and capability model
 
-**M5 implements a portable codec, tested on macOS, Windows and Linux.** No
-engine, backend or runtime capability API is implemented. Compilation and codec
-tests do not by themselves constitute evidence of native USB support. See
-[M5 validation](milestone5-validation.md) for the exact external peer checks.
+M5 implements the portable codec; M6 adds the portable engine and host APIs.
+M7 adds a development Windows importer/UDE backend with integrated attachment-owned
+controllers and passing native fault/isolation/final-reference retirement tests. The intermittent NCM stall
+was traced to Linux's gadget timer; a temporary fixture correction passed repeated
+traffic tests without changing KnightBus or stock `usbip_host`. M7 passes its agreed
+fixture scope; physical-device and sleep/wake qualification were explicitly deferred
+by the owner. Broader native/release qualification remains UNPROVEN. The historical table below
+records the earlier baseline; see [M7 findings](research/windows-rust-driver-feasibility.md)
+for current limits and measurements.
 
 | Platform / role | Measured feasibility | Product backend / release | Hosting/default |
 | --- | --- | --- | --- |

@@ -26,6 +26,12 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct Budget(Arc<Mutex<State>>);
 impl Budget {
+    /// Reserve byte credits for externally allocated backend metadata. Reserve
+    /// before allocation and keep the guard until that storage actually retires.
+    /// The caller must include capacity and overlapping replacement allocations.
+    pub fn reserve_memory(&self, bytes: usize) -> Result<MemoryReservation> {
+        self.reserve(bytes, 0).map(MemoryReservation)
+    }
     /// Construct a budget. Zero limits intentionally disable data admission.
     pub fn new(limits: ResourceLimits) -> Self {
         Self(Arc::new(Mutex::new(State {
@@ -76,6 +82,17 @@ impl Budget {
             bytes,
             _credit: credit,
         })
+    }
+}
+
+/// RAII credits for backend-owned metadata or native storage. Dropping the guard
+/// asserts the corresponding allocation can no longer be used by callbacks.
+#[derive(Debug)]
+pub struct MemoryReservation(Credit);
+impl MemoryReservation {
+    /// Bytes charged to the shared budget.
+    pub fn bytes(&self) -> usize {
+        self.0.bytes
     }
 }
 #[derive(Debug)]
@@ -153,6 +170,27 @@ impl Budget {
             .map_err(|_| crate::usbip::Error::Limit("aggregate bytes"))?;
         let bytes =
             crate::usbip::encode_with_admission(message, limits, &mut |n| admit(&mut credit, n))?;
+        Ok(Buffer {
+            bytes,
+            _credit: credit,
+        })
+    }
+    /// Encode borrowed SUBMIT storage directly into one charged wire buffer.
+    /// The caller keeps the payload/ISO owner and its credits alive separately.
+    pub fn encode_submit(
+        &self,
+        header: &crate::usbip::SubmitHeader,
+        data: &[u8],
+        packets: &[crate::usbip::IsoPacket],
+        limits: crate::usbip::Limits,
+    ) -> std::result::Result<Buffer, crate::usbip::Error> {
+        let mut credit = self
+            .reserve(0, 0)
+            .map_err(|_| crate::usbip::Error::Limit("aggregate bytes"))?;
+        let bytes =
+            crate::usbip::encode_submit_with_admission(header, data, packets, limits, &mut |n| {
+                admit(&mut credit, n)
+            })?;
         Ok(Buffer {
             bytes,
             _credit: credit,

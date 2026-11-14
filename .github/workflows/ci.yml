@@ -26,6 +26,8 @@ jobs:
       - name: Format
         if: matrix.rust == '1.85.0'
         run: cargo +${{ matrix.rust }} fmt --all --check
+      - name: Fetch locked dependencies
+        run: cargo +${{ matrix.rust }} fetch --locked
       - name: Lint
         run: cargo +${{ matrix.rust }} clippy --workspace --all-targets --locked --offline -- -D warnings
       - name: Tests
@@ -48,6 +50,7 @@ jobs:
       # Build the CLI on stable; only fuzz target instrumentation needs nightly.
       - run: cargo +1.85.0 install cargo-fuzz --version 0.13.1 --locked
       - run: cargo +nightly-2026-05-25 fetch --manifest-path crates/knightbus-usbip/tests/fuzz/Cargo.toml --locked
+      - run: cargo +1.85.0 fetch --locked
       - run: cargo test -p knightbus-usbip --locked --offline --test protocol write_fuzz_seeds -- --ignored
       - name: Fuzz both parsers
         env:

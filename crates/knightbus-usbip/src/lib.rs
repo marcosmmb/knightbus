@@ -18,6 +18,8 @@
 mod codec;
 mod model;
 mod stream;
-pub use codec::{decode, decode_with_admission, encode, encode_with_admission};
+pub use codec::{
+    decode, decode_with_admission, encode, encode_submit_with_admission, encode_with_admission,
+};
 pub use model::*;
 pub use stream::{Decoder, read_message, write_message};
