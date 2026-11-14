@@ -76,8 +76,12 @@ hardware/power behavior.
 ## Deliberate limits and open work
 
 - One configuration, up to 64 interface/alternate pairs, 30 nondefault endpoint
-  addresses, 4 KiB configuration descriptors and 64 KiB native transfers.
-- Low/full/high speed metadata is validated. Control, bulk and interrupt routing
+  addresses, 4 KiB configuration/BOS descriptors and 1 MiB native transfers.
+  Fixed payload storage is charged as 31 MiB per controller; host admission
+  budgets must include that reservation before native creation.
+- Low/full/high/SuperSpeed/SuperSpeedPlus metadata is validated. UDE publishes
+  the latter two as SuperSpeed; static streams remain unsupported.
+  Control, bulk and interrupt routing
   exists; full-speed CDC and NCM fixtures have native application evidence, with the
   reliability limitations recorded in the findings.
 - Import selects and reads back the sole supported configuration before native

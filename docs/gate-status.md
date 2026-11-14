@@ -1,5 +1,17 @@
 # Inputs and current gate status
 
+**M9 IN PROGRESS (2026-11-14).** The Mac-connected USB 3.2 SSD was mounted
+read/write as `SDD_Backup (F:)` in Weasley's native Explorer session through the
+standalone KnightBus path. Root-directory enumeration passed. The owner reported
+finishing and ejecting it; clean native detach, zero reserved bytes/requests and
+remount on the Mac were verified. The owner confirmed successful file creation,
+movement and deletion in Explorer. Hash-integrity checks, reconnect and soak
+remain pending. This trial exposed a Windows
+queue-lifetime crash and a bulk URB/mapped-buffer length bug; the corrected driver
+passed native regressions and the physical volume mounted. Windows C: remains
+dirty after the crash; the SSD F: is not dirty. See the
+[M9 validation and setup report](milestone9-validation.md) for scope and evidence.
+
 **M8 PASS for the owner-approved development scope (2026-11-13).** The original
 Rust macOS exporter enumerates, claims and transfers with the exact Logitech
 joystick. Refusal, STALL/recovery, cancellation, reset, active/idle removal,

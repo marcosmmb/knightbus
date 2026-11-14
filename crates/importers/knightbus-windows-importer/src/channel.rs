@@ -19,7 +19,7 @@ pub(crate) const LIFECYCLE: u32 = 0x22e414;
 // The previous code (0x22e428) only guaranteed a squattable global event.
 pub(crate) const RETIREMENT_READY: u32 = 0x22e42c;
 /// Maximum native payload per request. Larger URBs fail before publication.
-pub const MAX_TRANSFER: usize = 65536;
+pub const MAX_TRANSFER: usize = 1024 * 1024;
 /// Default endpoint plus all legal nondefault endpoint addresses.
 pub const SLOTS: usize = descriptors::MAX_ENDPOINTS + 1;
 pub(crate) const HEADER: usize = 32;
@@ -110,7 +110,8 @@ impl Descriptors {
         if address == 0 {
             return Ok(0);
         }
-        let config = &self.bytes.as_slice()[ATTACH_CONFIG..];
+        let length = u32_at(self.bytes.as_slice(), ATTACH_CONFIG_LENGTH) as usize;
+        let config = &self.bytes.as_slice()[ATTACH_CONFIG..ATTACH_CONFIG + length];
         let mut offset = descriptors::configuration::BYTES;
         let mut selected = false;
         while offset < config.len() {
@@ -126,7 +127,7 @@ impl Descriptors {
                 return Ok(
                     if d[descriptors::endpoint::ATTRIBUTES] == descriptors::TRANSFER_BULK {
                         0
-                    } else if self.speed == Speed::High {
+                    } else if self.speed == Speed::High || self.speed.superspeed() {
                         1 << (d[descriptors::endpoint::INTERVAL] - 1)
                     } else {
                         d[descriptors::endpoint::INTERVAL].into()
@@ -139,13 +140,24 @@ impl Descriptors {
     }
     /// Validate before allocating; preserve class descriptors verbatim.
     pub fn new(budget: &Budget, device: &[u8], config: &[u8], speed: Speed) -> Result<Self> {
+        Self::with_bos(budget, device, config, &[], speed)
+    }
+    /// Preserve the complete physical BOS tree for SuperSpeed publication.
+    pub fn with_bos(
+        budget: &Budget,
+        device: &[u8],
+        config: &[u8],
+        bos: &[u8],
+        speed: Speed,
+    ) -> Result<Self> {
         let topology =
             descriptors::validate(device, config, speed).map_err(|_| Error::Unsupported)?;
-        let mut bytes = budget.buffer(ATTACH_HEADER + device.len() + config.len())?;
+        descriptors::validate_bos(bos, speed).map_err(|_| Error::Unsupported)?;
+        let mut bytes = budget.buffer(ATTACH_HEADER + device.len() + config.len() + bos.len())?;
         let b = bytes.as_mut_slice();
         b[..ATTACH_MAGIC.len()].copy_from_slice(ATTACH_MAGIC);
         for (offset, value) in [
-            (ATTACH_VERSION, ABI_VERSION),
+            (ATTACH_VERSION, if bos.is_empty() { ABI_VERSION } else { 2 }),
             (ATTACH_SPEED, speed as u32),
             (ATTACH_DEVICE_LENGTH, descriptors::device::BYTES as u32),
             (ATTACH_CONFIG_LENGTH, config.len() as u32),
@@ -153,7 +165,8 @@ impl Descriptors {
             b[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
         }
         b[ATTACH_HEADER..ATTACH_CONFIG].copy_from_slice(device);
-        b[ATTACH_CONFIG..].copy_from_slice(config);
+        b[ATTACH_CONFIG..ATTACH_CONFIG + config.len()].copy_from_slice(config);
+        b[ATTACH_CONFIG + config.len()..].copy_from_slice(bos);
         Ok(Self {
             bytes,
             topology,

@@ -5,6 +5,8 @@ use knightbus_macos_exporter::constants::{lab, status, usb};
 #[cfg(target_os = "macos")]
 mod qualification;
 #[cfg(target_os = "macos")]
+mod standalone;
+#[cfg(target_os = "macos")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use knightbus_core::{
         Budget, ResourceLimits, SessionId, Transfer, TransferId,
@@ -13,6 +15,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use knightbus_macos_exporter::{Driver, native};
     use std::time::Instant;
     let mut args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "serve") {
+        return standalone::run(&args);
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--lab-journal") {
         let directory = args
             .get(index + 1)
@@ -100,6 +105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         snapshot.device.wire.interfaces
     );
     if args[0] == "inspect" {
+        println!("device_descriptor={:02x?}", snapshot.descriptor);
+        for configuration in &snapshot.configurations {
+            println!("configuration_descriptor={configuration:02x?}");
+        }
         return Ok(());
     }
     if args.len() != 3

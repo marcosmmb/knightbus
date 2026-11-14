@@ -84,12 +84,27 @@ struct State {
     polls: usize,
     removed: bool,
     released: bool,
+    drop_blocked: bool,
+    dropped: bool,
     fail_release: bool,
     fail_cancel_count: usize,
     complete_on_cancel: bool,
     waker: Option<Waker>,
 }
 struct Fake(Arc<Mutex<State>>);
+impl Drop for Fake {
+    fn drop(&mut self) {
+        loop {
+            let mut state = self.0.lock().unwrap();
+            if !state.drop_blocked {
+                state.dropped = true;
+                break;
+            }
+            drop(state);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
 impl Driver for Fake {
     fn set_waker(&mut self, waker: Waker) {
         self.0.lock().unwrap().waker = Some(waker);
@@ -173,6 +188,18 @@ fn fixture() -> Fixture {
     let mut backend = Backend::new(device.clone(), &b, factory).unwrap();
     wait(|| matches!(backend.claim(SESSION, &device), Poll::Ready(Ok(()))));
     (backend, state, b, device)
+}
+#[test]
+fn retirement_waits_for_native_destructor() {
+    let (mut backend, state, _budget, device) = fixture();
+    state.lock().unwrap().drop_blocked = true;
+    assert!(backend.release(SESSION, device.key).is_pending());
+    wait(|| state.lock().unwrap().released);
+    let still_pending = backend.release(SESSION, device.key).is_pending();
+    state.lock().unwrap().drop_blocked = false;
+    assert!(still_pending, "retirement preceded the native destructor");
+    wait(|| matches!(backend.release(SESSION, device.key), Poll::Ready(Ok(()))));
+    assert!(state.lock().unwrap().dropped);
 }
 #[test]
 fn cancellation_keeps_native_owner_and_credits_until_callback() {

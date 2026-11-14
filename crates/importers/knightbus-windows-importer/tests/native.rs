@@ -295,6 +295,58 @@ fn native_owned_controller_retirement() {
     owner_faults(true, false);
 }
 #[test]
+#[ignore = "requires administrator access and the staged SuperSpeed KnightBus driver"]
+fn native_superspeed_descriptor_publication_and_retirement() {
+    use knightbus_windows_importer::backend::Driver;
+    let _guard = CONTROLLER_TEST.lock().unwrap();
+    assert!(owned_controllers().is_empty());
+    let device = [18, 1, 0, 3, 0, 0, 0, 9, 9, 0x12, 0x43, 0, 0, 1, 0, 0, 0, 1];
+    let config = [9, 2, 18, 0, 1, 1, 0, 0x80, 1, 9, 4, 0, 0, 0, 0xff, 0, 0, 0];
+    let bos = [
+        5, 15, 22, 0, 2, 7, 16, 2, 2, 0, 0, 0, 10, 16, 3, 0, 14, 0, 1, 10, 0, 0,
+    ];
+    let mut envelope = Vec::from(*b"KBWD");
+    for value in [2u32, 5, 18, config.len() as u32] {
+        envelope.extend(value.to_le_bytes());
+    }
+    envelope.extend(device);
+    envelope.extend(config);
+    envelope.extend(bos);
+    let mut controller = Controller::owned();
+    controller.attach(&envelope).unwrap();
+    let mut scratch = vec![0; knightbus_windows_importer::channel::MAX_TRANSFER + 32];
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let n = controller.fetch(1, &mut scratch).unwrap();
+        if n != 0 {
+            let setup: [u8; 8] = scratch[24..32].try_into().unwrap();
+            scratch[16..32].fill(0);
+            if setup != [0, 9, 1, 0, 0, 0, 0, 0] {
+                // Optional OS string/vendor requests are not provided by this
+                // endpoint-zero-only fixture; preserve a native STALL.
+                scratch[24..28].copy_from_slice(&1u32.to_le_bytes());
+            }
+            controller.reply(&scratch[..32]).unwrap();
+        }
+        let output = std::process::Command::new("powershell.exe").args(["-NoProfile", "-Command",
+            "Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_1209&PID_0043*' | ForEach-Object InstanceId"])
+            .output().unwrap();
+        if String::from_utf8_lossy(&output.stdout).contains("VID_1209&PID_0043") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SuperSpeed USB child did not enumerate: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    controller.detach().unwrap();
+    drop(controller);
+    assert!(owned_controllers().is_empty());
+}
+#[test]
 #[ignore = "requires administrator access, staged KnightBus and tests/winusb.inf packages"]
 fn native_bulk_stall_reset_reaches_exporter() {
     let _guard = CONTROLLER_TEST.lock().unwrap();
@@ -351,7 +403,7 @@ fn roundtrip(owned: bool, halt: Option<Arc<AtomicUsize>>) {
     let stop = Arc::new(AtomicBool::new(false));
     let end = stop.clone();
     let budget = Budget::new(ResourceLimits {
-        bytes: 16 * 1024 * 1024,
+        bytes: 96 * 1024 * 1024,
         requests: 64,
     });
     let b = budget.clone();
@@ -725,7 +777,7 @@ fn winusb_reset_echo(path: &str, halt: &AtomicUsize) {
         );
     }
     let mut count = 0;
-    let mut sent = [0u8; 64];
+    let sent = [0u8; 64];
     // SAFETY: Synchronous transfer, initialized buffer and live interface handle.
     assert_eq!(
         unsafe {
@@ -771,8 +823,23 @@ fn winusb_reset_echo(path: &str, halt: &AtomicUsize) {
     assert_eq!(halt.load(Ordering::Acquire), 2);
     assert_ne!(unsafe { WinUsb_ResetPipe(handles.usb, 2) }, 0);
     for n in 0..20u8 {
-        sent.fill(n);
-        let mut got = [0u8; 64];
+        if n % 5 == 0 {
+            // Re-select the setting while the native client stays open, then
+            // verify both bulk pipes still work. Released endpoint queues must
+            // survive UdeCx's later purge/recovery operations (M9 regression).
+            assert_ne!(
+                unsafe { WinUsb_SetCurrentAlternateSetting(handles.usb, 0) },
+                0
+            );
+        }
+        // Cover the physical SSD's observed request and the admission ceiling.
+        let length = match n {
+            0 => 397312,
+            1 => knightbus_windows_importer::channel::MAX_TRANSFER,
+            _ => 64,
+        };
+        let sent = vec![n; length];
+        let mut got = vec![0u8; length];
         // SAFETY: Both calls are synchronous and bounded by the pipe timeout;
         // their buffers and count output remain alive until completion.
         unsafe {
@@ -781,26 +848,26 @@ fn winusb_reset_echo(path: &str, halt: &AtomicUsize) {
                     handles.usb,
                     2,
                     sent.as_ptr(),
-                    64,
+                    length as u32,
                     &mut count,
                     ptr::null_mut()
                 ),
                 0
             );
-            assert_eq!(count, 64);
+            assert_eq!(count as usize, length);
             assert_ne!(
                 WinUsb_ReadPipe(
                     handles.usb,
                     0x82,
                     got.as_mut_ptr(),
-                    64,
+                    length as u32,
                     &mut count,
                     ptr::null_mut()
                 ),
                 0
             );
         }
-        assert_eq!(count, 64);
+        assert_eq!(count as usize, length);
         assert_eq!(got, sent);
     }
 }

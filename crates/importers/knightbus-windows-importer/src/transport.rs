@@ -29,6 +29,8 @@ const EXCHANGE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const SEQ_DEVICE_DESCRIPTOR: u32 = 1;
 const SEQ_CONFIG_HEADER: u32 = 2;
 const SEQ_CONFIG_DESCRIPTOR: u32 = 3;
+const SEQ_BOS_HEADER: u32 = 4;
+const SEQ_BOS_DESCRIPTOR: u32 = 5;
 const SEQ_SET_CONFIGURATION: u32 = 4;
 const SEQ_GET_CONFIGURATION: u32 = 5;
 const DESCRIPTOR_TYPE_SHIFT: u32 = 8; // High byte of GET_DESCRIPTOR wValue.
@@ -75,7 +77,7 @@ impl Wire {
         }
         stream.set_nonblocking(true).map_err(net_error)?;
         stream.set_nodelay(true).map_err(net_error)?;
-        let input = budget.buffer(MAX_TRANSFER + USBIP_TRANSFER_HEADER_BYTES)?;
+        let input = budget.buffer(16384)?;
         Ok(Self {
             stream,
             budget,
@@ -327,11 +329,33 @@ impl Wire {
             u16::from(usb::configuration::TYPE) << DESCRIPTOR_TYPE_SHIFT,
             length,
         )?;
-        let descriptors = Descriptors::new(
+        let speed = Speed::try_from(metadata.speed).map_err(|_| Error::Unsupported)?;
+        let bos = if speed.superspeed() {
+            let header = self.descriptor(
+                id,
+                SEQ_BOS_HEADER,
+                u16::from(usb::BOS_TYPE) << DESCRIPTOR_TYPE_SHIFT,
+                usb::BOS_HEADER as u16,
+            )?;
+            let length = usb::u16_at(header.as_slice(), 2);
+            if !(usb::BOS_HEADER..=usb::MAX_BOS).contains(&usize::from(length)) {
+                return Err(Error::Invalid);
+            }
+            self.descriptor(
+                id,
+                SEQ_BOS_DESCRIPTOR,
+                u16::from(usb::BOS_TYPE) << DESCRIPTOR_TYPE_SHIFT,
+                length,
+            )?
+        } else {
+            self.budget.buffer(0)?
+        };
+        let descriptors = Descriptors::with_bos(
             &self.budget,
             device.as_slice(),
             config.as_slice(),
-            Speed::try_from(metadata.speed).map_err(|_| Error::Unsupported)?,
+            bos.as_slice(),
+            speed,
         )?;
         if descriptors.topology.vid != metadata.vendor_id
             || descriptors.topology.pid != metadata.product_id
@@ -386,7 +410,7 @@ impl Wire {
         let configuration = descriptors.topology.configuration;
         self.control(
             id,
-            SEQ_SET_CONFIGURATION,
+            SEQ_SET_CONFIGURATION + if speed.superspeed() { 2 } else { 0 },
             [
                 setup::DEVICE_OUT,
                 setup::SET_CONFIGURATION,
@@ -402,7 +426,7 @@ impl Wire {
         if self
             .control(
                 id,
-                SEQ_GET_CONFIGURATION,
+                SEQ_GET_CONFIGURATION + if speed.superspeed() { 2 } else { 0 },
                 [setup::DEVICE_IN, setup::GET_CONFIGURATION, 0, 0, 0, 0, 1, 0],
                 1,
             )?
@@ -536,6 +560,12 @@ impl<B: ImporterBackend> Forwarder<B> {
             return Err(Error::Invalid);
         }
         let metadata = budget.reserve_memory(std::mem::size_of::<Self>())?;
+        let sequence = SEQ_GET_CONFIGURATION
+            + if matches!(device.device().wire.speed, 5 | 6) {
+                2
+            } else {
+                0
+            };
         Ok(Self {
             backend,
             wire,
@@ -543,7 +573,7 @@ impl<B: ImporterBackend> Forwarder<B> {
             session,
             budget,
             pending: std::array::from_fn(|_| None),
-            sequence: SEQ_GET_CONFIGURATION,
+            sequence,
             attached: false,
             draining: false,
             error: None,

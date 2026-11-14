@@ -12,7 +12,7 @@ use core::{
 };
 use wdk_sys::{call_unsafe_wdf_function_binding as wdf, *};
 
-const LIMIT: usize = 65536;
+const LIMIT: usize = 1024 * 1024;
 const ENDPOINT_COUNT: usize = 31;
 const QUEUE_COUNT: usize = ENDPOINT_COUNT * 2;
 const STATS_BYTES: usize = (8 + ENDPOINT_COUNT) * 8;
@@ -98,6 +98,8 @@ struct State {
     physical_device: [u8; 18],
     physical_configuration: [u8; 4096],
     physical_length: usize,
+    physical_bos: [u8; 4096],
+    bos_length: usize,
     speed: u32,
     lock: WDFSPINLOCK,
     gate: WDFWAITLOCK,
@@ -120,6 +122,7 @@ struct State {
     rejected: u64,
     dpc_wrong_irql: u64,
     maximum_length: [u32; ENDPOINT_COUNT],
+    length_mismatch_logged: u32,
     last_urb_error: [u32; ENDPOINT_COUNT],
     starts: [u64; ENDPOINT_COUNT],
     resets: [u64; ENDPOINT_COUNT],
@@ -613,12 +616,39 @@ unsafe extern "C" fn urb(
         } else {
             unsafe { (*state(device)).endpoints[index] & 0x80 != 0 }
         };
+        let requested = if index == 0 {
+            u32::from(u16::from_le_bytes([bytes[6], bytes[7]]))
+        } else {
+            let mut parameters = WDF_REQUEST_PARAMETERS {
+                Size: mem::size_of::<WDF_REQUEST_PARAMETERS>() as u16,
+                ..Default::default()
+            };
+            // The mapped buffer can span more bytes than this URB requests
+            // (notably a partial storage read backed by a larger MDL).
+            // Preserve TransferBufferLength, rather than submitting its capacity.
+            unsafe {
+                wdf!(WdfRequestGetParameters, request, &mut parameters);
+                let header = parameters.Parameters.Others.Arg1.cast::<_URB_HEADER>();
+                if parameters.Type != _WDF_REQUEST_TYPE::WdfRequestTypeDeviceControlInternal
+                    || header.is_null()
+                    || (*header).Function != 0x0009 // URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER.
+                    || usize::from((*header).Length) < mem::size_of::<_URB_BULK_OR_INTERRUPT_TRANSFER>()
+                {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let urb = header.cast::<_URB_BULK_OR_INTERRUPT_TRANSFER>();
+                if ((*urb).TransferFlags & 1 != 0) != input {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                (*urb).TransferBufferLength
+            }
+        };
         let mut buffer: *mut u8 = ptr::null_mut();
         let mut length = 0u32;
         // A no-data control transfer has no transfer buffer to map. In the
         // measured v6 run Get/SetLineCoding succeeded, but SetControlLineState
         // (wLength zero) failed before publication to userspace.
-        if index != 0 || u16::from_le_bytes([bytes[6], bytes[7]]) != 0 {
+        if requested != 0 {
             let status = ude!(
                 UdecxUrbRetrieveBufferTableIndex,
                 PFN_UDECXURBRETRIEVEBUFFER,
@@ -630,18 +660,37 @@ unsafe extern "C" fn urb(
                 return Err(status);
             }
         }
-        if index == 0 {
-            let requested = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
-            if requested > length {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            length = requested;
+        if requested > length {
+            return Err(STATUS_INVALID_BUFFER_SIZE);
         }
+        if index != 0 && requested != length {
+            let first = unsafe {
+                wdf!(WdfSpinLockAcquire, (*s).lock);
+                let first = (*s).length_mismatch_logged & (1 << index) == 0;
+                (*s).length_mismatch_logged |= 1 << index;
+                wdf!(WdfSpinLockRelease, (*s).lock);
+                first
+            };
+            if first {
+                unsafe {
+                    initialization_stage(device, 200 + index as u32, requested as NTSTATUS);
+                    initialization_stage(device, 300 + index as u32, length as NTSTATUS);
+                }
+            }
+        }
+        let length = requested;
         let s = unsafe { state(device) };
-        unsafe {
+        let first_oversized = unsafe {
             wdf!(WdfSpinLockAcquire, (*s).lock);
+            let first = (*s).maximum_length[index] <= LIMIT as u32 && length > LIMIT as u32;
             (*s).maximum_length[index] = (*s).maximum_length[index].max(length);
             wdf!(WdfSpinLockRelease, (*s).lock);
+            first
+        };
+        if first_oversized {
+            // One metadata-only lab record per endpoint: stage 100+slot,
+            // data field = unsupported URB byte count (not a device payload).
+            unsafe { initialization_stage(device, 100 + index as u32, length as NTSTATUS) };
         }
         if length as usize > LIMIT || (length != 0 && buffer.is_null()) {
             return Err(STATUS_INVALID_BUFFER_SIZE);
@@ -932,7 +981,9 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             match (*s).speed {
                 1 => _UDECX_USB_DEVICE_SPEED::UdecxUsbLowSpeed,
                 2 => _UDECX_USB_DEVICE_SPEED::UdecxUsbFullSpeed,
-                _ => _UDECX_USB_DEVICE_SPEED::UdecxUsbHighSpeed,
+                3 => _UDECX_USB_DEVICE_SPEED::UdecxUsbHighSpeed,
+                5 | 6 => _UDECX_USB_DEVICE_SPEED::UdecxUsbSuperSpeed,
+                _ => return Err(STATUS_INVALID_PARAMETER),
             }
         )?;
         ude!(
@@ -950,7 +1001,14 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
                 unsafe { ptr::addr_of_mut!((*s).physical_configuration).cast::<u8>() },
                 unsafe { (*s).physical_length },
             ),
+            (
+                unsafe { ptr::addr_of_mut!((*s).physical_bos).cast::<u8>() },
+                unsafe { (*s).bos_length },
+            ),
         ] {
+            if length == 0 {
+                continue;
+            }
             let status = ude!(
                 UdecxUsbDeviceInitAddDescriptorTableIndex,
                 PFN_UDECXUSBDEVICEINITADDDESCRIPTOR,
@@ -992,11 +1050,21 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             .cast::<ChildState>())
             .controller = device;
         }
+        // NULL/default selection chose a USB 2.0 root port in the measured
+        // SuperSpeed trial. Select the speed-specific port explicitly.
+        let superspeed = unsafe { (*s).speed >= 5 };
+        let mut plug = UDECX_USB_DEVICE_PLUG_IN_OPTIONS {
+            Size: structure_size::<UDECX_USB_DEVICE_PLUG_IN_OPTIONS>(),
+            Usb20PortNumber: if superspeed { 0 } else { 1 },
+            // Root-hub numbering is shared across speed groups: port 1 is
+            // USB2 and port 2 is USB3 (one port in each configured group).
+            Usb30PortNumber: if superspeed { 2 } else { 0 },
+        };
         let status = ude!(
             UdecxUsbDevicePlugInTableIndex,
             PFN_UDECXUSBDEVICEPLUGIN,
             (*s).child,
-            ptr::null_mut()
+            &mut plug
         )?;
         if status < 0 {
             Err(status)
@@ -1278,16 +1346,12 @@ unsafe extern "C" fn endpoints_configure(
             {
                 STATUS_INVALID_PARAMETER
             } else {
-                // Released endpoints are no longer used by UDE. Retire only
-                // the callback-owned endpoint's still-live queue. Detach must
-                // never delete it ahead of this callback.
-                for i in 0..(*parameters).ReleasedEndpointsCount as usize {
-                    let endpoint = (*parameters).ReleasedEndpoints.add(i).read();
-                    let context = wdf!(WdfObjectGetTypedContextWorker, endpoint.cast(), ptr::addr_of!(ENDPOINT_TYPE)).cast::<EndpointState>();
-                    let queue = (*context).queue;
-                    (*context).queue = ptr::null_mut();
-                    if !queue.is_null() { wdf!(WdfObjectDelete, queue.cast()); }
-                }
+                // Release is a configuration notification, not destruction.
+                // UdeCx/UCX can still purge these queues during device recovery.
+                // Deleting one here makes that later purge bugcheck with
+                // STATUS_DELETE_PENDING (observed during the M9 storage trial).
+                // The endpoint parent owns final queue retirement; its cleanup
+                // callback clears our bounded tracking entry.
                 STATUS_SUCCESS
             }
         }
@@ -1315,10 +1379,11 @@ unsafe fn allowed_setting(device: WDFDEVICE, interface: u8, alternate: u8) -> bo
         )
     };
     topology.is_ok_and(|t| {
-        t.settings
-            .iter()
-            .flatten()
-            .any(|setting| setting.interface == interface && setting.alternate == alternate)
+        t.settings.iter().flatten().any(|setting| {
+            setting.interface == interface
+                && setting.alternate == alternate
+                && setting.stream_endpoints == 0
+        })
     })
 }
 
@@ -1541,7 +1606,7 @@ unsafe fn store_descriptors(
     request: WDFREQUEST,
     input: usize,
 ) -> Result<(), NTSTATUS> {
-    if !(20 + 18 + 9..=20 + 18 + 4096).contains(&input) {
+    if !(20 + 18 + 9..=20 + 18 + 4096 + 4096).contains(&input) {
         return Err(STATUS_INVALID_BUFFER_SIZE);
     }
     let mut pointer: PVOID = ptr::null_mut();
@@ -1561,17 +1626,25 @@ unsafe fn store_descriptors(
     // checked before slicing; no network parser lives in the kernel.
     let bytes = unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), input) };
     let config_len = u32_at(bytes, 16) as usize;
+    let version = u32_at(bytes, 4);
     if &bytes[..4] != b"KBWD"
-        || u32_at(bytes, 4) != 1
+        || !matches!(version, 1 | 2)
         || u32_at(bytes, 12) != 18
         || config_len > 4096
-        || 38usize.checked_add(config_len) != Some(input)
+        || 38 + config_len > input
+        || (version == 1 && 38 + config_len != input)
     {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let physical = super::descriptors::validate(
         &bytes[20..38],
-        &bytes[38..],
+        &bytes[38..38 + config_len],
+        super::descriptors::Speed::try_from(u32_at(bytes, 8))
+            .map_err(|_| STATUS_INVALID_PARAMETER)?,
+    )
+    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    super::descriptors::validate_bos(
+        &bytes[38 + config_len..],
         super::descriptors::Speed::try_from(u32_at(bytes, 8))
             .map_err(|_| STATUS_INVALID_PARAMETER)?,
     )
@@ -1584,8 +1657,11 @@ unsafe fn store_descriptors(
     // and cleanup. These arrays remain immutable while published.
     unsafe {
         (*s).physical_device.copy_from_slice(&bytes[20..38]);
-        (&mut (*s).physical_configuration)[..config_len].copy_from_slice(&bytes[38..]);
+        (&mut (*s).physical_configuration)[..config_len]
+            .copy_from_slice(&bytes[38..38 + config_len]);
         (*s).physical_length = config_len;
+        (*s).bos_length = input - 38 - config_len;
+        (&mut (*s).physical_bos)[..(*s).bos_length].copy_from_slice(&bytes[38 + config_len..]);
         (*s).speed = u32_at(bytes, 8);
         (*s).endpoints = endpoints;
     }

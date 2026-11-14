@@ -362,7 +362,7 @@ unsafe extern "C" fn query_capability(
         // SAFETY: UDE supplies this writable output for this callback only.
         unsafe { result_length.write(0) };
     }
-    // No chained MDLs, USB3, wake or transfer capabilities are claimed.
+    // No static streams, chained MDLs or wake capabilities are claimed.
     STATUS_NOT_SUPPORTED
 }
 

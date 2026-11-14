@@ -68,6 +68,12 @@ pub(crate) fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 
 /// Maximum bytes in one configuration, before any allocation or kernel copy.
 pub const MAX_CONFIGURATION: usize = 4096;
+/// Maximum BOS descriptor tree passed to the native controller.
+pub const MAX_BOS: usize = 4096;
+/// Binary Object Store descriptor type.
+pub const BOS_TYPE: u8 = 15;
+/// BOS header size.
+pub const BOS_HEADER: usize = 5;
 /// All nondefault USB endpoint addresses (15 in each direction).
 pub const MAX_ENDPOINTS: usize = 30;
 /// Maximum interface/alternate pairs in a configuration.
@@ -83,6 +89,10 @@ pub enum Speed {
     Full = 2,
     /// USB high speed; SuperSpeed requires separate companion/BOS handling.
     High = 3,
+    /// SuperSpeed USB; bulk streams are not implemented.
+    Super = 5,
+    /// Physical SuperSpeedPlus, represented by UDE's SuperSpeed device class.
+    SuperPlus = 6,
 }
 impl TryFrom<u32> for Speed {
     type Error = &'static str;
@@ -91,8 +101,16 @@ impl TryFrom<u32> for Speed {
             v if v == Self::Low as u32 => Ok(Self::Low),
             v if v == Self::Full as u32 => Ok(Self::Full),
             v if v == Self::High as u32 => Ok(Self::High),
+            v if v == Self::Super as u32 => Ok(Self::Super),
+            v if v == Self::SuperPlus as u32 => Ok(Self::SuperPlus),
             _ => Err("unsupported USB speed"),
         }
+    }
+}
+impl Speed {
+    /// Whether SuperSpeed descriptor rules apply.
+    pub fn superspeed(self) -> bool {
+        matches!(self, Self::Super | Self::SuperPlus)
     }
 }
 
@@ -119,6 +137,8 @@ pub struct Setting {
     pub alternate: u8,
     /// Bit n represents endpoint n OUT; bit n+16 represents n IN.
     pub endpoints: u32,
+    /// Endpoints advertising streams; selection requires an unsupported capability.
+    pub stream_endpoints: u32,
 }
 /// Fixed-capacity topology. No class driver or endpoint is inferred from VID/PID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,8 +159,8 @@ pub struct Topology {
 
 /// Validate a complete device/configuration descriptor before publication.
 /// One configuration is supported; composite interfaces and alternate settings
-/// are supported. ISO and SuperSpeed fail explicitly until their native paths
-/// are qualified. No attacker-controlled allocation occurs here.
+/// are supported. ISO remains unsupported. Stream descriptors are preserved,
+/// but stream-bearing settings cannot be selected by the native backend.
 pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, &'static str> {
     if device.len() != device::BYTES
         || device[..DESCRIPTOR_HEADER_BYTES] != [device::BYTES as u8, device::TYPE]
@@ -152,8 +172,10 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
         Speed::Low => u16::from(device[device::EP0_PACKET]) == LOW_SPEED_MAX_PACKET,
         Speed::Full => FULL_SPEED_PACKET_SIZES.contains(&u16::from(device[device::EP0_PACKET])),
         Speed::High => u16::from(device[device::EP0_PACKET]) == FULL_SPEED_MAX_PACKET,
+        Speed::Super | Speed::SuperPlus => device[device::EP0_PACKET] == 9,
     };
-    if !ep0 || u16_at(device, device::USB_REVISION) >= USB_REVISION_3_0 {
+    let revision = u16_at(device, device::USB_REVISION);
+    if !ep0 || (speed.superspeed() != (revision >= USB_REVISION_3_0)) || revision > 0x0320 {
         return Err("invalid endpoint zero or unsupported USB revision");
     }
     if !(configuration::BYTES..=MAX_CONFIGURATION).contains(&config.len())
@@ -181,6 +203,7 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
     let mut endpoints = 0;
     let mut expected = 0;
     let mut seen = 0;
+    let mut companion: Option<(u8, u8, u16)> = None;
     while offset < config.len() {
         if config.len() - offset < DESCRIPTOR_HEADER_BYTES {
             return Err("truncated descriptor header");
@@ -190,6 +213,9 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
             return Err("invalid descriptor length");
         }
         let d = &config[offset..offset + length];
+        if companion.is_some() && d[DESCRIPTOR_TYPE] != 0x30 {
+            return Err("missing SuperSpeed endpoint companion");
+        }
         match d[DESCRIPTOR_TYPE] {
             interface::TYPE => {
                 // INTERFACE: close the preceding setting before opening another.
@@ -209,6 +235,7 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
                     interface: d[interface::NUMBER],
                     alternate: d[interface::ALTERNATE],
                     endpoints: 0,
+                    stream_endpoints: 0,
                 });
                 settings += 1;
                 expected = d[interface::ENDPOINTS];
@@ -240,6 +267,10 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
                         size <= HIGH_SPEED_INTERRUPT_MAX_PACKET
                             && (packet >> TRANSACTIONS_SHIFT) <= MAX_EXTRA_TRANSACTIONS
                             && (1..=HIGH_SPEED_MAX_INTERVAL).contains(&d[endpoint::INTERVAL])
+                    }
+                    (Speed::Super | Speed::SuperPlus, TRANSFER_BULK) => packet == 1024,
+                    (Speed::Super | Speed::SuperPlus, TRANSFER_INTERRUPT) => {
+                        packet <= 1024 && (1..=16).contains(&d[endpoint::INTERVAL])
                     }
                     _ => false,
                 };
@@ -281,6 +312,38 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
                     endpoints += 1;
                 }
                 seen += 1;
+                if speed.superspeed() {
+                    companion = Some((d[endpoint::ADDRESS], d[endpoint::ATTRIBUTES], packet));
+                }
+            }
+            0x30 => {
+                let (address, kind, packet) = companion.take().ok_or("unexpected companion")?;
+                if length != 6 || d[2] > 15 {
+                    return Err("invalid endpoint companion");
+                }
+                let bytes_per_interval = u16_at(d, 4);
+                if kind == TRANSFER_BULK {
+                    if d[3] > 16 || bytes_per_interval != 0 {
+                        return Err("invalid bulk companion");
+                    }
+                    if d[3] != 0 {
+                        let bit = (address & ENDPOINT_NUMBER_MASK)
+                            + if address & DIRECTION_IN != 0 {
+                                IN_ENDPOINT_BIT_OFFSET
+                            } else {
+                                0
+                            };
+                        result.settings[settings - 1]
+                            .as_mut()
+                            .unwrap()
+                            .stream_endpoints |= 1 << bit;
+                    }
+                } else if d[3] != 0
+                    || bytes_per_interval == 0
+                    || u32::from(bytes_per_interval) > u32::from(packet) * (u32::from(d[2]) + 1)
+                {
+                    return Err("invalid interrupt companion");
+                }
             }
             ASSOCIATION_TYPE => {
                 // INTERFACE_ASSOCIATION: preserve composite-function grouping.
@@ -302,7 +365,8 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
         }
         offset += length;
     }
-    if seen != expected
+    if companion.is_some()
+        || seen != expected
         || (0..result.interfaces).any(|number| {
             !result
                 .settings
@@ -314,4 +378,42 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
         return Err("missing interface, alternate zero or endpoint");
     }
     Ok(result)
+}
+
+/// Validate bounded BOS framing and required SuperSpeed capability before UDE.
+pub fn validate_bos(bytes: &[u8], speed: Speed) -> Result<(), &'static str> {
+    if bytes.is_empty() && !speed.superspeed() {
+        return Ok(());
+    }
+    if !(BOS_HEADER..=MAX_BOS).contains(&bytes.len())
+        || bytes[..2] != [BOS_HEADER as u8, BOS_TYPE]
+        || usize::from(u16_at(bytes, 2)) != bytes.len()
+    {
+        return Err("invalid BOS header");
+    }
+    let mut offset = BOS_HEADER;
+    let mut count = 0;
+    let mut super_capability = false;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 3 {
+            return Err("truncated capability");
+        }
+        let length = usize::from(bytes[offset]);
+        if length < 3 || length > bytes.len() - offset || bytes[offset + 1] != 16 {
+            return Err("invalid capability");
+        }
+        let d = &bytes[offset..offset + length];
+        if d[2] == 3 {
+            if length != 10 || super_capability || u16_at(d, 4) & 8 == 0 || d[6] > 3 {
+                return Err("invalid SuperSpeed capability");
+            }
+            super_capability = true;
+        }
+        count += 1;
+        offset += length;
+    }
+    if count != usize::from(bytes[4]) || (speed.superspeed() && !super_capability) {
+        return Err("missing BOS capability");
+    }
+    Ok(())
 }

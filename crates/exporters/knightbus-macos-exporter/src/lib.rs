@@ -7,6 +7,7 @@ pub mod descriptors;
 pub mod journal;
 #[cfg(target_os = "macos")]
 pub mod native;
+pub mod transport;
 pub use backend::{Backend, Driver, SubmitError};
 
 /// Maximum simultaneous requests, including queued and completed owners.

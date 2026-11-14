@@ -28,7 +28,7 @@ const SESSION: SessionId = SessionId {
 };
 fn budget() -> Budget {
     Budget::new(ResourceLimits {
-        bytes: 8 * 1024 * 1024,
+        bytes: 64 * 1024 * 1024,
         requests: 64,
     })
 }

@@ -1,6 +1,8 @@
-# Windows private driver IPC, version 1
+# Windows private driver IPC
 
-Development contract for the original M7 driver. All integers are little-endian;
+Development contract for the original driver, extended in M9. Transfer headers
+remain version 1; descriptor attachment supports versions 1 and 2.
+All integers are little-endian;
 all buffers are copied `METHOD_BUFFERED` IOCTLs with read/write access required.
 No pointers, kernel handles, arbitrary memory reads or USB/IP frames cross this
 boundary. Interface GUID: `53baf142-c628-47de-b891-5c71e38b9620`.
@@ -18,11 +20,15 @@ identity and device grants before opening an attachment.
 | RETIREMENT_READY `0x22e42c` | Empty | Empty; succeeds only with the protected-namespace final-destruction event bound |
 
 ATTACH envelope: `KBWD` at offset 0, u32 version 1 at 4, actual USB speed
-(1 low / 2 full / 3 high) at 8, u32 device length 18 at 12, u32 configuration
+(1 low / 2 full / 3 high / 5 SuperSpeed / 6 SuperSpeedPlus) at 8, u32 device length 18 at 12, u32 configuration
 length at 16, raw device descriptor at 20 and raw configuration at 38. The
 configuration is 9..4096 bytes and must match its advertised total length. Both
 sides run the same allocation-free validation independently. Class-specific
 bytes remain opaque; interface/alternate/endpoint topology is checked.
+Version 2 appends the physical BOS after the length-delimited configuration.
+SuperSpeed requires a valid BOS (at most 4096 bytes), EP0 exponent 9 and endpoint
+companion descriptors. Stream-bearing alternate settings remain unsupported.
+The driver publishes SuperSpeed on USB3 root port 2; USB2 uses root port 1.
 
 FETCH request header:
 
@@ -31,7 +37,7 @@ FETCH request header:
 | 0 | 4 | Version 1 |
 | 4 | 4 | Endpoint address; zero for control, direction bit for other endpoints |
 | 8 | 8 | Nonzero monotonic token, scoped to this controller's owner |
-| 16 | 4 | Requested transfer length, at most 65536 |
+| 16 | 4 | Requested transfer length, at most 1048576 (1 MiB) |
 | 20 | 4 | Payload length: requested length for OUT, zero for IN |
 | 24 | 8 | USB setup packet for endpoint zero; zero otherwise |
 | 32 | variable | OUT bytes |
@@ -79,7 +85,10 @@ higher-level Windows APIs can apply their own reset/recovery policy.
 
 Each controller admits one owning file/child. All mutating IOCTLs after ATTACH
 must use that file. The worker uses synchronous calls with a maximum scratch
-buffer of 65568 bytes. Engine methods only exchange bounded mailbox entries;
+buffer of 1048608 bytes. Deploy importer and driver together: the earlier 64 KiB
+build rejects the enlarged FETCH buffer. The native payload reservation is now
+31 MiB plus metadata; the standalone importer admits a 96 MiB shared budget.
+Engine methods only exchange bounded mailbox entries;
 no user buffer outlives a completed synchronous IOCTL. The kernel copies payloads
 into fixed per-pipe storage, retains Windows request ownership, and arbitrates
 reply/cancel under its spin lock. A separate DPC performs terminal URB completion.

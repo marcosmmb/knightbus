@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     const MAX_LAB_SECONDS: u64 = 300;
     const LAB_LIMITS: ResourceLimits = ResourceLimits {
-        bytes: 16 * 1024 * 1024,
+        bytes: 96 * 1024 * 1024,
         requests: 64,
     };
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,12 +30,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !(REQUIRED_ARGS..=REQUIRED_ARGS + 1).contains(&args.len())
         || args[MODE_ARG] != "--insecure-lab"
     {
-        return Err("usage: knightbus-windows-importer --insecure-lab ADDRESS:PORT BUS_ID SECONDS [CONTROLLER_INSTANCE]; raw USB/IP has no peer authentication".into());
+        return Err("usage: knightbus-windows-importer --insecure-lab ADDRESS:PORT BUS_ID SECONDS|until-stop=ABSOLUTE_PATH [CONTROLLER_INSTANCE]; raw USB/IP has no peer authentication".into());
     }
     let address: SocketAddr = args[ADDRESS_ARG].parse()?;
     let bus = WireString::new(args[BUS_ARG].as_bytes())?;
-    let seconds: u64 = args[SECONDS_ARG].parse()?;
-    if !(1..=MAX_LAB_SECONDS).contains(&seconds) {
+    let stop_file = args[SECONDS_ARG]
+        .strip_prefix("until-stop=")
+        .map(std::path::PathBuf::from);
+    if stop_file
+        .as_ref()
+        .is_some_and(|p| !p.is_absolute() || p.exists())
+    {
+        return Err("stop file must be an absolute, initially absent path".into());
+    }
+    let seconds: u64 = if stop_file.is_some() {
+        u64::MAX
+    } else {
+        args[SECONDS_ARG].parse()?
+    };
+    if stop_file.is_none() && !(1..=MAX_LAB_SECONDS).contains(&seconds) {
         return Err(format!("lab duration must be 1..{MAX_LAB_SECONDS} seconds").into());
     }
     eprintln!(
@@ -74,7 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut forwarding = Forwarder::new(backend, wire, device, session, budget.clone(), timeout)?;
     let start = Instant::now();
     loop {
-        if start.elapsed() >= Duration::from_secs(seconds) {
+        if start.elapsed() >= Duration::from_secs(seconds)
+            || stop_file.as_ref().is_some_and(|p| p.exists())
+        {
             forwarding.disconnect();
         }
         if let Poll::Ready(result) = forwarding.tick() {

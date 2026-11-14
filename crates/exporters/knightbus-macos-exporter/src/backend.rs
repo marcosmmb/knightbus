@@ -474,6 +474,9 @@ fn worker<D: Driver>(shared: Arc<Shared>, factory: impl FnOnce() -> Result<D>) {
         {
             drop(m);
             if driver.release().is_ok() {
+                // Publish retirement only after native objects and their memory
+                // reservations have actually been dropped.
+                drop(driver);
                 shared.mailbox.lock().unwrap().state = State::Retired;
                 return;
             }
