@@ -28,14 +28,36 @@ struct Lab {
     invalid: bool,
     snapshots: usize,
     detached: bool,
+    iso_address: u8,
+    completed: Option<Observed>,
 }
+struct Observed {
+    status: i32,
+    actual: u32,
+    bytes: Vec<u8>,
+    packets: Vec<usbip::IsoPacket>,
+}
+const PACKETS: [usbip::IsoPacket; 2] = [
+    usbip::IsoPacket {
+        offset: 0,
+        length: 4,
+        actual_length: 0,
+        status: 0,
+    },
+    usbip::IsoPacket {
+        offset: 12,
+        length: 4,
+        actual_length: 0,
+        status: 0,
+    },
+];
 struct Native(Arc<Mutex<Lab>>);
 impl Driver for Native {
     type Signal = ThreadSignal;
     const CAPABILITIES: Capabilities = Capabilities {
         transfer_bytes: 256,
         requests: 2,
-        iso_packets: 0,
+        iso_packets: 2,
         speeds: 1 << 2,
         descriptor_bytes: 4096,
         configurations: 1,
@@ -47,28 +69,44 @@ impl Driver for Native {
         Ok(())
     }
     fn fetch<'a>(
-        &mut self,
+        &'a mut self,
         mask: u32,
         _: &topology::Topology,
-        _: &'a mut [u8],
+        scratch: &'a mut [u8],
     ) -> Result<Option<importer::Request<'a>>> {
         let mut lab = self.0.lock().unwrap();
         if lab.token == 0 || lab.fetched || mask & 2 == 0 {
             return Ok(None);
         }
         lab.fetched = true;
+        let iso = lab.iso_address != 0;
+        scratch[..16].fill(0x42);
         Ok(Some(importer::Request {
+            slot: 1,
+            packets: if iso { &PACKETS } else { &[] },
+            flags: if iso { usbip::ISO_ASAP } else { 0 },
+            start_frame: 0,
             token: if lab.invalid { 0 } else { lab.token },
-            endpoint: 0x81,
-            length: 8,
+            endpoint: if iso { lab.iso_address } else { 0x81 },
+            length: if iso { 16 } else { 8 },
             setup: [0; 8],
-            payload: &[],
+            payload: if iso && lab.iso_address & 0x80 == 0 {
+                &scratch[..16]
+            } else {
+                &[]
+            },
         }))
     }
-    fn complete(&mut self, token: u64, _: &Completion, _: &mut [u8]) -> Result<()> {
+    fn complete(&mut self, token: u64, done: &Completion, _: &mut [u8]) -> Result<()> {
         let mut lab = self.0.lock().unwrap();
         assert!(lab.token == token || lab.token == 0);
         lab.token = 0;
+        lab.completed = Some(Observed {
+            status: done.status,
+            actual: done.actual_length,
+            bytes: done.transfer.buffer().to_vec(),
+            packets: done.transfer.packets().to_vec(),
+        });
         Ok(())
     }
     fn snapshot(&mut self) -> Result<importer::Snapshot> {
@@ -371,4 +409,217 @@ fn idle_native_worker_parks_after_registration() {
     );
     drop(backend);
     wait(|| budget.usage().bytes == 0);
+}
+
+#[test]
+fn iso_worker_preserves_packet_results_and_retires_cancel_and_disconnect() {
+    for address in [1, 0x81] {
+        // Completion, cancellation after delivery, disconnect with a held owner.
+        for outcome in 0..3 {
+            let budget = budget();
+            let mut config = CONFIG;
+            config[20] = address;
+            config[21] = 1;
+            let d = DescriptorSet::new(&budget, &DEVICE, &config, &[], Speed::Full).unwrap();
+            let mut inventory = device();
+            inventory.configurations = vec![descriptors::configuration(&config).unwrap()];
+            let lab = Arc::new(Mutex::new(Lab {
+                token: 1,
+                iso_address: address,
+                ..Default::default()
+            }));
+            let state = lab.clone();
+            let mut backend =
+                importer::Backend::new(move || Ok(Native(state)), d, budget.clone()).unwrap();
+            wait(|| matches!(backend.attach(SESSION, &inventory), Poll::Ready(Ok(()))));
+            let mut transfer = None;
+            wait(|| {
+                transfer = backend.next_transfer(SESSION, &budget).map(|r| r.unwrap());
+                transfer.is_some()
+            });
+            let mut transfer = transfer.unwrap();
+            assert_eq!(transfer.layout().len(), 2);
+            assert_eq!(transfer.header().transfer_flags, usbip::ISO_ASAP);
+            assert_eq!(
+                transfer.buffer(),
+                if address == 1 { &[0x42; 16] } else { &[0; 16] }
+            );
+            if outcome == 2 {
+                wait(|| matches!(backend.detach(SESSION), Poll::Ready(Ok(()))));
+                // Native retirement does not free storage still owned by transport.
+                assert!(budget.usage().bytes >= 16);
+                drop(transfer);
+            } else {
+                if outcome == 1 {
+                    let mut state = lab.lock().unwrap();
+                    state.token = 0;
+                    state.wake.as_ref().unwrap().notify();
+                    drop(state);
+                    wait(|| backend.next_cancellation(SESSION) == Some(transfer.header().seqnum));
+                    assert!(budget.usage().requests > 0);
+                    for p in transfer.packets_mut() {
+                        p.status = -104;
+                    }
+                } else {
+                    transfer.packets_mut()[0].actual_length = 3;
+                    transfer.packets_mut()[1].status = -71;
+                    if address == 0x81 {
+                        transfer.buffer_mut()[..3].copy_from_slice(&[7, 8, 9]);
+                    }
+                }
+                backend
+                    .complete(
+                        SESSION,
+                        Completion {
+                            transfer,
+                            status: if outcome == 1 { -104 } else { 0 },
+                            actual_length: if outcome == 1 { 0 } else { 3 },
+                            start_frame: 0,
+                        },
+                    )
+                    .unwrap();
+                wait(|| lab.lock().unwrap().completed.is_some());
+                let state = lab.lock().unwrap();
+                let done = state.completed.as_ref().unwrap();
+                assert_eq!(done.status, if outcome == 1 { -104 } else { 0 });
+                assert_eq!(done.actual, if outcome == 1 { 0 } else { 3 });
+                assert_eq!(done.packets[1].offset, 12);
+                assert_eq!(
+                    done.packets[1].status,
+                    if outcome == 1 { -104 } else { -71 }
+                );
+                if outcome == 0 && address == 0x81 {
+                    assert_eq!(&done.bytes[..3], &[7, 8, 9]);
+                }
+                drop(state);
+                wait(|| matches!(backend.detach(SESSION), Poll::Ready(Ok(()))));
+            }
+            drop(backend);
+            wait(|| budget.usage() == Usage::default());
+            assert!(lab.lock().unwrap().detached);
+        }
+    }
+}
+
+#[test]
+fn iso_slots_preserve_endpoint_order_and_correlate_out_of_order_completions() {
+    #[derive(Default)]
+    struct Stream {
+        fetched: usize,
+        published: bool,
+        live: u64,
+        completed: Vec<u64>,
+        wake: Option<Arc<ThreadSignal>>,
+    }
+    struct Queued(Arc<Mutex<Stream>>);
+    impl Driver for Queued {
+        type Signal = ThreadSignal;
+        const CAPABILITIES: Capabilities = Native::CAPABILITIES;
+        const NATIVE_BYTES: usize = 128;
+        const SCRATCH_BYTES: usize = 256;
+        fn attach(&mut self, _: &DescriptorSet, _: &Budget) -> Result<()> {
+            Ok(())
+        }
+        fn notifications(&mut self, wake: Arc<ThreadSignal>) -> Result<()> {
+            self.0.lock().unwrap().wake = Some(wake);
+            Ok(())
+        }
+        fn fetch<'a>(
+            &'a mut self,
+            mask: u32,
+            _: &topology::Topology,
+            _: &'a mut [u8],
+        ) -> Result<Option<importer::Request<'a>>> {
+            let mut s = self.0.lock().unwrap();
+            let Some(&slot) = [30, 1].get(s.fetched) else {
+                return Ok(None);
+            };
+            assert_ne!(mask & (1 << slot), 0);
+            s.fetched += 1;
+            Ok(Some(importer::Request {
+                slot,
+                token: slot as u64 + 10,
+                endpoint: 0x81,
+                length: 16,
+                setup: [0; 8],
+                payload: &[],
+                packets: &PACKETS,
+                flags: usbip::ISO_ASAP,
+                start_frame: 0,
+            }))
+        }
+        fn snapshot(&mut self) -> Result<importer::Snapshot> {
+            let mut s = self.0.lock().unwrap();
+            s.published = s.fetched == 2;
+            let mut tokens = [0; 31];
+            tokens[30] = 40;
+            tokens[1] = 11;
+            Ok(importer::Snapshot {
+                live: s.live,
+                tokens,
+            })
+        }
+        fn complete(&mut self, token: u64, _: &Completion, _: &mut [u8]) -> Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.live &= !(1 << (token - 10));
+            s.completed.push(token);
+            Ok(())
+        }
+        fn detach(&mut self) -> Result<()> {
+            self.0.lock().unwrap().wake = None;
+            Ok(())
+        }
+    }
+    let budget = budget();
+    let mut config = CONFIG;
+    config[21] = 1;
+    let d = DescriptorSet::new(&budget, &DEVICE, &config, &[], Speed::Full).unwrap();
+    let mut inventory = device();
+    inventory.configurations = vec![descriptors::configuration(&config).unwrap()];
+    let stream = Arc::new(Mutex::new(Stream {
+        live: (1 << 30) | 2,
+        ..Default::default()
+    }));
+    let native = stream.clone();
+    let mut backend =
+        importer::Backend::new(move || Ok(Queued(native)), d, budget.clone()).unwrap();
+    wait(|| matches!(backend.attach(SESSION, &inventory), Poll::Ready(Ok(()))));
+    wait(|| stream.lock().unwrap().published);
+    let first = backend.next_transfer(SESSION, &budget).unwrap().unwrap();
+    let second = backend.next_transfer(SESSION, &budget).unwrap().unwrap();
+    assert!(first.header().seqnum < second.header().seqnum);
+    assert!(backend.next_transfer(SESSION, &budget).is_none());
+    for (transfer, token) in [(second, 11), (first, 40)] {
+        backend
+            .complete(
+                SESSION,
+                Completion {
+                    transfer,
+                    status: 0,
+                    actual_length: 0,
+                    start_frame: 0,
+                },
+            )
+            .unwrap();
+        wait(|| stream.lock().unwrap().completed.contains(&token));
+    }
+    assert_eq!(stream.lock().unwrap().completed, [11, 40]);
+    wait(|| matches!(backend.detach(SESSION), Poll::Ready(Ok(()))));
+    drop(backend);
+    wait(|| budget.usage().bytes == 0);
+}
+
+#[test]
+fn iso_spare_slots_do_not_admit_inactive_bulk_endpoints() {
+    let b = budget();
+    let mut config = vec![
+        9, 2, 0, 0, 2, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 1, 8, 0, 1, 9, 4,
+        1, 0, 0, 0xff, 0, 0, 0, 9, 4, 1, 1, 1, 0xff, 0, 0, 0, 7, 5, 0x82, 2, 64, 0, 0,
+    ];
+    config[2] = config.len() as u8;
+    let d = DescriptorSet::new(&b, &DEVICE, &config, &[], Speed::Full).unwrap();
+    let mut alternates = [0; topology::MAX_SETTINGS];
+    assert_eq!(d.active_slots(&alternates), ((1u32 << 31) - 1) & !4);
+    alternates[1] = 1;
+    assert_eq!(d.active_slots(&alternates), (1u32 << 31) - 1);
 }

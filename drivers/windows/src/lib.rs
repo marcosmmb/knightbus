@@ -16,6 +16,11 @@ mod channel;
 mod filter;
 mod lifetime;
 
+// Windows interrupt time and relative timer deadlines use 100 ns units.
+const TIME_UNITS_PER_MILLISECOND: u64 = 10_000;
+const TIME_UNITS_PER_MICROFRAME: u64 = TIME_UNITS_PER_MILLISECOND
+    / knightbus_windows_protocol::descriptors::MICROFRAMES_PER_FRAME as u64;
+
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("This driver requires the Windows x64 WDK ABI");
 

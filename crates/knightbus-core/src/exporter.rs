@@ -1,7 +1,9 @@
 //! Host-independent bounded worker. Native objects never cross thread boundaries.
 use crate::usbip::status;
 use knightbus_usb as usb;
-const SLOTS: usize = 64;
+const SLOTS: usize = crate::Capabilities::MAX_REQUESTS;
+/// Maximum requests queued concurrently on one ISO endpoint.
+pub const ISO_QUEUE_DEPTH: usize = 8;
 mod limits {
     pub const WORKER_METADATA_ALLOWANCE: usize = 4096;
     pub const CLEANUP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -88,9 +90,69 @@ fn pipe(transfer: &Transfer) -> usize {
     header.endpoint as usize + direction
 }
 
+mod control;
+use control::Change;
+
+fn endpoint_bit(address: u8) -> u32 {
+    let pipe = if address & usb::ENDPOINT_NUMBER_MASK == 0 {
+        0
+    } else {
+        (address & usb::ENDPOINT_NUMBER_MASK)
+            + if address & usb::DIRECTION_IN != 0 {
+                usb::IN_ENDPOINT_BIT_OFFSET
+            } else {
+                0
+            }
+    };
+    1 << pipe
+}
+
+/// Negative USB result for a native management operation. Conversion from core
+/// errors is supported; invalid nonnegative statuses become a generic I/O error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlError(i32);
+impl From<Error> for ControlError {
+    fn from(error: Error) -> Self {
+        Self(status(error))
+    }
+}
+impl From<i32> for ControlError {
+    fn from(value: i32) -> Self {
+        Self(if value < 0 { value } else { status::IO })
+    }
+}
+
+/// Native state for one claimed interface. It must own only that interface's
+/// handles, so changing an alternate cannot release another interface's pipes.
+pub trait InterfaceDriver {
+    /// Apply this validated setting and rebuild only its pipes. Called after
+    /// this interface's requests retire; unrelated interfaces may still have I/O.
+    /// Return only after the OS operation finishes, using a bounded native wait.
+    fn select_alternate(
+        &mut self,
+        setting: &crate::Interface,
+    ) -> std::result::Result<(), ControlError>;
+    /// Clear the addressed pipe's halt after its requests retire. Other pipes
+    /// remain live. Errors must not release their buffers or handles.
+    fn clear_halt(&mut self, address: u8) -> std::result::Result<(), ControlError>;
+}
+
 /// Native ownership boundary. Implementations retain transfers until terminal
 /// callbacks, and must never unwind while native code can access freed storage.
 pub trait Driver {
+    /// Native handles scoped to one interface.
+    type Interface: InterfaceDriver;
+    /// Current native configuration; zero means unconfigured.
+    fn configuration(&self) -> u8;
+    /// Borrow only the selected interface's native state.
+    fn interface(&mut self, number: u8) -> Result<&mut Self::Interface>;
+    /// Select a validated configuration, or unconfigure on None. Core drains all
+    /// transfers first. Finish the bounded OS operation before returning; core
+    /// retires the device if the operation fails with potentially partial state.
+    fn configure(
+        &mut self,
+        configuration: Option<&crate::Configuration>,
+    ) -> std::result::Result<(), ControlError>;
     /// Native feature and resource limits.
     const CAPABILITIES: crate::Capabilities;
     /// Install the worker notification before polling/submitting. Wake after
@@ -98,7 +160,8 @@ pub trait Driver {
     fn set_waker(&mut self, waker: Waker);
     /// Report the endpoint currently selected by the OS; None means absent.
     fn endpoint(&self, address: u8) -> Option<crate::Endpoint>;
-    /// Admit a request or return its unchanged owner. Called in endpoint order.
+    /// Admit ordinary control/data or return its unchanged owner, in endpoint order.
+    /// Configuration, alternate changes and clear-halt never reach this method.
     #[allow(clippy::result_large_err)]
     fn submit(
         &mut self,
@@ -119,14 +182,14 @@ pub trait Driver {
 enum Slot {
     Free,
     Queued(TransferId, Transfer),
-    Running(TransferId, usize),
+    Running(TransferId, usize, bool),
     Done(TransferId, Completion),
 }
 impl Slot {
     fn id(&self) -> Option<TransferId> {
         match self {
             Self::Free => None,
-            Self::Queued(id, _) | Self::Running(id, _) | Self::Done(id, _) => Some(*id),
+            Self::Queued(id, _) | Self::Running(id, _, _) | Self::Done(id, _) => Some(*id),
         }
     }
 }
@@ -163,7 +226,7 @@ impl Shared {
 /// opens native objects on the worker only after the engine authorizes a claim.
 pub struct Backend<F> {
     factory: Option<F>,
-    device: Device,
+    device: Arc<Device>,
     session: Option<SessionId>,
     shared: Arc<Shared>,
     removal_reported: bool,
@@ -183,7 +246,7 @@ impl<F> Backend<F> {
         )?;
         Ok(Self {
             factory: Some(factory),
-            device,
+            device: Arc::new(device),
             session: None,
             shared: Arc::new(Shared {
                 mailbox: Mutex::new(Mailbox {
@@ -215,7 +278,7 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ExporterBackend for B
         true
     }
     fn claim(&mut self, session: SessionId, device: &Device) -> Poll<Result<()>> {
-        if device != &self.device
+        if device != self.device.as_ref()
             || session.epoch == 0
             || session.serial == 0
             || self.session.is_some_and(|s| s != session)
@@ -226,10 +289,10 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ExporterBackend for B
             self.session = Some(session);
             self.lock().state = State::Opening;
             let shared = self.shared.clone();
-            let device_id = self.device.wire_id();
+            let device = self.device.clone();
             if thread::Builder::new()
                 .name("knightbus-exporter".into())
-                .spawn(move || worker(shared, factory, device_id))
+                .spawn(move || worker(shared, factory, device))
                 .is_err()
             {
                 self.lock().state = State::Failed(Error::Unavailable);
@@ -336,7 +399,11 @@ impl<F> Drop for Backend<F> {
         self.shared.wake.notify();
     }
 }
-fn worker<D: Driver>(shared: Arc<Shared>, factory: impl FnOnce() -> Result<D>, device_id: u32) {
+fn worker<D: Driver>(
+    shared: Arc<Shared>,
+    factory: impl FnOnce() -> Result<D>,
+    device: Arc<Device>,
+) {
     let mut driver = match factory() {
         Ok(d) => d,
         Err(e) => {
@@ -351,8 +418,7 @@ fn worker<D: Driver>(shared: Arc<Shared>, factory: impl FnOnce() -> Result<D>, d
     Worker {
         shared,
         driver,
-        active_barrier: None,
-        device_id,
+        device,
     }
     .run();
 }
@@ -360,8 +426,7 @@ fn worker<D: Driver>(shared: Arc<Shared>, factory: impl FnOnce() -> Result<D>, d
 struct Worker<D> {
     shared: Arc<Shared>,
     driver: D,
-    active_barrier: Option<TransferId>,
-    device_id: u32,
+    device: Arc<Device>,
 }
 impl<D: Driver> Worker<D> {
     fn run(mut self) {
@@ -411,14 +476,17 @@ impl<D: Driver> Worker<D> {
             m.stop = true;
         }
         let mut blocked = [false; usb::ENDPOINT_DIRECTION_SLOTS];
+        let mut inflight = [0usize; usb::ENDPOINT_DIRECTION_SLOTS];
         for slot in &m.slots {
-            if let Slot::Running(_, pipe) = slot {
-                blocked[*pipe] = true;
+            if let Slot::Running(_, pipe, iso) = slot {
+                inflight[*pipe] += 1;
+                blocked[*pipe] |= !iso;
             }
         }
         // Correlation sequence numbers need not be monotonic. Preserve actual
         // admission order across slot reuse and sequence-number wraparound.
         let pass_end = m.next_order;
+        let mut barrier_pending = 0;
         let mut indices: [usize; SLOTS] = std::array::from_fn(|i| i);
         indices.sort_unstable_by_key(|i| m.order[*i]);
         for i in indices {
@@ -427,34 +495,39 @@ impl<D: Driver> Worker<D> {
                 continue;
             }
             let cancel = m.stop || m.cancelled[i];
-            if !cancel && self.active_barrier.is_some() && matches!(m.slots[i], Slot::Queued(..)) {
-                continue;
-            }
-            let barrier = match &m.slots[i] {
-                Slot::Queued(_, t) => {
-                    t.header().endpoint == 0
-                        && t.header().setup[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK == 0
-                        && matches!(
-                            t.header().setup[usb::SETUP_REQUEST],
-                            usb::CLEAR_FEATURE | usb::SET_CONFIGURATION | usb::SET_INTERFACE
-                        )
-                }
-                _ => false,
+            let change = match &m.slots[i] {
+                Slot::Queued(_, t) if t.header().endpoint == 0 => Change::decode(&t.header().setup),
+                _ => Ok(None),
             };
-            if barrier
+            let barrier = change.ok().flatten().map_or(0, |change| {
+                change.scope(&self.device, self.driver.configuration())
+            });
+            if !cancel {
+                if let Slot::Queued(_, transfer) = &m.slots[i] {
+                    if barrier_pending & (1 << pipe(transfer)) != 0 {
+                        barrier_pending |= barrier;
+                        continue;
+                    }
+                }
+            }
+            if barrier != 0
                 && !cancel
-                && m.slots.iter().enumerate().any(|(j, slot)| {
-                    matches!(slot, Slot::Running(..))
-                        || (matches!(slot, Slot::Queued(..)) && m.order[j] < m.order[i])
+                && m.slots.iter().enumerate().any(|(j, slot)| match slot {
+                    Slot::Running(_, pipe, _) => barrier & (1 << pipe) != 0,
+                    Slot::Queued(_, t) if m.order[j] < m.order[i] => barrier & (1 << pipe(t)) != 0,
+                    _ => false,
                 })
             {
-                break;
+                // Unrelated interfaces keep running, including idle HID reads.
+                // Cancellation still retires requests behind a waiting change.
+                barrier_pending |= barrier;
+                continue;
             }
             if !cancel {
                 if let Slot::Queued(_, transfer) = &m.slots[i] {
-                    if blocked[pipe(transfer)] {
-                        if barrier {
-                            break;
+                    if blocked[pipe(transfer)] || inflight[pipe(transfer)] >= ISO_QUEUE_DEPTH {
+                        if barrier != 0 {
+                            barrier_pending |= barrier;
                         }
                         continue;
                     }
@@ -465,33 +538,55 @@ impl<D: Driver> Worker<D> {
                     progress = true;
                     m.slots[i] = Slot::Done(
                         id,
-                        Completion {
+                        failed(
                             transfer,
-                            status: if removed {
+                            if removed {
                                 status::NO_DEVICE
                             } else {
                                 status::CANCELLED
                             },
-                            actual_length: 0,
-                            start_frame: 0,
-                        },
+                        ),
                     );
+                }
+                Slot::Queued(id, transfer) if change != Ok(None) => {
+                    // Core owns the request and completion. Adapters receive only
+                    // validated native operations, never the wire setup packet.
+                    m.slots[i] = Slot::Running(id, 0, false);
+                    drop(m);
+                    let (result, invalidated) = match transfer
+                        .validate_native(self.device.wire_id(), None, D::CAPABILITIES)
+                        .and(change)
+                    {
+                        Ok(Some(change)) => change.execute(&mut self.driver, &self.device),
+                        Err(error) => (Err(ControlError::from(error)), false),
+                        Ok(None) => unreachable!(),
+                    };
+                    m = self.shared.mailbox.lock().unwrap();
+                    m.slots[i] = Slot::Done(
+                        id,
+                        failed(transfer, result.err().map_or(0, |error| error.0)),
+                    );
+                    m.stop |= invalidated;
+                    m.gone |= invalidated;
+                    progress = true;
                 }
                 Slot::Queued(id, transfer) => {
                     let pipe = pipe(&transfer);
-                    blocked[pipe] = true;
-                    m.slots[i] = Slot::Running(id, pipe);
+                    let iso = !transfer.layout().is_empty();
+                    blocked[pipe] = !iso;
+                    inflight[pipe] += 1;
+                    m.slots[i] = Slot::Running(id, pipe, iso);
                     drop(m);
                     let endpoint = self.driver.endpoint(
                         transfer.header().endpoint as u8
                             | if transfer.header().direction == crate::usbip::Direction::In {
-                                0x80
+                                usb::DIRECTION_IN
                             } else {
                                 0
                             },
                     );
                     let result = match transfer.validate_native(
-                        self.device_id,
+                        self.device.wire_id(),
                         endpoint.as_ref(),
                         D::CAPABILITIES,
                     ) {
@@ -502,41 +597,33 @@ impl<D: Driver> Worker<D> {
                     match result {
                         Ok(()) => {
                             progress = true;
-                            if barrier {
-                                self.active_barrier = Some(id);
-                            }
                         }
                         Err((SubmitError::Busy, transfer)) => {
                             // The head stays queued. Never offer a later request
                             // on this pipe, even if the driver would accept it.
+                            blocked[pipe] = true;
+                            inflight[pipe] -= 1;
                             m.slots[i] = Slot::Queued(id, transfer);
                         }
                         Err((SubmitError::Failed(error), transfer)) => {
                             // Allocation failure is terminal ENOMEM, not Busy.
                             progress = true;
                             blocked[pipe] = false;
-                            m.slots[i] = Slot::Done(
-                                id,
-                                Completion {
-                                    transfer,
-                                    status: status(error),
-                                    actual_length: 0,
-                                    start_frame: 0,
-                                },
-                            );
+                            inflight[pipe] -= 1;
+                            m.slots[i] = Slot::Done(id, failed(transfer, status(error)));
                         }
                     }
                 }
-                Slot::Running(id, pipe) if cancel => {
-                    m.slots[i] = Slot::Running(id, pipe);
+                Slot::Running(id, pipe, iso) if cancel => {
+                    m.slots[i] = Slot::Running(id, pipe, iso);
                     drop(m);
                     retry_cleanup |= self.driver.cancel(id).is_err();
                     m = self.shared.mailbox.lock().unwrap();
                 }
                 other => m.slots[i] = other,
             }
-            if barrier {
-                break;
+            if barrier != 0 && !cancel {
+                barrier_pending |= barrier;
             }
         }
         drop(m);
@@ -549,14 +636,11 @@ impl<D: Driver> Worker<D> {
                 break;
             };
             progress = true;
-            if self.active_barrier == Some(id) {
-                self.active_barrier = None;
-            }
             let mut m = self.shared.mailbox.lock().unwrap();
             if let Some(i) = m
                 .slots
                 .iter()
-                .position(|s| matches!(s, Slot::Running(token, _) if *token == id))
+                .position(|s| matches!(s, Slot::Running(token, _, _) if *token == id))
             {
                 m.slots[i] = Slot::Done(id, done);
             } else {
@@ -566,6 +650,19 @@ impl<D: Driver> Worker<D> {
         progress
     }
 }
+fn failed(mut transfer: Transfer, status: i32) -> Completion {
+    for packet in transfer.packets_mut() {
+        packet.actual_length = 0;
+        packet.status = status;
+    }
+    Completion {
+        transfer,
+        status,
+        actual_length: 0,
+        start_frame: 0,
+    }
+}
+
 /// Stable USB/IP status for admission errors.
 pub fn status(error: Error) -> i32 {
     match error {
@@ -605,7 +702,31 @@ mod tests {
         pending: Option<(TransferId, Transfer)>,
         wake: Option<Waker>,
     }
+    impl InterfaceDriver for Immediate {
+        fn select_alternate(
+            &mut self,
+            _: &crate::Interface,
+        ) -> std::result::Result<(), ControlError> {
+            Err(Error::Unsupported.into())
+        }
+        fn clear_halt(&mut self, _: u8) -> std::result::Result<(), ControlError> {
+            Err(Error::Unsupported.into())
+        }
+    }
     impl Driver for Immediate {
+        type Interface = Self;
+        fn configuration(&self) -> u8 {
+            1
+        }
+        fn interface(&mut self, _: u8) -> Result<&mut Self::Interface> {
+            Err(Error::Unsupported)
+        }
+        fn configure(
+            &mut self,
+            _: Option<&crate::Configuration>,
+        ) -> std::result::Result<(), ControlError> {
+            Err(Error::Unsupported.into())
+        }
         fn endpoint(&self, address: u8) -> Option<crate::Endpoint> {
             if !matches!(address, 0x81 | 0x82) {
                 return None;
@@ -614,6 +735,7 @@ mod tests {
                 address,
                 kind: crate::TransferKind::Bulk,
                 max_packet_size: 64,
+                service_bytes: 64,
                 interval: 0,
                 allowed_flags: 0,
             })
@@ -734,7 +856,8 @@ mod tests {
         let worker_shared = shared.clone();
         let factory = backend.factory.take().unwrap();
         let start = Instant::now();
-        let thread = std::thread::spawn(move || worker(worker_shared, factory, 0x00011000));
+        let device = backend.device.clone();
+        let thread = std::thread::spawn(move || worker(worker_shared, factory, device));
         while backend
             .lock()
             .slots

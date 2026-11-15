@@ -1,8 +1,9 @@
 //! Passive IOCTL dispatch. The owner gate covers validation through completion.
 use super::*;
+use knightbus_windows_protocol::iso as packets;
 use knightbus_windows_protocol::wire::{
-    self, ATTACH as ATTACH_PHYSICAL, DETACH, FETCH, HEADER, MAX_TRANSFER as LIMIT, REPLY,
-    RETIREMENT_READY, SLOTS as ENDPOINT_COUNT, STATS, STATS_BYTES,
+    self, ATTACH as ATTACH_PHYSICAL, DETACH, FETCH, HEADER, REPLY, RETIREMENT_READY,
+    SLOTS as ENDPOINT_COUNT, STATS, STATS_BYTES, TRANSFER_READY,
 };
 
 fn abi_status(error: wire::Error) -> NTSTATUS {
@@ -57,7 +58,7 @@ unsafe fn store_descriptors(
     s: *mut State,
     request: WDFREQUEST,
     input: usize,
-) -> Result<(), NTSTATUS> {
+) -> Result<bool, NTSTATUS> {
     if !(wire::ATTACH_CONFIG + 9..=wire::ATTACH_MAX).contains(&input) {
         return Err(STATUS_INVALID_BUFFER_SIZE);
     }
@@ -76,8 +77,10 @@ unsafe fn store_descriptors(
         (&mut (*s).physical_bos)[..attachment.bos.len()].copy_from_slice(attachment.bos);
         (*s).speed = attachment.speed as u32;
         (*s).endpoints = attachment.endpoints;
+        (*s).iso_slots = attachment.iso_slots;
+        (*s).has_iso = attachment.has_iso;
     }
-    Ok(())
+    Ok(attachment.has_iso)
 }
 #[inline(never)]
 unsafe fn attach_physical(
@@ -97,8 +100,13 @@ unsafe fn attach_physical(
     if unsafe { !(*s).owner.is_null() || !(*s).child.is_null() } {
         return Err(STATUS_DEVICE_BUSY);
     }
-    unsafe { store_descriptors(s, request, input) }?;
+    if unsafe { store_descriptors(s, request, input) }? {
+        unsafe {
+            iso::initialize(device)?;
+        }
+    }
     unsafe {
+        crate::filter::set_iso_clock(device, if (*s).has_iso { (*s).speed } else { 0 });
         wdf!(WdfSpinLockAcquire, (*s).lock);
         (*s).closing = 0;
         wdf!(WdfSpinLockRelease, (*s).lock);
@@ -134,11 +142,18 @@ unsafe fn fetch_or_stats(
     output: usize,
 ) -> Result<usize, NTSTATUS> {
     let needed = if code == FETCH {
-        HEADER + LIMIT
+        if unsafe { (*s).has_iso } {
+            packets::MAX_MESSAGE
+        } else {
+            HEADER + LIMIT
+        }
     } else {
         STATS_BYTES
     };
-    if (input != 0 && (code != FETCH || input != 4)) || output < needed || output > HEADER + LIMIT {
+    if (input != 0 && (code != FETCH || input != 4))
+        || output < needed
+        || output > packets::MAX_MESSAGE
+    {
         return Err(STATUS_INVALID_BUFFER_SIZE);
     }
     // Read the mask before writing the shared input/output buffer.
@@ -203,33 +218,66 @@ unsafe fn fetch(s: *mut State, buffer: *mut u8, mask: u32) -> Result<usize, NTST
         }
         let slot = unsafe { ptr::addr_of_mut!((*s).slots[index]) };
         if unsafe { !(*slot).request.is_null() && (*slot).fetched == 0 } {
+            // A rotating slot cursor must not reorder one ISO endpoint.
+            if unsafe {
+                (*slot).iso_count != 0
+                    && (*s).slots.iter().any(|other| {
+                        !other.request.is_null()
+                            && other.fetched == 0
+                            && other.address == (*slot).address
+                            && other.token < (*slot).token
+                    })
+            } {
+                continue;
+            }
             let length = unsafe { (*slot).length as usize };
             let payload = if unsafe { (*slot).input } != 0 {
                 0
             } else {
                 length
             };
+            let count = unsafe { (*slot).iso_count as usize };
+            let header = if count == 0 { HEADER } else { packets::HEADER };
             // Initialize only the returned header and payload. Never
             // form a byte slice over the unused METHOD_BUFFERED tail.
-            unsafe { ptr::write_bytes(buffer.cast::<u8>(), 0, HEADER) };
-            let out = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), HEADER) };
-            out[0..4].copy_from_slice(&1u32.to_le_bytes());
-            out[4..8].copy_from_slice(&(unsafe { (*s).endpoints[index] } as u32).to_le_bytes());
+            unsafe { ptr::write_bytes(buffer.cast::<u8>(), 0, header) };
+            let out = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), header) };
+            out[0..4]
+                .copy_from_slice(&(if count == 0 { 1u32 } else { packets::VERSION }).to_le_bytes());
+            out[4..8].copy_from_slice(&(unsafe { (*slot).address } as u32).to_le_bytes());
             out[8..16].copy_from_slice(&unsafe { (*slot).token }.to_le_bytes());
             out[16..20].copy_from_slice(&(length as u32).to_le_bytes());
             out[20..24].copy_from_slice(&(payload as u32).to_le_bytes());
             out[24..32].copy_from_slice(&unsafe { (*slot).setup });
+            if count != 0 {
+                out[packets::field::PACKET_COUNT
+                    ..packets::field::PACKET_COUNT + mem::size_of::<u32>()]
+                    .copy_from_slice(&(count as u32).to_le_bytes());
+                out[packets::field::FLAGS..packets::field::FLAGS + mem::size_of::<u32>()]
+                    .copy_from_slice(&packets::ASAP.to_le_bytes());
+                out[packets::field::SLOT..packets::field::SLOT + mem::size_of::<u32>()]
+                    .copy_from_slice(&(index as u32).to_le_bytes());
+                let records = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        buffer.add(header + payload),
+                        count * packets::PACKET_BYTES,
+                    )
+                };
+                for (i, bytes) in records.chunks_exact_mut(packets::PACKET_BYTES).enumerate() {
+                    unsafe { (*slot).packets[i] }.write(bytes);
+                }
+            }
             unsafe {
                 ptr::copy_nonoverlapping(
                     (*slot).data.as_ptr(),
-                    buffer.cast::<u8>().add(HEADER),
+                    buffer.cast::<u8>().add(header),
                     payload,
                 );
                 (*slot).fetched = 1;
                 (*s).next_fetch = (index + 1) % ENDPOINT_COUNT;
                 wdf!(WdfSpinLockRelease, (*s).lock);
             }
-            return Ok(HEADER + payload);
+            return Ok(header + payload + count * packets::PACKET_BYTES);
         }
     }
     unsafe { wdf!(WdfSpinLockRelease, (*s).lock) };
@@ -243,13 +291,13 @@ unsafe fn reply(
     output: usize,
 ) -> Result<usize, NTSTATUS> {
     let s = unsafe { state(device) };
-    if output != 0 || !(HEADER..=HEADER + LIMIT).contains(&input) {
+    if output != 0 || !(HEADER..=packets::MAX_MESSAGE).contains(&input) {
         return Err(STATUS_INVALID_BUFFER_SIZE);
     }
     let pointer = unsafe { input_buffer(request, input)? };
     let bytes = unsafe { core::slice::from_raw_parts(pointer, input) };
     let response = wire::Reply::decode(bytes).map_err(abi_status)?;
-    let index = unsafe { (*s).endpoints }
+    let fixed_index = unsafe { (*s).endpoints }
         .iter()
         .position(|ep| u32::from(*ep) == response.endpoint)
         .ok_or(STATUS_INVALID_PARAMETER)?;
@@ -258,12 +306,40 @@ unsafe fn reply(
     // with cancel, which cannot complete until after releasing this lock.
     let owned = unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
+        let index = if response.packets.is_some() {
+            match (*s).slots.iter().position(|slot| {
+                !slot.request.is_null()
+                    && slot.token == response.token
+                    && u32::from(slot.address) == response.endpoint
+            }) {
+                Some(index) => index,
+                None => {
+                    wdf!(WdfSpinLockRelease, (*s).lock);
+                    return Err(STATUS_NOT_FOUND);
+                }
+            }
+        } else {
+            fixed_index
+        };
         let slot = ptr::addr_of_mut!((*s).slots[index]);
         if (*slot).request.is_null() || (*slot).token != response.token || (*slot).fetched == 0 {
             wdf!(WdfSpinLockRelease, (*s).lock);
             return Err(STATUS_NOT_FOUND);
         }
         if let Err(error) = response.validate_length((*slot).length as usize, (*slot).input != 0) {
+            wdf!(WdfSpinLockRelease, (*s).lock);
+            return Err(abi_status(error));
+        }
+        let valid = match response.packets {
+            Some(packets) if (*slot).iso_count != 0 => packets.validate_reply(
+                &(&(*slot).packets)[..(*slot).iso_count as usize],
+                response.completed,
+                response.errors,
+            ),
+            None if (*slot).iso_count == 0 => Ok(()),
+            _ => Err(wire::Error::Fields),
+        };
+        if let Err(error) = valid {
             wdf!(WdfSpinLockRelease, (*s).lock);
             return Err(abi_status(error));
         }
@@ -290,6 +366,9 @@ unsafe fn complete_urb(
     input: bool,
     response: &wire::Reply<'_>,
 ) -> Result<(), NTSTATUS> {
+    if response.packets.is_some() {
+        return unsafe { iso::complete(urb, input, response) };
+    }
     let completed = response.completed;
     let payload = response.payload.len();
     let reply_status = response.status;
@@ -354,7 +433,7 @@ unsafe fn dispatch(
         return Err(STATUS_ACCESS_DENIED);
     }
     match code {
-        RETIREMENT_READY => return unsafe { readiness(s, input, output) },
+        RETIREMENT_READY | TRANSFER_READY => return unsafe { readiness(s, input, output) },
         ATTACH_PHYSICAL => return unsafe { attach_physical(device, request, file, output, input) },
         _ => {}
     }
@@ -393,6 +472,7 @@ pub(crate) unsafe fn ioctl(
         DETACH,
         STATS,
         RETIREMENT_READY,
+        TRANSFER_READY,
     ]
     .contains(&code)
     {

@@ -13,6 +13,7 @@ use knightbus_windows_protocol::{
     descriptors,
     wire::{MAX_TRANSFER as LIMIT, SLOTS as ENDPOINT_COUNT},
 };
+
 const QUEUE_COUNT: usize = ENDPOINT_COUNT * 2;
 const SUBMIT_URB: u32 = 0x0022_0003;
 const PRIVATE_INTERFACE: GUID = GUID {
@@ -43,12 +44,18 @@ struct Slot {
     fetched: u8,
     input: u8,
     setup: [u8; 8],
+    address: u8,
+    iso_count: u32,
+    start_frame: u32,
+    packets:
+        [knightbus_windows_protocol::iso::Packet; knightbus_windows_protocol::iso::MAX_PACKETS],
     data: [u8; LIMIT],
 }
 #[repr(C)]
 struct State {
     retirement: super::lifetime::Retirement,
     endpoints: [u8; ENDPOINT_COUNT], // Immutable from attach through final child retirement.
+    iso_slots: [u32; ENDPOINT_COUNT],
     physical_device: [u8; 18],
     physical_configuration: [u8; 4096],
     physical_length: usize,
@@ -58,6 +65,8 @@ struct State {
     lock: WDFSPINLOCK,
     gate: WDFWAITLOCK,
     dpc: WDFDPC,
+    iso_timer: WDFTIMER,
+    has_iso: bool,
     head: WDFREQUEST,
     filtered_pending: u32, // Accepted filter requests, including DPC delivery.
     failed_head: PIRP,     // Context-allocation failures; owned, non-cancelable IRPs only.
@@ -84,12 +93,21 @@ struct RequestState {
     status: NTSTATUS,
     controller: WDFDEVICE,
     slot: usize,
+    iso_complete: u8,
+    delay_completion: u8,
+    due_frame: u32,
     operation: u8, // 0=URB, 1=configuration/endpoint reset notification.
 }
 #[repr(C)]
 struct QueueState {
     index: usize,
     storage: usize,
+    controller: WDFDEVICE,
+    interval: u8,
+    schedule: knightbus_windows_protocol::iso::Schedule,
+}
+#[repr(C)]
+struct WorkState {
     controller: WDFDEVICE,
 }
 #[repr(C)]
@@ -120,6 +138,18 @@ context_type!(REQUEST_TYPE, RequestState, c"KnightBusRequest");
 context_type!(QUEUE_TYPE, QueueState, c"KnightBusQueue");
 context_type!(ENDPOINT_TYPE, EndpointState, c"KnightBusEndpoint");
 context_type!(CHILD_TYPE, ChildState, c"KnightBusChild");
+context_type!(WORK_TYPE, WorkState, c"KnightBusWork");
+
+unsafe fn work(object: WDFOBJECT) -> *mut WorkState {
+    unsafe {
+        wdf!(
+            WdfObjectGetTypedContextWorker,
+            object,
+            ptr::addr_of!(WORK_TYPE)
+        )
+    }
+    .cast()
+}
 
 // SAFETY: All callers use an object created with the exact matching attributes;
 // WDF holds its context alive through callbacks and owned request completion.
@@ -310,6 +340,7 @@ pub(super) unsafe fn initialize(device: WDFDEVICE) -> NTSTATUS {
     if status < 0 {
         return status;
     }
+    attributes.ContextTypeInfo = ptr::addr_of!(WORK_TYPE);
     let mut config = WDF_DPC_CONFIG {
         Size: structure_size::<WDF_DPC_CONFIG>(),
         EvtDpcFunc: Some(complete_dpc),
@@ -327,6 +358,9 @@ pub(super) unsafe fn initialize(device: WDFDEVICE) -> NTSTATUS {
 
     if status < 0 {
         return status;
+    }
+    unsafe {
+        (*work((*s).dpc.cast())).controller = device;
     }
     // SAFETY: Live FDO and our independently selected private interface GUID.
     unsafe {
@@ -356,8 +390,9 @@ unsafe fn finish(device: WDFDEVICE, request: WDFREQUEST, status: NTSTATUS) {
 }
 
 unsafe extern "C" fn complete_dpc(dpc: WDFDPC) {
-    // SAFETY: The framework's DPC parent is this FDO; it stays live throughout.
-    let device = unsafe { wdf!(WdfDpcGetParentObject, dpc) }.cast();
+    // WDF can unlink the parent before its cleanup callback. The saved pointer
+    // remains live because device_cleanup drains and joins this DPC before return.
+    let device = unsafe { (*work(dpc.cast())).controller };
     let s = unsafe { state(device) };
     loop {
         // SAFETY: Only list operations/counters occur under this lock. Never
@@ -378,12 +413,21 @@ unsafe extern "C" fn complete_dpc(dpc: WDFDPC) {
                 context[..3].fill(ptr::null_mut());
                 (request, status)
             } else {
-                let request = (*s).head;
+                let mut link = ptr::addr_of_mut!((*s).head);
+                while !(*link).is_null() {
+                    let r = request_state(*link);
+                    if !iso::waiting(s, r) {
+                        break;
+                    }
+                    link = ptr::addr_of_mut!((*r).next);
+                }
+                let request = *link;
                 if request.is_null() {
+                    iso::arm(s);
                     (request, STATUS_SUCCESS)
                 } else {
                     let r = request_state(request);
-                    (*s).head = (*r).next;
+                    *link = (*r).next;
                     (request, (*r).status)
                 }
             };
@@ -429,7 +473,13 @@ unsafe extern "C" fn complete_dpc(dpc: WDFDPC) {
                 // Argument1 is their kernel buffer, never a user channel pointer.
                 // Check the declared size before writing its common status.
                 unsafe {
-                    if usize::from((*urb).Length) >= mem::size_of::<_URB_HEADER>() {
+                    if usize::from((*urb).Length) >= mem::size_of::<_URB_HEADER>()
+                        && !iso::finish(
+                            urb,
+                            !context.is_null() && (*context).iso_complete != 0,
+                            status,
+                        )
+                    {
                         (*urb).Status = if status >= 0 {
                             0
                         } else if status == STATUS_CANCELLED {
@@ -475,7 +525,7 @@ unsafe extern "C" fn cancel(request: WDFREQUEST) {
     let device = unsafe { (*context).controller };
     let index = unsafe { (*context).slot };
     let s = unsafe { state(device) };
-    // SAFETY: Index was fixed at queue creation; source queue is sequential.
+    // SAFETY: The slot index was fixed before publishing cancellation.
     unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
         if index < ENDPOINT_COUNT && (*s).slots[index].request == request {
@@ -521,15 +571,27 @@ unsafe extern "C" fn urb(
         unsafe { finish(device, request, STATUS_INVALID_DEVICE_REQUEST) };
         return;
     }
-    let index = unsafe { queue_index(queue) };
-    let result = unsafe { submit_urb(device, request, index) };
+    let q = unsafe {
+        wdf!(
+            WdfObjectGetTypedContextWorker,
+            queue.cast(),
+            ptr::addr_of!(QUEUE_TYPE)
+        )
+    }
+    .cast::<QueueState>();
+    let result = unsafe { submit_urb(device, request, q) };
     if let Err(status) = result {
         unsafe { finish(device, request, status) };
     }
 }
 
 // Passive callback, live request; no cancellation ownership is published yet.
-unsafe fn submit_urb(device: WDFDEVICE, request: WDFREQUEST, index: usize) -> Result<(), NTSTATUS> {
+unsafe fn submit_urb(
+    device: WDFDEVICE,
+    request: WDFREQUEST,
+    queue: *mut QueueState,
+) -> Result<(), NTSTATUS> {
+    let index = unsafe { (*queue).index };
     if index >= ENDPOINT_COUNT {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -554,10 +616,22 @@ unsafe fn submit_urb(device: WDFDEVICE, request: WDFREQUEST, index: usize) -> Re
     } else {
         unsafe { (*state(device)).endpoints[index] & 0x80 != 0 }
     };
-    let requested = if index == 0 {
+    let header = if index == 0 {
+        ptr::null_mut()
+    } else {
+        unsafe { iso::request(request)? }
+    };
+    let iso = if header.is_null() {
+        None
+    } else {
+        unsafe { iso::layout(header, input)? }
+    };
+    let requested = if let Some(urb) = iso {
+        unsafe { (*urb).TransferBufferLength }
+    } else if index == 0 {
         u32::from(u16::from_le_bytes([bytes[6], bytes[7]]))
     } else {
-        unsafe { bulk_length(request, input)? }
+        unsafe { bulk_length(header, input)? }
     };
     let mut buffer: *mut u8 = ptr::null_mut();
     let mut length = 0u32;
@@ -581,23 +655,26 @@ unsafe fn submit_urb(device: WDFDEVICE, request: WDFREQUEST, index: usize) -> Re
     if length as usize > LIMIT || (length != 0 && buffer.is_null()) {
         return Err(STATUS_INVALID_BUFFER_SIZE);
     }
-    unsafe { publish_urb(device, request, index, bytes, input, buffer, length) }
+    unsafe {
+        publish_urb(
+            device,
+            request,
+            queue,
+            NativeUrb {
+                setup: bytes,
+                input,
+                buffer,
+                length,
+                iso,
+            },
+        )
+    }
 }
 
-unsafe fn bulk_length(request: WDFREQUEST, input: bool) -> Result<u32, NTSTATUS> {
-    let mut parameters = WDF_REQUEST_PARAMETERS {
-        Size: mem::size_of::<WDF_REQUEST_PARAMETERS>() as u16,
-        ..Default::default()
-    };
-    // The mapped buffer can span more bytes than this URB requests
-    // (notably a partial storage read backed by a larger MDL).
-    // Preserve TransferBufferLength, rather than submitting its capacity.
+unsafe fn bulk_length(header: *mut _URB_HEADER, input: bool) -> Result<u32, NTSTATUS> {
+    // A mapped buffer may be larger than the requested transfer.
     unsafe {
-        wdf!(WdfRequestGetParameters, request, &mut parameters);
-        let header = parameters.Parameters.Others.Arg1.cast::<_URB_HEADER>();
-        if parameters.Type != _WDF_REQUEST_TYPE::WdfRequestTypeDeviceControlInternal
-            || header.is_null()
-            || (*header).Function != 0x0009 // URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER.
+        if (*header).Function != URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER as u16
             || usize::from((*header).Length) < mem::size_of::<_URB_BULK_OR_INTERRUPT_TRANSFER>()
         {
             return Err(STATUS_INVALID_PARAMETER);
@@ -609,19 +686,31 @@ unsafe fn bulk_length(request: WDFREQUEST, input: bool) -> Result<u32, NTSTATUS>
         Ok((*urb).TransferBufferLength)
     }
 }
+struct NativeUrb {
+    setup: [u8; 8],
+    input: bool,
+    buffer: *mut u8,
+    length: u32,
+    iso: Option<*mut _URB_ISOCH_TRANSFER>,
+}
 
 // The payload copy precedes MarkCancelableEx. After publication only the slot
 // lock and successful unmarking may grant completion ownership.
 unsafe fn publish_urb(
     device: WDFDEVICE,
     request: WDFREQUEST,
-    index: usize,
-    bytes: [u8; 8],
-    input: bool,
-    buffer: *mut u8,
-    length: u32,
+    queue: *mut QueueState,
+    urb: NativeUrb,
 ) -> Result<(), NTSTATUS> {
+    let NativeUrb {
+        setup: bytes,
+        input,
+        buffer,
+        length,
+        iso,
+    } = urb;
     let s = unsafe { state(device) };
+    let index = unsafe { (*queue).index };
     // SAFETY: Mapping belongs to our live URB. No copying after publishing
     // cancellation. The lock protects publication against FETCH/REPLY.
     let status = unsafe {
@@ -631,6 +720,40 @@ unsafe fn publish_urb(
             wdf!(WdfSpinLockRelease, (*s).lock);
             return Err(STATUS_CANCELLED);
         }
+        let schedule = if let Some(urb) = iso {
+            let requested = ((*urb).TransferFlags & 4 == 0).then_some((*urb).StartFrame);
+            match (*queue).schedule.reserve(
+                iso::current_frame(),
+                requested,
+                (*urb).NumberOfPackets,
+                (*queue).interval,
+                (*s).speed >= 3,
+            ) {
+                Ok(frames) => Some(frames),
+                Err(_) => {
+                    wdf!(WdfSpinLockRelease, (*s).lock);
+                    iso::bad_start(request, urb);
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+            }
+        } else {
+            None
+        };
+        let address = (*s).endpoints[index];
+        let index = if iso.is_some() {
+            let allowed = (*s).iso_slots[index];
+            match (1..ENDPOINT_COUNT)
+                .find(|i| allowed & (1 << i) != 0 && (*s).slots[*i].request.is_null())
+            {
+                Some(slot) => slot,
+                None => {
+                    wdf!(WdfSpinLockRelease, (*s).lock);
+                    return Err(STATUS_DEVICE_BUSY);
+                }
+            }
+        } else {
+            index
+        };
         if !(*s).slots[index].request.is_null() || token.is_none() {
             wdf!(WdfSpinLockRelease, (*s).lock);
             return Err(STATUS_DEVICE_BUSY);
@@ -643,6 +766,11 @@ unsafe fn publish_urb(
         (*slot).input = u8::from(input);
         (*slot).setup = bytes;
         (*slot).fetched = 0;
+        (*slot).iso_count = 0;
+        (*slot).address = address;
+        if let Some(iso) = iso {
+            iso::copy_layout(iso, slot, schedule.unwrap().0);
+        }
         if !input && length != 0 {
             ptr::copy_nonoverlapping(buffer, (*slot).data.as_mut_ptr(), length as usize);
         }
@@ -651,6 +779,9 @@ unsafe fn publish_urb(
         (*context).controller = device;
         (*context).slot = index;
         (*context).operation = 0;
+        (*context).iso_complete = 0;
+        (*context).delay_completion = u8::from(schedule.is_some());
+        (*context).due_frame = schedule.map_or(0, |(_, end)| end);
         (*s).submitted += 1;
 
         // MarkCancelableEx never synchronously calls cancel on an already
@@ -721,7 +852,13 @@ unsafe extern "C" fn reset(endpoint: UDECXUSBENDPOINT, request: WDFREQUEST) {
     if address == 0 {
         unsafe { wdf!(WdfRequestComplete, request, STATUS_NOT_SUPPORTED) };
     } else {
-        let setup = [0x02, 1, 0, 0, address, 0, 0, 0]; // CLEAR_FEATURE(ENDPOINT_HALT).
+        let setup = descriptors::setup(
+            descriptors::RECIPIENT_ENDPOINT,
+            descriptors::CLEAR_FEATURE,
+            descriptors::ENDPOINT_HALT,
+            u16::from(address),
+            0,
+        );
         unsafe { forward_control(device, request, setup, 1) };
     }
 }
@@ -738,9 +875,9 @@ unsafe extern "C" fn device_reset(
     unsafe { wdf!(WdfRequestComplete, request, STATUS_NOT_SUPPORTED) };
 }
 
-// A filter send failure still owns its request. Complete it on the controller
+// The filter owns this terminal request. Complete it on the controller
 // DPC, including the allocation-free fallback for missing request context.
-pub(super) unsafe fn fail_filtered(device: WDFDEVICE, request: WDFREQUEST, status: NTSTATUS) {
+pub(super) unsafe fn complete_filtered(device: WDFDEVICE, request: WDFREQUEST, status: NTSTATUS) {
     if unsafe { prepare_request(device, request, true) } {
         unsafe {
             (*request_state(request)).operation = 0;
@@ -781,7 +918,7 @@ pub(super) unsafe fn forward_standard_control(
         valid
     };
     if !valid {
-        unsafe { fail_filtered(device, request, STATUS_INVALID_PARAMETER) };
+        unsafe { complete_filtered(device, request, STATUS_INVALID_PARAMETER) };
     } else {
         unsafe { forward_control(device, request, setup, 2) };
     }
@@ -978,6 +1115,7 @@ unsafe fn create_endpoint(
     init: &mut PUDECXUSBENDPOINT_INIT,
     index: usize,
     address: u8,
+    interval: Option<u8>,
 ) -> Result<(), NTSTATUS> {
     let s = unsafe { state(device) };
     if index >= ENDPOINT_COUNT || (*init).is_null() {
@@ -985,7 +1123,7 @@ unsafe fn create_endpoint(
     }
     // UDE may create a replacement before reporting the old endpoint released.
     // Reserve at most two queue generations per logical endpoint, never reuse a
-    // released queue, and keep the payload budget at one slot per endpoint.
+    // released queue. ISO shares the bounded pool of unused endpoint slots.
     let storage = unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
         let free = (index * 2..index * 2 + 2).find(|position| {
@@ -1047,6 +1185,13 @@ unsafe fn create_endpoint(
             EvtIoCanceledOnQueue: Some(canceled_on_queue),
             ..Default::default()
         };
+        if interval.is_some() {
+            config.DispatchType = _WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel;
+            unsafe {
+                config.Settings.Parallel.NumberOfPresentedRequests =
+                    (*s).iso_slots[index].count_ones();
+            }
+        }
         let mut attributes = WDF_OBJECT_ATTRIBUTES {
             Size: structure_size::<WDF_OBJECT_ATTRIBUTES>(),
             ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
@@ -1080,6 +1225,8 @@ unsafe fn create_endpoint(
             (*context).index = index;
             (*context).storage = storage;
             (*context).controller = device;
+            (*context).interval = interval.unwrap_or(0);
+            (*context).schedule = Default::default();
             wdf!(WdfSpinLockAcquire, (*s).lock);
             (*s).queues[storage] = queue;
             wdf!(WdfSpinLockRelease, (*s).lock);
@@ -1147,7 +1294,7 @@ unsafe extern "C" fn default_endpoint_add(
     if device.is_null() {
         return STATUS_DEVICE_NOT_READY;
     }
-    let status = unsafe { create_endpoint(device, &mut init, 0, 0) }
+    let status = unsafe { create_endpoint(device, &mut init, 0, 0, None) }
         .err()
         .unwrap_or(STATUS_SUCCESS);
     if status >= 0 {
@@ -1183,9 +1330,17 @@ unsafe extern "C" fn endpoint_add(
         return STATUS_NOT_SUPPORTED;
     };
     let mut init = unsafe { (*metadata).UdecxUsbEndpointInit };
-    let status = unsafe { create_endpoint(device, &mut init, index, address) }
-        .err()
-        .unwrap_or(STATUS_SUCCESS);
+    let status = unsafe {
+        create_endpoint(
+            device,
+            &mut init,
+            index,
+            address,
+            (bytes[3] & 3 == 1).then_some(bytes[6]),
+        )
+    }
+    .err()
+    .unwrap_or(STATUS_SUCCESS);
 
     status
 }
@@ -1266,6 +1421,9 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
     unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
         (*s).closing = 1;
+        if !(*s).head.is_null() {
+            let _ = wdf!(WdfDpcEnqueue, (*s).dpc);
+        }
         notification::signal(s);
         for (index, output) in owned.iter_mut().enumerate() {
             let request = (*s).slots[index].request;
@@ -1289,6 +1447,11 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             if !request.is_null() {
                 finish(device, request, STATUS_CANCELLED);
             }
+        }
+    }
+    if !unsafe { (*s).iso_timer.is_null() } {
+        unsafe {
+            let _ = wdf!(WdfTimerStop, (*s).iso_timer, 1);
         }
     }
     if failure < 0 {
@@ -1453,5 +1616,7 @@ unsafe extern "C" fn device_cleanup(object: WDFOBJECT) {
 }
 
 mod ioctl;
+mod iso;
+pub(super) use iso::current_frame;
 mod notification;
 pub(super) use ioctl::ioctl;

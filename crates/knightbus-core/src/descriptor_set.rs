@@ -73,22 +73,29 @@ impl DescriptorSet {
                         && setting.alternate == alternates[endpoint.interface as usize]
                         && setting.endpoints & bit != 0
                 }) {
-                    mask | (1 << (index + 1))
+                    if self
+                        .endpoint(endpoint.address, alternates)
+                        .is_ok_and(|e| e.kind == crate::TransferKind::Isochronous)
+                    {
+                        // ISO may use several native slots for the same endpoint.
+                        let first_spare = self.topology.endpoints.iter().flatten().count() + 1;
+                        let spare = ((1u32 << 31) - 1) & !((1u32 << first_spare) - 1);
+                        mask | (1 << (index + 1)) | spare
+                    } else {
+                        mask | (1 << (index + 1))
+                    }
                 } else {
                     mask
                 }
             },
         )
     }
-    /// USB/IP polling interval for the currently selected endpoint.
-    pub fn interval(
+    /// Endpoint properties from the currently selected alternate setting.
+    pub fn endpoint(
         &self,
         address: u8,
         alternates: &[u8; descriptors::MAX_SETTINGS],
-    ) -> Result<i32> {
-        if address == 0 {
-            return Ok(0);
-        }
+    ) -> Result<crate::Endpoint> {
         let config = self.configuration();
         let mut offset = descriptors::configuration::BYTES;
         let mut selected = false;
@@ -102,19 +109,60 @@ impl DescriptorSet {
                 && selected
                 && d[descriptors::endpoint::ADDRESS] == address
             {
-                return Ok(
-                    if d[descriptors::endpoint::ATTRIBUTES] == descriptors::TRANSFER_BULK {
-                        0
-                    } else if self.speed == Speed::High || self.speed.superspeed() {
-                        1 << (d[descriptors::endpoint::INTERVAL] - 1)
+                let kind =
+                    match d[descriptors::endpoint::ATTRIBUTES] & descriptors::TRANSFER_TYPE_MASK {
+                        descriptors::TRANSFER_ISOCHRONOUS => crate::TransferKind::Isochronous,
+                        descriptors::TRANSFER_INTERRUPT => crate::TransferKind::Interrupt,
+                        _ => crate::TransferKind::Bulk,
+                    };
+                let packet = descriptors::u16_at(d, descriptors::endpoint::MAX_PACKET);
+                let service_bytes = if self.speed.superspeed() && kind != crate::TransferKind::Bulk
+                {
+                    u32::from(descriptors::u16_at(&config[offset + d.len()..], 4))
+                } else {
+                    u32::from(packet & descriptors::PACKET_SIZE_MASK)
+                        * (1 + u32::from(
+                            (packet >> descriptors::TRANSACTIONS_SHIFT)
+                                & descriptors::TRANSACTIONS_MASK,
+                        ))
+                };
+                return Ok(crate::Endpoint {
+                    address,
+                    kind,
+                    max_packet_size: packet,
+                    service_bytes,
+                    interval: d[descriptors::endpoint::INTERVAL],
+                    allowed_flags: if kind == crate::TransferKind::Isochronous {
+                        crate::usbip::ISO_ASAP
                     } else {
-                        d[descriptors::endpoint::INTERVAL].into()
+                        0
                     },
-                );
+                });
             }
             offset += d.len();
         }
         Err(Error::Invalid)
+    }
+    /// USB/IP polling interval for the currently selected endpoint.
+    pub fn interval(
+        &self,
+        address: u8,
+        alternates: &[u8; descriptors::MAX_SETTINGS],
+    ) -> Result<i32> {
+        if address == 0 {
+            return Ok(0);
+        }
+        let e = self.endpoint(address, alternates)?;
+        Ok(if e.kind == crate::TransferKind::Bulk {
+            0
+        } else if self.speed == Speed::High
+            || self.speed.superspeed()
+            || e.kind == crate::TransferKind::Isochronous
+        {
+            1 << (e.interval - 1)
+        } else {
+            i32::from(e.interval)
+        })
     }
 }
 
@@ -147,5 +195,30 @@ mod tests {
         let d = DescriptorSet::new(&budget, &device, &config, &[], Speed::Full).unwrap();
         alternates[0] = 0;
         assert_eq!(d.interval(0x81, &alternates), Ok(7));
+    }
+    #[test]
+    fn endpoint_type_and_service_size_follow_selected_alternate() {
+        let budget = Budget::new(crate::ResourceLimits {
+            bytes: 4096,
+            requests: 4,
+        });
+        let device = [18, 1, 0, 2, 0, 0, 0, 64, 9, 0x12, 1, 0, 0, 1, 0, 0, 0, 1];
+        let config = [
+            9, 2, 41, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0,
+            9, 4, 0, 1, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 1, 0, 0x14, 4,
+        ];
+        let set = DescriptorSet::new(&budget, &device, &config, &[], Speed::High).unwrap();
+        let mut alternates = [0; descriptors::MAX_SETTINGS];
+        let endpoint = set.endpoint(0x81, &alternates).unwrap();
+        assert_eq!(endpoint.kind, crate::TransferKind::Bulk);
+        assert_eq!(endpoint.service_bytes, 512);
+        assert_eq!(set.interval(0x81, &alternates), Ok(0));
+        alternates[0] = 1;
+        let endpoint = set.endpoint(0x81, &alternates).unwrap();
+        assert_eq!(endpoint.kind, crate::TransferKind::Isochronous);
+        assert_eq!(endpoint.service_bytes, 3072);
+        assert_eq!(set.interval(0x81, &alternates), Ok(8));
+        assert_eq!(endpoint.allowed_flags, crate::usbip::ISO_ASAP);
+        assert_ne!(set.topology().iso_endpoints, 0);
     }
 }

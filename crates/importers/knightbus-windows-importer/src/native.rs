@@ -120,8 +120,8 @@ impl Controller {
         }
     }
     fn ioctl(&mut self, code: u32, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        if input.len() > channel::MAX_TRANSFER + channel::HEADER
-            || output.len() > channel::MAX_TRANSFER + channel::HEADER
+        if input.len() > knightbus_windows_protocol::iso::MAX_MESSAGE
+            || output.len() > knightbus_windows_protocol::iso::MAX_MESSAGE
         {
             return Err(Error::Exhausted);
         }
@@ -167,7 +167,7 @@ impl Driver for Controller {
         self.handle = Self::open_channel(&instance)?;
         // Require a kernel-held event and final-destruction acknowledgement
         // before publishing the USB device.
-        self.ioctl(channel::RETIREMENT_READY, &[], &mut [])?;
+        self.ioctl(channel::TRANSFER_READY, &[], &mut [])?;
         self.ioctl(channel::ATTACH, bytes, &mut []).map(|_| ())
     }
     fn fetch(&mut self, mask: u32, output: &mut [u8]) -> Result<usize> {

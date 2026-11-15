@@ -97,6 +97,8 @@ pub struct Endpoint {
     pub kind: TransferKind,
     /// Descriptor maximum packet size, including high-bandwidth bits.
     pub max_packet_size: u16,
+    /// Maximum bytes per service interval, including periodic bursts.
+    pub service_bytes: u32,
     /// Descriptor interval.
     pub interval: u8,
     /// Explicit supported USB/IP flags, default deny all others.
@@ -176,14 +178,17 @@ impl Device {
             || self.wire.bus_number > u16::MAX.into()
             || self.wire.device_number > u16::MAX.into()
             || self.configurations.is_empty()
-            || self.configurations.len() > 16
+            || self.configurations.len() > crate::descriptors::limits::MAX_CONFIGURATIONS
             || self.configurations.len() != usize::from(self.wire.configurations)
         {
             return Err(Error::Invalid);
         }
         let mut configurations = std::collections::BTreeSet::new();
         for c in &self.configurations {
-            if c.value == 0 || !configurations.insert(c.value) || c.interfaces.len() > 64 {
+            if c.value == 0
+                || !configurations.insert(c.value)
+                || c.interfaces.len() > crate::descriptors::limits::MAX_INTERFACE_ALTERNATES
+            {
                 return Err(Error::Invalid);
             }
             let mut interfaces = std::collections::BTreeSet::new();
@@ -194,9 +199,10 @@ impl Device {
                 }
                 let mut endpoints = std::collections::BTreeSet::new();
                 for e in &i.endpoints {
-                    if e.address & 0x70 != 0
-                        || e.address & 0x0f == 0
+                    if e.address & knightbus_usb::ENDPOINT_RESERVED_MASK != 0
+                        || e.address & knightbus_usb::ENDPOINT_NUMBER_MASK == 0
                         || e.max_packet_size == 0
+                        || e.service_bytes == 0
                         || e.kind == TransferKind::Control
                         || !endpoints.insert(e.address)
                         || (i.alternate == 0 && !active_endpoints.insert(e.address))

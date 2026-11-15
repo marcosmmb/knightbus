@@ -1,6 +1,6 @@
 //! Checked physical descriptor parsing. Class/vendor descriptors remain opaque.
 use knightbus_usb as usb;
-mod limits {
+pub(crate) mod limits {
     pub const MAX_CONFIGURATIONS: usize = 16;
     pub const MAX_INTERFACE_ALTERNATES: usize = 64;
 }
@@ -30,6 +30,7 @@ pub fn configuration(bytes: &[u8]) -> Result<Configuration> {
     };
     let mut offset = usb::configuration::BYTES;
     let mut expected = 0;
+    let mut previous_type = usb::configuration::TYPE;
     while offset < bytes.len() {
         if bytes.len() - offset < usb::DESCRIPTOR_HEADER_BYTES {
             return Err(Error::Invalid);
@@ -99,6 +100,12 @@ pub fn configuration(bytes: &[u8]) -> Result<Configuration> {
                     address: d[usb::endpoint::ADDRESS],
                     kind,
                     max_packet_size: usb::u16_at(d, usb::endpoint::MAX_PACKET),
+                    service_bytes: u32::from(
+                        usb::u16_at(d, usb::endpoint::MAX_PACKET) & usb::PACKET_SIZE_MASK,
+                    ) * (1 + u32::from(
+                        (usb::u16_at(d, usb::endpoint::MAX_PACKET) >> usb::TRANSACTIONS_SHIFT)
+                            & usb::TRANSACTIONS_MASK,
+                    )),
                     interval: d[usb::endpoint::INTERVAL],
                     allowed_flags: if kind == TransferKind::Isochronous {
                         crate::usbip::ISO_ASAP
@@ -107,9 +114,29 @@ pub fn configuration(bytes: &[u8]) -> Result<Configuration> {
                     },
                 });
             }
+            usb::companion::TYPE => {
+                let endpoint = result
+                    .interfaces
+                    .last_mut()
+                    .and_then(|i| i.endpoints.last_mut())
+                    .ok_or(Error::Invalid)?;
+                if len != usb::companion::BYTES || previous_type != usb::endpoint::TYPE {
+                    return Err(Error::Invalid);
+                }
+                if endpoint.kind == TransferKind::Isochronous
+                    || endpoint.kind == TransferKind::Interrupt
+                {
+                    endpoint.service_bytes =
+                        u32::from(usb::u16_at(d, usb::companion::BYTES_PER_INTERVAL));
+                    if endpoint.service_bytes == 0 {
+                        return Err(Error::Invalid);
+                    }
+                }
+            }
             usb::device::TYPE | usb::configuration::TYPE => return Err(Error::Invalid),
             _ => {} // Retain raw bytes separately; do not reinterpret class requests.
         }
+        previous_type = d[usb::DESCRIPTOR_TYPE];
         offset += len;
     }
     if result
@@ -210,4 +237,27 @@ pub fn device(
         },
         configurations,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn companion_must_immediately_follow_its_endpoint() {
+        let mut config = vec![
+            9, 2, 31, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 1, 0, 4, 1,
+            6, 0x30, 1, 2, 0, 24,
+        ];
+        let parsed = configuration(&config).unwrap();
+        assert_eq!(parsed.interfaces[0].endpoints[0].service_bytes, 6144);
+        for extra in [&[2, 0x24][..], &[6, 0x30, 1, 2, 0, 24][..]] {
+            let mut invalid = config.clone();
+            invalid.splice(25..25, extra.iter().copied());
+            invalid[2] = invalid.len() as u8;
+            assert!(matches!(configuration(&invalid), Err(Error::Invalid)));
+        }
+        config[29..31].fill(0);
+        assert!(matches!(configuration(&config), Err(Error::Invalid)));
+    }
 }

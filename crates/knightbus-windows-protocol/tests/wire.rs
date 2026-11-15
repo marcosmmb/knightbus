@@ -151,3 +151,26 @@ fn native_descriptor_policy_stays_stricter_than_usb_structure() {
     assert!(knightbus_usb::validate_bos(&bos, Speed::Full).is_ok());
     assert!(native::validate_bos(&bos, Speed::Full).is_err());
 }
+
+#[test]
+fn native_attachment_accepts_iso_in_every_alternate_and_direction() {
+    for address in [1, 0x81] {
+        for alternate in [0, 1] {
+            let base = attachment();
+            let device = &base[20..38];
+            let mut config = vec![9, 2, 0, 0, 1, 1, 0, 0x80, 50];
+            if alternate != 0 {
+                config.extend([9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, address, 2, 64, 0, 0]);
+            }
+            config.extend([
+                9, 4, 0, alternate, 1, 0xff, 0, 0, 0, 7, 5, address, 1, 64, 0, 1,
+            ]);
+            config[2] = config.len() as u8;
+            assert!(knightbus_usb::validate(device, &config, Speed::Full).is_ok());
+            let mut bytes = base[..38].to_vec();
+            bytes[16..20].copy_from_slice(&(config.len() as u32).to_le_bytes());
+            bytes.extend(config);
+            assert!(Attachment::decode(&bytes).is_ok());
+        }
+    }
+}

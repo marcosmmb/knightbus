@@ -1,5 +1,8 @@
 //! Private METHOD_BUFFERED ABI. All integers are little endian.
-use crate::descriptors::{self, Speed};
+use crate::{
+    descriptors::{self, Speed},
+    iso,
+};
 
 pub const MAX_TRANSFER: usize = 1024 * 1024;
 pub const SLOTS: usize = descriptors::MAX_ENDPOINTS + 1;
@@ -19,6 +22,8 @@ pub const ATTACH: u32 = 0x0022_e424;
 pub const RETIREMENT_READY: u32 = 0x0022_e42c;
 /// Register an owner-only wake event (u64 handle); zero unregisters it.
 pub const NOTIFY: u32 = 0x0022_e430;
+/// Require bounded ISO envelopes and final-destruction acknowledgement.
+pub const TRANSFER_READY: u32 = 0x0022_e434;
 
 /// Invalid message size or field. Native status mapping belongs to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +40,8 @@ pub struct Attachment<'a> {
     pub speed: Speed,
     /// Endpoint addresses by native slot; slot zero is the default pipe.
     pub endpoints: [u8; SLOTS],
+    pub iso_slots: [u32; SLOTS],
+    pub has_iso: bool,
 }
 impl<'a> Attachment<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
@@ -72,6 +79,8 @@ impl<'a> Attachment<'a> {
             bos,
             speed,
             endpoints,
+            iso_slots: iso::slot_masks(&topology),
+            has_iso: topology.iso_endpoints != 0,
         })
     }
 }
@@ -84,17 +93,59 @@ pub struct Reply<'a> {
     pub completed: usize,
     pub status: u32,
     pub payload: &'a [u8],
+    pub packets: Option<iso::Packets<'a>>,
+    pub start_frame: u32,
+    pub errors: u32,
 }
 impl<'a> Reply<'a> {
+    /// Hold successful ISO results until their reserved end frame. Failed URBs
+    /// and ordinary transfers complete immediately; mixed packet results retain
+    /// their timing because the overall ISO transfer still succeeded.
+    pub fn completion_timing(&self, due_frame: u32) -> iso::CompletionTiming {
+        if self.status == 0
+            && self
+                .packets
+                .is_some_and(|packets| (self.errors as usize) < packets.len())
+        {
+            iso::CompletionTiming::Scheduled(due_frame)
+        } else {
+            iso::CompletionTiming::Immediate
+        }
+    }
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
-        if !(HEADER..=HEADER + MAX_TRANSFER).contains(&bytes.len()) {
+        if !(HEADER..=iso::MAX_MESSAGE).contains(&bytes.len()) {
             return Err(Error::Length);
         }
         let payload = u32_at(bytes, 20) as usize;
         let status = u32_at(bytes, 24);
-        if u32_at(bytes, 0) != 1
-            || payload > MAX_TRANSFER
-            || HEADER + payload != bytes.len()
+        let version = u32_at(bytes, 0);
+        let (header, packets, start_frame, errors) = match version {
+            1 => (HEADER, None, 0, 0),
+            iso::VERSION if bytes.len() >= iso::HEADER => {
+                let count = u32_at(bytes, iso::field::PACKET_COUNT) as usize;
+                if count == 0
+                    || count > iso::MAX_PACKETS
+                    || u32_at(bytes, iso::field::FLAGS) != 0
+                    || payload > MAX_TRANSFER
+                    || iso::HEADER + payload + count * iso::PACKET_BYTES != bytes.len()
+                {
+                    return Err(Error::Fields);
+                }
+                (
+                    iso::HEADER,
+                    Some(iso::Packets::decode(
+                        &bytes[iso::HEADER + payload..],
+                        MAX_TRANSFER,
+                        true,
+                    )?),
+                    u32_at(bytes, iso::field::START_FRAME),
+                    u32_at(bytes, iso::field::ERRORS),
+                )
+            }
+            _ => return Err(Error::Fields),
+        };
+        if payload > MAX_TRANSFER
+            || (packets.is_none() && header + payload != bytes.len())
             || status > 2
             || bytes[28..32] != [0; 4]
         {
@@ -105,12 +156,17 @@ impl<'a> Reply<'a> {
             token: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             completed: u32_at(bytes, 16) as usize,
             status,
-            payload: &bytes[HEADER..],
+            payload: &bytes[header..header + payload],
+            packets,
+            start_frame,
+            errors,
         })
     }
     pub fn validate_length(&self, requested: usize, input: bool) -> Result<(), Error> {
         if self.completed > requested
-            || (self.status != 0 && (self.completed != 0 || !self.payload.is_empty()))
+            || (self.packets.is_none()
+                && self.status != 0
+                && (self.completed != 0 || !self.payload.is_empty()))
             || (input && self.completed != self.payload.len())
             || (!input && !self.payload.is_empty())
         {

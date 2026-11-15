@@ -42,6 +42,13 @@ physical device, or [`core::importer::Driver`](crates/knightbus-core/src/importe
 for a virtual device. These traits require capability limits, native operations,
 notifications and retirement. Their API comments define ownership and wakeup rules.
 
+Exporters must implement configuration selection and an `InterfaceDriver` owning
+one interface's native handles. Core decodes configuration, alternate-setting and
+clear-halt requests, validates their targets and drains the affected transfers.
+These requests never reach `submit`. Alternate changes receive only the targeted
+interface; preserve other interfaces and report native USB errors through
+`ControlError`. Failed topology changes retire the device through the shared worker.
+
 Compose an exporter worker inside `Engine::new` and serve connections with
 `transport::exporter::serve`. Importers use `transport::importer::connect` to
 validate descriptors, create the worker and forward requests using one budget.

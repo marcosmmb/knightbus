@@ -2,10 +2,11 @@
 //! The driver independently checks ownership and request lifetimes.
 use crate::descriptors::{self, Speed, Topology};
 use knightbus_core::{Budget, Buffer, Error, Result};
+use knightbus_windows_protocol::iso;
 
 #[cfg(windows)]
 pub(crate) use knightbus_windows_protocol::wire::{
-    ATTACH, DETACH, FETCH, REPLY, RETIREMENT_READY, STATS,
+    ATTACH, DETACH, FETCH, REPLY, STATS, TRANSFER_READY,
 };
 pub(crate) use knightbus_windows_protocol::wire::{HEADER, STATS_BYTES};
 pub use knightbus_windows_protocol::wire::{MAX_TRANSFER, SLOTS};
@@ -95,6 +96,8 @@ impl Descriptors {
 /// Borrowed driver request; the payload is consumed before scratch reuse.
 #[derive(Debug)]
 pub struct Request<'a> {
+    /// Index in the native liveness snapshot.
+    pub slot: usize,
     /// Monotonic native token, scoped to the owning driver handle.
     pub token: u64,
     /// USB endpoint address.
@@ -105,11 +108,17 @@ pub struct Request<'a> {
     pub setup: [u8; descriptors::SETUP_SIZE],
     /// OUT data only.
     pub payload: &'a [u8],
+    /// Validated ISO packet layout, absent for other transfers.
+    pub packets: Option<iso::Packets<'a>>,
+    /// ISO scheduling flags.
+    pub flags: u32,
+    /// Native frame metadata.
+    pub start_frame: i32,
 }
 impl<'a> Request<'a> {
     /// Reject malformed native responses before constructing engine work.
     pub fn decode(bytes: &'a [u8], topology: &Topology) -> Result<Self> {
-        if bytes.len() < HEADER || u32_at(bytes, transfer::VERSION) != ABI_VERSION {
+        if bytes.len() < HEADER {
             return Err(Error::Invalid);
         }
         let endpoint =
@@ -117,6 +126,39 @@ impl<'a> Request<'a> {
         let token = u64_at(bytes, transfer::TOKEN);
         let length = u32_at(bytes, transfer::LENGTH);
         let payload = u32_at(bytes, transfer::PAYLOAD_LENGTH) as usize;
+        let (header, packets, flags, start_frame) = match u32_at(bytes, 0) {
+            ABI_VERSION => (HEADER, None, 0, 0),
+            iso::VERSION if bytes.len() >= iso::HEADER => {
+                let count = u32_at(bytes, iso::field::PACKET_COUNT) as usize;
+                let flags = u32_at(bytes, iso::field::FLAGS);
+                let frame = u32_at(bytes, iso::field::START_FRAME) as i32;
+                if count == 0
+                    || count > iso::MAX_PACKETS
+                    || flags != iso::ASAP
+                    || frame != 0
+                    || u32_at(bytes, iso::field::SLOT) == 0
+                    || u32_at(bytes, iso::field::SLOT) as usize >= SLOTS
+                    || payload > MAX_TRANSFER
+                    || iso::HEADER + payload + count * iso::PACKET_BYTES != bytes.len()
+                {
+                    return Err(Error::Invalid);
+                }
+                (
+                    iso::HEADER,
+                    Some(
+                        iso::Packets::decode(
+                            &bytes[iso::HEADER + payload..],
+                            length as usize,
+                            false,
+                        )
+                        .map_err(|_| Error::Invalid)?,
+                    ),
+                    flags,
+                    frame,
+                )
+            }
+            _ => return Err(Error::Invalid),
+        };
         let setup: [u8; descriptors::SETUP_SIZE] =
             bytes[transfer::SETUP..HEADER].try_into().unwrap();
         let input = if endpoint == 0 {
@@ -126,7 +168,8 @@ impl<'a> Request<'a> {
         };
         if token == 0
             || length as usize > MAX_TRANSFER
-            || bytes.len() - HEADER != payload
+            || (packets.is_none() && bytes.len() - header != payload)
+            || (packets.is_some() && endpoint == 0)
             || payload != if input { 0 } else { length as usize }
             || (endpoint != 0
                 && (!topology
@@ -140,12 +183,29 @@ impl<'a> Request<'a> {
         {
             return Err(Error::Invalid);
         }
+        let slot = if packets.is_some() {
+            u32_at(bytes, iso::field::SLOT) as usize
+        } else if endpoint == 0 {
+            0
+        } else {
+            topology
+                .endpoints
+                .iter()
+                .flatten()
+                .position(|e| e.address == endpoint)
+                .ok_or(Error::Invalid)?
+                + 1
+        };
         Ok(Self {
+            slot,
             token,
             endpoint,
             length,
             setup,
-            payload: &bytes[HEADER..],
+            payload: &bytes[header..header + payload],
+            packets,
+            flags,
+            start_frame,
         })
     }
 }

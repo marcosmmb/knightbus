@@ -60,22 +60,31 @@ impl ExporterBackend for Mock {
         self.cancelled = Some(id);
     }
     fn poll_completion(&mut self) -> Option<(TransferId, Completion)> {
-        let index = self
-            .pending
-            .iter()
-            .position(|(id, t)| t.header().endpoint != 3 || self.cancelled == Some(*id))?;
+        let index = self.pending.iter().position(|(id, t)| {
+            !matches!(t.header().endpoint, 3 | 6) || self.cancelled == Some(*id)
+        })?;
         let (id, mut t) = self.pending.remove(index)?;
         if t.header().direction == Direction::In {
             t.buffer_mut().fill(0x5a);
-        } else {
+        } else if !t.buffer().is_empty() && t.layout().is_empty() {
             assert_eq!(t.buffer(), [1, 2, 3, 4]);
         }
-        let length = t.header().transfer_buffer_length;
+        let stalled = t.header().endpoint == 0 && t.header().setup[1] == 0xff;
+        let length = if !t.layout().is_empty() {
+            t.packets_mut()[0].actual_length = 2;
+            t.packets_mut()[1].actual_length = 1;
+            t.packets_mut()[1].status = -71;
+            3
+        } else if stalled {
+            0
+        } else {
+            t.header().transfer_buffer_length
+        };
         Some((
             id,
             Completion {
                 transfer: t,
-                status: 0,
+                status: if stalled { usbip::status::PIPE } else { 0 },
                 actual_length: length,
                 start_frame: 0,
             },
@@ -111,14 +120,25 @@ fn device() -> Device {
                     subclass: 0,
                     protocol: 0,
                 },
-                endpoints: [1, 0x82, 0x83]
+                endpoints: [1, 0x82, 0x83, 4, 0x84, 5, 0x85, 6, 0x86]
                     .into_iter()
                     .map(|address| Endpoint {
                         address,
-                        kind: TransferKind::Bulk,
+                        kind: if matches!(address & 15, 5 | 6) {
+                            TransferKind::Isochronous
+                        } else if address & 15 == 4 {
+                            TransferKind::Interrupt
+                        } else {
+                            TransferKind::Bulk
+                        },
                         max_packet_size: 512,
+                        service_bytes: 512,
                         interval: 0,
-                        allowed_flags: 0,
+                        allowed_flags: if matches!(address & 15, 5 | 6) {
+                            usbip::ISO_ASAP
+                        } else {
+                            0
+                        },
                     })
                     .collect(),
             }],
@@ -282,4 +302,197 @@ fn fragmented_bidirectional_transfers_unlink_and_disconnect_retire() {
     drop(peer);
     assert_eq!(task.join().unwrap(), Err(Error::Unavailable));
     assert_eq!(claims.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn control_bulk_interrupt_both_directions_and_stall_preserve_the_session() {
+    let (mut peer, task, claims) = start(true);
+    send(&mut peer, &Message::ImportRequest(KEY.id.bus_id()));
+    assert!(matches!(
+        read(&mut peer, Context::Management),
+        Message::ImportReply { status: 0, .. }
+    ));
+    let mut sequence = 1;
+    // Standard, class and vendor control requests pass through without class logic.
+    for (endpoint, direction, setup_type) in [
+        (0, Direction::In, 0x80),
+        (0, Direction::Out, 0),
+        (0, Direction::In, 0xa1),
+        (0, Direction::Out, 0x21),
+        (0, Direction::In, 0xc0),
+        (0, Direction::Out, 0x40),
+        (1, Direction::Out, 0),
+        (2, Direction::In, 0),
+        (4, Direction::Out, 0),
+        (4, Direction::In, 0),
+    ] {
+        let mut h = header(sequence, endpoint, direction);
+        if direction == Direction::In {
+            h.transfer_flags = usbip::DIR_IN;
+        }
+        if endpoint == 0 {
+            h.setup = [setup_type, 0x50, 0, 0, 0, 0, 4, 0];
+        }
+        let payload = if direction == Direction::Out {
+            vec![1, 2, 3, 4]
+        } else {
+            vec![]
+        };
+        send(&mut peer, &Message::Submit(h.with_payload(payload, vec![])));
+        let Message::ReturnSubmit(reply) = read(&mut peer, Context::Replies(Some((&h).into())))
+        else {
+            panic!()
+        };
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.actual_length, 4);
+        assert_eq!(
+            reply.data,
+            if direction == Direction::In {
+                vec![0x5a; 4]
+            } else {
+                vec![]
+            }
+        );
+        sequence += 1;
+    }
+    for request in [0xff, 0x50] {
+        let mut h = header(sequence, 0, Direction::In);
+        h.setup = [0xc0, request, 0, 0, 0, 0, 4, 0];
+        send(&mut peer, &Message::Submit(h.with_payload(vec![], vec![])));
+        let Message::ReturnSubmit(reply) = read(&mut peer, Context::Replies(Some((&h).into())))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            reply.status,
+            if request == 0xff {
+                usbip::status::PIPE
+            } else {
+                0
+            }
+        );
+        assert_eq!(reply.actual_length, if request == 0xff { 0 } else { 4 });
+        sequence += 1;
+    }
+    drop(peer);
+    assert_eq!(task.join().unwrap(), Err(Error::Unavailable));
+    assert_eq!(claims.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn iso_tcp_replies_pack_sparse_input_and_preserve_packet_errors_in_both_directions() {
+    let (mut peer, task, claims) = start(true);
+    send(&mut peer, &Message::ImportRequest(KEY.id.bus_id()));
+    assert!(matches!(
+        read(&mut peer, Context::Management),
+        Message::ImportReply { status: 0, .. }
+    ));
+    for (sequence, direction) in [(1, Direction::In), (2, Direction::Out)] {
+        let mut h = header(sequence, 5, direction);
+        h.transfer_buffer_length = 16;
+        h.number_of_packets = 2;
+        h.transfer_flags = usbip::ISO_ASAP;
+        let packets = vec![
+            usbip::IsoPacket {
+                offset: 0,
+                length: 4,
+                actual_length: 0,
+                status: 0,
+            },
+            usbip::IsoPacket {
+                offset: 12,
+                length: 4,
+                actual_length: 0,
+                status: 0,
+            },
+        ];
+        send(
+            &mut peer,
+            &Message::Submit(h.with_payload(
+                if direction == Direction::Out {
+                    vec![0; 16]
+                } else {
+                    vec![]
+                },
+                packets.clone(),
+            )),
+        );
+        let Message::ReturnSubmit(reply) = read(&mut peer, Context::Replies(Some((&h).into())))
+        else {
+            panic!()
+        };
+        assert_eq!(reply.actual_length, 3);
+        assert_eq!(reply.error_count, 1);
+        assert_eq!(reply.iso_packets[1].status, -71);
+        assert_eq!(reply.iso_packets[1].offset, 12);
+        assert_eq!(
+            reply.data,
+            if direction == Direction::In {
+                vec![0x5a; 3]
+            } else {
+                vec![]
+            }
+        );
+    }
+    drop(peer);
+    assert_eq!(task.join().unwrap(), Err(Error::Unavailable));
+    assert_eq!(claims.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn iso_unlink_and_disconnect_retire_in_both_directions() {
+    for direction in [Direction::In, Direction::Out] {
+        let (mut peer, task, claims) = start(true);
+        send(&mut peer, &Message::ImportRequest(KEY.id.bus_id()));
+        assert!(matches!(
+            read(&mut peer, Context::Management),
+            Message::ImportReply { status: 0, .. }
+        ));
+        for sequence in [1, 3] {
+            let mut h = header(sequence, 6, direction);
+            h.transfer_buffer_length = 16;
+            h.number_of_packets = 2;
+            h.transfer_flags = usbip::ISO_ASAP;
+            let packets = [0, 12]
+                .into_iter()
+                .map(|offset| usbip::IsoPacket {
+                    offset,
+                    length: 4,
+                    actual_length: 0,
+                    status: 0,
+                })
+                .collect();
+            send(
+                &mut peer,
+                &Message::Submit(h.with_payload(
+                    if direction == Direction::Out {
+                        vec![0; 16]
+                    } else {
+                        vec![]
+                    },
+                    packets,
+                )),
+            );
+            if sequence == 1 {
+                send(
+                    &mut peer,
+                    &Message::Unlink {
+                        seqnum: 2,
+                        device_id: 0x10001,
+                        target_seqnum: 1,
+                    },
+                );
+                assert_eq!(
+                    read(&mut peer, Context::Replies(None)),
+                    Message::ReturnUnlink {
+                        seqnum: 2,
+                        status: -104
+                    }
+                );
+            }
+        }
+        drop(peer);
+        assert_eq!(task.join().unwrap(), Err(Error::Unavailable));
+        assert_eq!(claims.load(Ordering::SeqCst), 0);
+    }
 }

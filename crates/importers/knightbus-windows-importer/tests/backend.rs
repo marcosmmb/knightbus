@@ -125,6 +125,11 @@ impl Driver for Mock {
         Ok(())
     }
     fn fetch(&mut self, mask: u32, out: &mut [u8]) -> knightbus_core::Result<usize> {
+        assert_eq!(
+            out.len(),
+            32 + MAX_TRANSFER,
+            "non-ISO keeps its original IOCTL size"
+        );
         let mut l = self.lab.lock().unwrap();
         let Some(position) = l
             .requests
@@ -716,10 +721,50 @@ fn descriptors_reject_truncation_collisions_and_accept_composite_alternates() {
     assert!(validate(&DEVICE, &duplicate, Speed::Full).is_err());
     let mut iso = CONFIG;
     iso[21] = 1;
-    assert!(validate(&DEVICE, &iso, Speed::Full).is_err());
+    iso[24] = 1;
+    assert!(validate(&DEVICE, &iso, Speed::Full).is_ok());
     let mut wake = CONFIG;
     wake[7] |= 0x20;
     assert!(validate(&DEVICE, &wake, Speed::Full).is_err());
     assert!(validate(&DEVICE, &CONFIG, Speed::Low).is_err());
     assert!(validate(&DEVICE, &CONFIG, Speed::High).is_err());
+}
+
+#[test]
+fn iso_in_active_or_inactive_alternate_reaches_native_open() {
+    for address in [2, 0x82] {
+        for alternate in [0, 1] {
+            let b = budget();
+            let mut config = vec![9, 2, 0, 0, 1, 1, 0, 0x80, 50];
+            if alternate != 0 {
+                config.extend([9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, address, 2, 64, 0, 0]);
+            }
+            config.extend([
+                9, 4, 0, alternate, 1, 0xff, 0, 0, 0, 7, 5, address, 1, 64, 0, 1,
+            ]);
+            config[2] = config.len() as u8;
+            let d = Descriptors::new(&b, &DEVICE, &config, &[], Speed::Full).unwrap();
+            let opened = Arc::new(AtomicBool::new(false));
+            let check = opened.clone();
+            let mut backend = backend::new::<Mock>(
+                move || {
+                    opened.store(true, Ordering::Release);
+                    Err(Error::Unavailable)
+                },
+                d,
+                b.clone(),
+            )
+            .unwrap();
+            wait(|| {
+                matches!(
+                    backend.attach(SESSION, &device()),
+                    Poll::Ready(Err(Error::Unavailable))
+                )
+            });
+            assert!(check.load(Ordering::Acquire));
+            drop(backend);
+            wait(|| b.usage().bytes == 0);
+            assert_eq!(b.usage().requests, 0);
+        }
+    }
 }

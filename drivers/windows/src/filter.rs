@@ -6,9 +6,11 @@ use super::structure_size;
 use core::{
     cell::UnsafeCell,
     mem, ptr,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 use wdk_sys::{call_unsafe_wdf_function_binding as wdf, *};
+
+mod clock;
 
 const MAX_CONTROLLERS: usize = 64;
 const ID_LENGTH: usize = 200; // MAX_DEVICE_ID_LEN, including the terminator.
@@ -53,6 +55,7 @@ static LOCK: AtomicPtr<WDFWAITLOCK__> = AtomicPtr::new(ptr::null_mut());
 #[repr(C)]
 struct Context {
     controller: WDFDEVICE,
+    iso_speed: AtomicU32,
 }
 // Image-lifetime type identity; never mutated, addressed without references.
 static mut CONTEXT_TYPE: WDF_OBJECT_CONTEXT_TYPE_INFO = WDF_OBJECT_CONTEXT_TYPE_INFO {
@@ -179,6 +182,22 @@ pub(super) unsafe fn ready(device: WDFDEVICE) -> bool {
     unsafe { wdf!(WdfWaitLockRelease, lock) };
     found
 }
+// Zero leaves the native bus interface unchanged for non-ISO devices.
+pub(super) unsafe fn set_iso_clock(device: WDFDEVICE, speed: u32) {
+    let lock = unsafe { acquire() };
+    for entry in unsafe { &*REGISTRY.0.get() } {
+        if entry.controller == device && !entry.filter.is_null() {
+            unsafe {
+                (*context(entry.filter))
+                    .iso_speed
+                    .store(speed, Ordering::Release);
+            }
+        }
+    }
+    unsafe {
+        wdf!(WdfWaitLockRelease, lock);
+    }
+}
 // Called before consuming the init object. Only the recorded parent's hub can
 // bind; a matching hardware ID on a physical controller is insufficient.
 pub(super) unsafe fn try_add(init: PWDFDEVICE_INIT) -> Option<NTSTATUS> {
@@ -232,6 +251,19 @@ pub(super) unsafe fn try_add(init: PWDFDEVICE_INIT) -> Option<NTSTATUS> {
 }
 unsafe fn add(mut init: PWDFDEVICE_INIT, controller: WDFDEVICE) -> NTSTATUS {
     unsafe { wdf!(WdfFdoInitSetFilter, init) };
+    let status = unsafe { clock::install(init) };
+    if status < 0 {
+        unsafe {
+            wdf!(
+                WdfObjectDereferenceActual,
+                controller.cast(),
+                ptr::null_mut(),
+                0,
+                ptr::null()
+            );
+        }
+        return status;
+    }
     let mut a = WDF_OBJECT_ATTRIBUTES {
         Size: structure_size::<WDF_OBJECT_ATTRIBUTES>(),
         ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelDispatch,
@@ -334,6 +366,36 @@ unsafe extern "C" fn internal(
         // IOCTL_INTERNAL_USB_SUBMIT_URB, kernel callers only.
         let header = unsafe { p.Parameters.Others.Arg1.cast::<_URB_HEADER>() };
         if !header.is_null() {
+            // Frame numbers are controller-local milliseconds. Keep queries and
+            // ASAP completion metadata on the same monotonic clock.
+            if unsafe { (*header).Function } == 0x0007
+                && unsafe {
+                    (*context(wdf!(WdfIoQueueGetDevice, queue)))
+                        .iso_speed
+                        .load(Ordering::Acquire)
+                } != 0
+            {
+                let status = if unsafe { usize::from((*header).Length) }
+                    >= mem::size_of::<_URB_GET_CURRENT_FRAME_NUMBER>()
+                {
+                    unsafe {
+                        (*header.cast::<_URB_GET_CURRENT_FRAME_NUMBER>()).FrameNumber =
+                            super::channel::current_frame();
+                    }
+                    STATUS_SUCCESS
+                } else {
+                    STATUS_INVALID_PARAMETER
+                };
+                unsafe {
+                    let device = wdf!(WdfIoQueueGetDevice, queue);
+                    super::channel::complete_filtered(
+                        (*context(device)).controller,
+                        request,
+                        status,
+                    );
+                }
+                return;
+            }
             let setup = unsafe {
                 match (*header).Function {
                     0x0008
@@ -399,7 +461,7 @@ pub(super) unsafe fn forward(request: WDFREQUEST) {
         if wdf!(WdfRequestSend, request, target, &mut options) == 0 {
             let status = wdf!(WdfRequestGetStatus, request);
             let controller = (*context(device)).controller;
-            super::channel::fail_filtered(controller, request, status);
+            super::channel::complete_filtered(controller, request, status);
         }
     }
 }
