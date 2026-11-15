@@ -2,6 +2,8 @@ use crate::{Caller, DeviceKey, Error, PeerId, Result, Session, SessionId};
 
 /// Major version of the control contract (independent of USB/IP).
 pub const CONTROL_VERSION: u16 = 1;
+/// Maximum peers granted one device; fits a complete control response.
+pub const MAX_DEVICE_GRANTS: usize = 255;
 /// Host-neutral management request. Contains no USB payloads or credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -16,6 +18,8 @@ pub enum Command {
         /// Enable or revoke the grant.
         allow: bool,
     },
+    /// Exporter administrator inspects the explicit grants for a device.
+    Permissions(DeviceKey),
     /// Transactional exclusive acquisition, completed by engine ticks/events.
     Attach(Vec<DeviceKey>),
     /// Idempotent drain, also cancels a pending acquisition.
@@ -50,6 +54,8 @@ pub enum Reply {
     Done,
     /// Filtered device snapshot.
     Devices(Vec<DeviceInfo>),
+    /// Identities explicitly granted access to the requested device.
+    Peers(Vec<PeerId>),
     /// Authorized session snapshot.
     Session(Session),
     /// Subscription ID scoped to the current host epoch/connection.
@@ -158,10 +164,10 @@ impl<T: ControlTarget> KnightBusControl for ControlConnection<'_, T> {
         if let Ok(Reply::Subscription(id)) = &result {
             self.subscriptions.insert(*id);
         }
-        if result.is_ok() {
-            if let Some(id) = unsubscribe {
-                self.subscriptions.remove(&id);
-            }
+        if result.is_ok()
+            && let Some(id) = unsubscribe
+        {
+            self.subscriptions.remove(&id);
         }
         result
     }

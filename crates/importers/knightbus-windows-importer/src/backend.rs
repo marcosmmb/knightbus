@@ -30,7 +30,7 @@ pub trait Driver: Send + 'static {
 
 /// Connect the Windows channel to USB/IP discovery and forwarding.
 pub fn connect<D: Driver>(
-    stream: std::net::TcpStream,
+    stream: knightbus_transport::Stream,
     bus: knightbus_core::usbip::WireString<32>,
     session: knightbus_core::SessionId,
     budget: Budget,
@@ -204,7 +204,9 @@ impl<D: Driver> importer::Driver for Channel<D> {
                 .copy_from_slice(&errors.to_le_bytes());
             done.copy_payload(&mut bytes[header_bytes..header_bytes + payload])?;
             for (bytes, p) in bytes[header_bytes + payload..]
-                .chunks_exact_mut(iso::PACKET_BYTES)
+                .as_chunks_mut::<{ iso::PACKET_BYTES }>()
+                .0
+                .iter_mut()
                 .zip(done.transfer.packets())
             {
                 iso::Packet {

@@ -206,16 +206,16 @@ impl Driver for Controller {
             self.close_channel();
         }
         self.retired = true;
-        if let Some(mut lifetime) = self.lifetime.take() {
-            if lifetime.unplug().is_err() {
-                // Keep the slot reserved after unproven retirement. The worker
-                // separately retains its native budget. Process death closes
-                // user handles; the kernel keeps the slot until final destruction.
-                // Never assign this lifetime to another attachment.
-                self.cleanup_failed = true;
-                std::mem::forget(lifetime);
-                return Err(Error::Cleanup);
-            }
+        if let Some(mut lifetime) = self.lifetime.take()
+            && lifetime.unplug().is_err()
+        {
+            // Keep the slot reserved after unproven retirement. The worker
+            // separately retains its native budget. Process death closes
+            // user handles; the kernel keeps the slot until final destruction.
+            // Never assign this lifetime to another attachment.
+            self.cleanup_failed = true;
+            std::mem::forget(lifetime);
+            return Err(Error::Cleanup);
         }
         Ok(())
     }

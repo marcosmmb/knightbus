@@ -1,9 +1,7 @@
 //! Bounded control service and framed in-process client.
 //!
-//! Requests cross a strict binary framing boundary; service and embedded adapters
-//! delegate to the same control target. No sockets, OS authentication, daemon or
-//! C ABI are provided here. Hosts bind a verified OS principal to the link.
-//! USB transfers never enter this management protocol.
+//! Direct and framed callers use the same core commands. Local endpoints verify
+//! OS authority before dispatch; USB transfers never enter this protocol.
 mod wire;
 use knightbus_core::*;
 use std::collections::BTreeMap;
@@ -111,8 +109,7 @@ impl<'a, T: ControlTarget> Service<'a, T> {
         self.epoch = 0;
     }
 }
-/// Service adapter over the deterministic framed local link. Production IPC will
-/// implement this contract after verifying the OS peer.
+/// Service adapter over the deterministic framed local link. Native IPC clients use the same contract after OS peer authorization.
 pub struct IpcControl<'a, T: ControlTarget> {
     service: Service<'a, T>,
     epoch: u64,
@@ -167,3 +164,7 @@ impl<T: ControlTarget> Drop for Service<'_, T> {
         self.close();
     }
 }
+
+pub mod local;
+
+pub mod private;

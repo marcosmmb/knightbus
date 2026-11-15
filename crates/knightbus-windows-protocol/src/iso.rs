@@ -73,12 +73,12 @@ pub struct Packet {
 }
 impl Packet {
     pub fn write(self, bytes: &mut [u8]) {
-        for (chunk, value) in bytes[..PACKET_BYTES].chunks_exact_mut(WORD_BYTES).zip([
-            self.offset,
-            self.length,
-            self.actual,
-            self.status as u32,
-        ]) {
+        for (chunk, value) in bytes[..PACKET_BYTES]
+            .as_chunks_mut::<WORD_BYTES>()
+            .0
+            .iter_mut()
+            .zip([self.offset, self.length, self.actual, self.status as u32])
+        {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -88,7 +88,7 @@ pub struct Packets<'a>(&'a [u8]);
 impl<'a> Packets<'a> {
     pub fn decode(bytes: &'a [u8], capacity: usize, reply: bool) -> Result<Self, Error> {
         if bytes.is_empty()
-            || bytes.len() % PACKET_BYTES != 0
+            || !bytes.len().is_multiple_of(PACKET_BYTES)
             || bytes.len() / PACKET_BYTES > MAX_PACKETS
             || capacity > MAX_TRANSFER
         {
@@ -117,7 +117,7 @@ impl<'a> Packets<'a> {
         self.0.is_empty()
     }
     pub fn iter(self) -> impl Iterator<Item = Packet> + 'a {
-        self.0.chunks_exact(PACKET_BYTES).map(|p| Packet {
+        self.0.as_chunks::<PACKET_BYTES>().0.iter().map(|p| Packet {
             offset: word(p, packet_field::OFFSET),
             length: word(p, packet_field::LENGTH),
             actual: word(p, packet_field::ACTUAL),

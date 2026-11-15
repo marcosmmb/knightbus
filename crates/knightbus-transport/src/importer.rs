@@ -1,6 +1,6 @@
 //! Standard USB/IP stream, bounded framing and request correlation. The caller
-//! supplies an authorized TCP connection (normally through its authenticated
-//! tunnel). Production peer authentication belongs to the hosting layer.
+//! supplies a stream authenticated by the shared host, or an explicitly authorized
+//! raw compatibility connection.
 use knightbus_core::{
     DescriptorSet as Descriptors,
     topology::{self as usb, Speed},
@@ -13,7 +13,6 @@ use knightbus_core::{
     usbip::{self, Context, Direction, Limits, Message, ReplyContext, SubmitHeader},
 };
 use std::{
-    net::TcpStream,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -41,7 +40,7 @@ const LIMITS: Limits = Limits {
 /// Import and attach a device with protocol and policy checks.
 /// The native factory receives the same admission budget used by every layer.
 pub fn connect<D: knightbus_core::importer::Driver>(
-    stream: TcpStream,
+    stream: crate::Stream,
     bus_id: usbip::WireString<USBIP_BUS_ID_BYTES>,
     session: SessionId,
     budget: Budget,
@@ -82,7 +81,7 @@ pub struct Wire {
 impl Wire {
     /// Use the same aggregate budget for framing, descriptors and native requests.
     pub fn new(
-        stream: TcpStream,
+        stream: crate::Stream,
         budget: Budget,
         timeout: Duration,
         capabilities: knightbus_core::Capabilities,
@@ -443,12 +442,12 @@ impl<B: ImporterBackend> Forwarder<B> {
     pub fn tick(&mut self) -> Poll<Result<()>> {
         use knightbus_core::ImporterState;
         self.backend.tick();
-        if self.backend.state() == ImporterState::Active {
-            if let Err(error) = self.advance() {
-                self.error = Some(error);
-                self.disconnect();
-                self.backend.tick();
-            }
+        if self.backend.state() == ImporterState::Active
+            && let Err(error) = self.advance()
+        {
+            self.error = Some(error);
+            self.disconnect();
+            self.backend.tick();
         }
         match self.backend.state() {
             ImporterState::Idle => {
@@ -490,52 +489,51 @@ impl<B: ImporterBackend> Forwarder<B> {
                 p.cancel_started.get_or_insert_with(Instant::now);
             }
         }
-        if self.wire.connection.writable() {
-            if let Some(index) = self.pending.iter().position(|p| {
+        if self.wire.connection.writable()
+            && let Some(index) = self.pending.iter().position(|p| {
                 p.as_ref()
                     .is_some_and(|p| p.cancel && p.unlink.is_none() && p.transfer.is_some())
-            }) {
-                let seq = self.next_sequence()?;
-                let p = self.pending[index].as_mut().unwrap();
-                self.wire.connection.send(&Message::Unlink {
-                    seqnum: seq,
-                    device_id: self.device_id,
-                    target_seqnum: p.context.seqnum,
-                })?;
-                p.unlink = Some(seq);
-            }
+            })
+        {
+            let seq = self.next_sequence()?;
+            let p = self.pending[index].as_mut().unwrap();
+            self.wire.connection.send(&Message::Unlink {
+                seqnum: seq,
+                device_id: self.device_id,
+                target_seqnum: p.context.seqnum,
+            })?;
+            p.unlink = Some(seq);
         }
         Ok(())
     }
 
     fn send_next_transfer(&mut self) -> Result<()> {
         // At most one new native request per tick; the socket admits one frame.
-        if self.wire.connection.writable() {
-            if let Some(slot) = self.pending.iter().position(Option::is_none) {
-                if let Some(transfer) = self.backend.next_transfer() {
-                    let transfer = transfer?;
-                    let mut header = *transfer.header();
-                    header.seqnum = self.next_sequence()?;
-                    let context = (&header).into();
-                    self.wire.connection.send(usbip::Frame::Submit {
-                        header: &header,
-                        data: if header.direction == Direction::Out {
-                            transfer.buffer()
-                        } else {
-                            &[]
-                        },
-                        packets: transfer.layout(),
-                    })?;
-                    self.pending[slot] = Some(Pending {
-                        transfer: Some(transfer),
-                        context,
-                        unlink: None,
-                        cancel: false,
-                        started: Instant::now(),
-                        cancel_started: None,
-                    });
-                }
-            }
+        if self.wire.connection.writable()
+            && let Some(slot) = self.pending.iter().position(Option::is_none)
+            && let Some(transfer) = self.backend.next_transfer()
+        {
+            let transfer = transfer?;
+            let mut header = *transfer.header();
+            header.seqnum = self.next_sequence()?;
+            let context = (&header).into();
+            self.wire.connection.send(usbip::Frame::Submit {
+                header: &header,
+                data: if header.direction == Direction::Out {
+                    transfer.buffer()
+                } else {
+                    &[]
+                },
+                packets: transfer.layout(),
+            })?;
+            self.pending[slot] = Some(Pending {
+                transfer: Some(transfer),
+                context,
+                unlink: None,
+                cancel: false,
+                started: Instant::now(),
+                cancel_started: None,
+            });
         }
         Ok(())
     }
@@ -661,6 +659,7 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
+    use std::net::TcpStream;
     const CAPS: knightbus_core::Capabilities = knightbus_core::Capabilities {
         transfer_bytes: 1024 * 1024,
         requests: 31,
@@ -796,7 +795,13 @@ mod tests {
             bytes: 1024 * 1024,
             requests: 32,
         });
-        let wire = Wire::new(stream, budget.clone(), Duration::from_secs(2), CAPS).unwrap();
+        let wire = Wire::new(
+            crate::Stream::insecure_loopback(stream).unwrap(),
+            budget.clone(),
+            Duration::from_secs(2),
+            CAPS,
+        )
+        .unwrap();
         let delivered = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut f = Forwarder::new(
             Native {
@@ -968,7 +973,13 @@ mod tests {
                 results: results.clone(),
             };
             let timeout = Duration::from_secs(2);
-            let wire = Wire::new(stream, budget.clone(), timeout, CAPS).unwrap();
+            let wire = Wire::new(
+                crate::Stream::insecure_loopback(stream).unwrap(),
+                budget.clone(),
+                timeout,
+                CAPS,
+            )
+            .unwrap();
             let mut forwarder = Forwarder::new(
                 native,
                 wire,

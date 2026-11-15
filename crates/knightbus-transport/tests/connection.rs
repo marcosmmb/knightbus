@@ -18,7 +18,13 @@ fn pair(timeout: Duration) -> (Wire, TcpStream, Budget) {
         requests: 32,
     });
     (
-        Wire::new(receiver, b.clone(), Limits::default(), timeout).unwrap(),
+        Wire::new(
+            knightbus_transport::Stream::insecure_loopback(receiver).unwrap(),
+            b.clone(),
+            Limits::default(),
+            timeout,
+        )
+        .unwrap(),
         sender,
         b,
     )

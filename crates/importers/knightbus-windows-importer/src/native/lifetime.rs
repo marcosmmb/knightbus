@@ -343,7 +343,7 @@ fn property(node: u32, key: u32) -> Result<Vec<u16>> {
     if status != CR_SUCCESS
         || kind != REG_MULTI_SZ
         || (bytes as usize) < size_of_val(&MULTI_SZ_TERMINATOR)
-        || bytes as usize % size_of::<u16>() != 0
+        || !(bytes as usize).is_multiple_of(size_of::<u16>())
         || bytes as usize > data.len() * size_of::<u16>()
     {
         return Err(Error::Invalid);

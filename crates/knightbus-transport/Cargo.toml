@@ -10,5 +10,11 @@ description = "Bounded USB/IP TCP framing for importers and exporters"
 knightbus-core = { path = "../knightbus-core" }
 mio = { version = "=1.2.2", default-features = false, features = ["os-poll", "net"] }
 
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring"] }
+ring = "=0.17.14"
+zeroize = "=1.9.1"
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+knightbus-ipc = { path = "../knightbus-ipc" }
+
 [lints]
 workspace = true

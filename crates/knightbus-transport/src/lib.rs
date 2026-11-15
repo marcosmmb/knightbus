@@ -1,16 +1,22 @@
 //! Bounded nonblocking USB/IP transport, shared by all OS adapters.
-//! Callers supply an authenticated stream and resolve reply context before allocation.
+//! TLS authenticates paired peers; raw streams require explicit compatibility opt-in.
+//! Reply context is resolved before allocation.
 use knightbus_core::{
     Budget, Buffer, DecodedMessage, Error, IncomingDecoder, MemoryReservation, Result,
     usbip::{self, Context, Limits},
 };
+/// OS-authenticated local management endpoint.
+pub use knightbus_ipc::local;
 use std::{
     io::{self, Read, Write},
-    net::{Shutdown, TcpStream},
     sync::Arc,
     task::{Wake, Waker},
     time::{Duration, Instant},
 };
+pub mod security;
+mod stream;
+pub use stream::Stream;
+
 struct ReadyWake {
     wake: mio::Waker,
     // Fixed allowance for one socket registration, event storage and wake owner.
@@ -33,7 +39,8 @@ const USBIP_SEQUENCE_OFFSET: usize = 4;
 /// Bounded stream adapter. A partial frame has an absolute deadline; slow byte
 /// delivery cannot keep renewing it. A failed write poisons the whole connection.
 pub struct Connection {
-    stream: mio::net::TcpStream,
+    stream: Stream,
+    _tls_storage: MemoryReservation,
     poll: mio::Poll,
     events: mio::Events,
     wake: Arc<ReadyWake>,
@@ -56,23 +63,18 @@ pub struct Connection {
 }
 impl Connection {
     /// Wrap an already authorized connection. This does not authenticate a peer.
-    pub fn new(
-        stream: TcpStream,
-        budget: Budget,
-        limits: Limits,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub fn new(stream: Stream, budget: Budget, limits: Limits, timeout: Duration) -> Result<Self> {
         if timeout.is_zero() {
             return Err(Error::Invalid);
         }
-        stream.set_nonblocking(true).map_err(net_error)?;
-        stream.set_nodelay(true).map_err(net_error)?;
+        let mut stream = stream;
+        stream.socket.set_nodelay(true).map_err(net_error)?;
+        let tls_storage = budget.reserve_memory(stream.storage_bytes())?;
         let input = budget.buffer(INPUT_BYTES)?;
         let storage = budget.reserve_memory(16 * 1024)?;
         let poll = mio::Poll::new().map_err(net_error)?;
-        let mut stream = mio::net::TcpStream::from_std(stream);
         poll.registry()
-            .register(&mut stream, mio::Token(0), mio::Interest::READABLE)
+            .register(&mut stream.socket, mio::Token(0), mio::Interest::READABLE)
             .map_err(net_error)?;
         let wake = Arc::new(ReadyWake {
             wake: mio::Waker::new(poll.registry(), mio::Token(1)).map_err(net_error)?,
@@ -80,6 +82,7 @@ impl Connection {
         });
         Ok(Self {
             stream,
+            _tls_storage: tls_storage,
             poll,
             events: mio::Events::with_capacity(4),
             wake,
@@ -113,7 +116,7 @@ impl Connection {
         }
         // Subscribe to writable readiness only after backpressure. A writable
         // idle socket otherwise keeps Windows polling instead of parking.
-        let interests = if self.write_blocked {
+        let interests = if self.write_blocked || self.stream.pending_write() {
             if self.read_blocked {
                 mio::Interest::READABLE | mio::Interest::WRITABLE
             } else {
@@ -126,13 +129,16 @@ impl Connection {
             if let Err(error) =
                 self.poll
                     .registry()
-                    .reregister(&mut self.stream, mio::Token(0), interests)
+                    .reregister(&mut self.stream.socket, mio::Token(0), interests)
             {
                 self.close();
                 return Err(net_error(error));
             }
             self.interests = interests;
         }
+        let timeout = self.output.as_ref().map_or(timeout, |(_, _, admitted)| {
+            timeout.min(self.timeout.saturating_sub(admitted.elapsed()))
+        });
         match self.poll.poll(&mut self.events, Some(timeout)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
@@ -144,7 +150,7 @@ impl Connection {
     }
     /// Whether another outbound message can be admitted without queue growth.
     pub fn writable(&self) -> bool {
-        !self.failed && self.output.is_none()
+        !self.failed && self.output.is_none() && !self.stream.pending_write()
     }
     /// Take and clear activity since the last check. Partial reads/writes count;
     /// callers should wait only when false, and yield after bounded busy turns.
@@ -156,7 +162,7 @@ impl Connection {
         if self.failed {
             return Err(Error::State);
         }
-        if self.output.is_some() {
+        if !self.writable() {
             return Err(Error::Exhausted);
         }
         let bytes = self
@@ -172,7 +178,20 @@ impl Connection {
         if self.failed {
             return Err(Error::State);
         }
-        let result = self.flush_inner(|mut stream, bytes| stream.write(bytes));
+        let result = self
+            .flush_inner(|stream, bytes| stream.write(bytes))
+            .and_then(|()| {
+                self.progressed |= self.stream.pump().map_err(net_error)?;
+                if !self.stream.pending_write()
+                    && self
+                        .output
+                        .as_ref()
+                        .is_some_and(|(bytes, offset, _)| *offset == bytes.as_slice().len())
+                {
+                    self.output = None;
+                }
+                Ok(())
+            });
         if result.is_err() {
             self.close();
         }
@@ -181,12 +200,12 @@ impl Connection {
     /// Close the socket and reject further I/O. Pending input charges remain until drop.
     pub fn close(&mut self) {
         self.failed = true;
-        let _ = self.stream.shutdown(Shutdown::Both);
+        self.stream.close();
         self.output = None;
     }
     fn flush_inner(
         &mut self,
-        mut write: impl FnMut(&mio::net::TcpStream, &[u8]) -> io::Result<usize>,
+        mut write: impl FnMut(&mut Stream, &[u8]) -> io::Result<usize>,
     ) -> Result<()> {
         let mut remaining = IO_BYTES;
         self.write_blocked = false;
@@ -198,14 +217,20 @@ impl Connection {
             if admitted.elapsed() >= self.timeout {
                 return Err(Error::Deadline);
             }
+            if *offset == bytes.as_slice().len() {
+                if !self.stream.pending_write() {
+                    self.output = None;
+                }
+                break;
+            }
             let end = bytes.as_slice().len().min(*offset + remaining);
-            match write(&self.stream, &bytes.as_slice()[*offset..end]) {
+            match write(&mut self.stream, &bytes.as_slice()[*offset..end]) {
                 Ok(0) => return Err(Error::Unavailable),
                 Ok(n) => {
                     *offset += n;
                     remaining -= n;
                     self.progressed = true;
-                    if *offset == bytes.as_slice().len() {
+                    if *offset == bytes.as_slice().len() && !self.stream.pending_write() {
                         self.output = None;
                     }
                     if remaining == 0 {
@@ -232,7 +257,7 @@ impl Connection {
         if self.failed {
             return Err(Error::State);
         }
-        let result = self.receive_with(context, |mut stream, bytes| stream.read(bytes));
+        let result = self.receive_with(context, |stream, bytes| stream.read(bytes));
         if result.is_err() {
             self.close();
         }
@@ -241,7 +266,7 @@ impl Connection {
     fn receive_with(
         &mut self,
         mut context: impl FnMut(u32, u32) -> Result<Context>,
-        mut read: impl FnMut(&mio::net::TcpStream, &mut [u8]) -> io::Result<usize>,
+        mut read: impl FnMut(&mut Stream, &mut [u8]) -> io::Result<usize>,
     ) -> Result<Option<DecodedMessage>> {
         for _ in 0..IO_STEPS {
             let (message, progressed) = self.receive_step(&mut context, &mut read)?;
@@ -255,7 +280,7 @@ impl Connection {
     fn receive_step(
         &mut self,
         context: &mut impl FnMut(u32, u32) -> Result<Context>,
-        read: &mut impl FnMut(&mio::net::TcpStream, &mut [u8]) -> io::Result<usize>,
+        read: &mut impl FnMut(&mut Stream, &mut [u8]) -> io::Result<usize>,
     ) -> Result<(Option<DecodedMessage>, bool)> {
         if self
             .frame_started
@@ -264,7 +289,7 @@ impl Connection {
             return Err(Error::Deadline);
         }
         if self.start == self.end {
-            match read(&self.stream, self.input.as_mut_slice()) {
+            match read(&mut self.stream, self.input.as_mut_slice()) {
                 Ok(0) => return Err(Error::Unavailable),
                 Ok(n) => {
                     self.read_blocked = false;
@@ -335,7 +360,7 @@ fn net_error(_: io::Error) -> Error {
 mod tests {
     use super::*;
     use knightbus_core::Transfer;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use usbip::{Direction, Message, SubmitHeader};
     const MAX_TRANSFER: usize = 1024 * 1024;
     const LIMITS: Limits = Limits {
@@ -367,9 +392,85 @@ mod tests {
             bytes: 4 * MAX_TRANSFER,
             requests: 4,
         });
-        let connection =
-            Connection::new(stream, budget.clone(), LIMITS, Duration::from_secs(10)).unwrap();
+        let connection = Connection::new(
+            Stream::insecure_loopback(stream).unwrap(),
+            budget.clone(),
+            LIMITS,
+            Duration::from_secs(10),
+        )
+        .unwrap();
         (connection, peer, budget)
+    }
+
+    #[test]
+    fn final_tls_plaintext_keeps_its_deadline_until_ciphertext_drains() {
+        use crate::security::{Channel, Identity, Peers};
+        let server_identity = Identity::generate().unwrap();
+        let client_identity = Identity::generate().unwrap();
+        let server_peer = server_identity.peer();
+        let mut peers = Peers::default();
+        for identity in [&server_identity, &client_identity] {
+            peers
+                .pair(identity.certificate().to_vec(), identity.peer())
+                .unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let trust = peers.clone();
+        let (done, hold) = std::sync::mpsc::channel();
+        let (ready, authenticated) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _stream = Stream::accept(
+                listener.accept().unwrap().0,
+                &server_identity,
+                &trust,
+                Channel::Usb,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            ready.send(()).unwrap();
+            // Complete authentication, but never read USB data.
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+        });
+        let stream = Stream::connect(
+            TcpStream::connect(address).unwrap(),
+            &client_identity,
+            &peers,
+            server_peer,
+            Channel::Usb,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        authenticated.recv_timeout(Duration::from_secs(5)).unwrap();
+        let budget = Budget::new(knightbus_core::ResourceLimits {
+            bytes: 2 * MAX_TRANSFER,
+            requests: 4,
+        });
+        let mut connection =
+            Connection::new(stream, budget.clone(), LIMITS, Duration::from_secs(1)).unwrap();
+        connection.send(&Message::DevListRequest).unwrap();
+        // Stop at rustls acceptance, before allowing ciphertext to drain.
+        connection
+            .flush_inner(|stream, bytes| stream.write(bytes))
+            .unwrap();
+        assert!(connection.stream.pending_write());
+        let (bytes, offset, admitted) = connection
+            .output
+            .as_mut()
+            .expect("TLS still owns the frame deadline");
+        assert_eq!(*offset, bytes.as_slice().len());
+        *admitted = Instant::now() - Duration::from_secs(1);
+        assert!(!connection.writable());
+        assert_eq!(
+            connection.send(&Message::DevListRequest),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(connection.flush(), Err(Error::Deadline));
+        assert_eq!(connection.flush(), Err(Error::State));
+        drop(connection);
+        assert_eq!(budget.usage().bytes, 0);
+        done.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -651,8 +752,13 @@ mod tests {
             bytes: 3 * MAX_TRANSFER + 96 + std::mem::size_of::<Transfer>() + 1024,
             requests: 1,
         });
-        let mut wire =
-            Connection::new(stream, budget.clone(), LIMITS, Duration::from_secs(1)).unwrap();
+        let mut wire = Connection::new(
+            Stream::insecure_loopback(stream).unwrap(),
+            budget.clone(),
+            LIMITS,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let mut transfer = Transfer::new(
             &budget,
             test_header(71, Direction::Out, MAX_TRANSFER as u32),
@@ -700,7 +806,7 @@ mod tests {
         let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (receiver, _) = listener.accept().unwrap();
         let mut wire = Connection::new(
-            receiver,
+            Stream::insecure_loopback(receiver).unwrap(),
             Budget::new(knightbus_core::ResourceLimits {
                 bytes: 1024 * 1024,
                 requests: 32,
@@ -747,3 +853,6 @@ pub mod exporter;
 
 /// USB/IP import, descriptor bootstrap and forwarding.
 pub mod importer;
+
+pub mod control;
+pub mod host;

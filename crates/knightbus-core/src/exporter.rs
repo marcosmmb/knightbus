@@ -502,13 +502,12 @@ impl<D: Driver> Worker<D> {
             let barrier = change.ok().flatten().map_or(0, |change| {
                 change.scope(&self.device, self.driver.configuration())
             });
-            if !cancel {
-                if let Slot::Queued(_, transfer) = &m.slots[i] {
-                    if barrier_pending & (1 << pipe(transfer)) != 0 {
-                        barrier_pending |= barrier;
-                        continue;
-                    }
-                }
+            if !cancel
+                && let Slot::Queued(_, transfer) = &m.slots[i]
+                && barrier_pending & (1 << pipe(transfer)) != 0
+            {
+                barrier_pending |= barrier;
+                continue;
             }
             if barrier != 0
                 && !cancel
@@ -523,15 +522,14 @@ impl<D: Driver> Worker<D> {
                 barrier_pending |= barrier;
                 continue;
             }
-            if !cancel {
-                if let Slot::Queued(_, transfer) = &m.slots[i] {
-                    if blocked[pipe(transfer)] || inflight[pipe(transfer)] >= ISO_QUEUE_DEPTH {
-                        if barrier != 0 {
-                            barrier_pending |= barrier;
-                        }
-                        continue;
-                    }
+            if !cancel
+                && let Slot::Queued(_, transfer) = &m.slots[i]
+                && (blocked[pipe(transfer)] || inflight[pipe(transfer)] >= ISO_QUEUE_DEPTH)
+            {
+                if barrier != 0 {
+                    barrier_pending |= barrier;
                 }
+                continue;
             }
             match std::mem::replace(&mut m.slots[i], Slot::Free) {
                 Slot::Queued(id, transfer) if cancel => {

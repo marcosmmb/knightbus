@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.10"
 knightbus-usbip = { path = "../.." }
+knightbus-ipc = { path = "../../../knightbus-ipc" }
 
 [[bin]]
 name = "decode"
@@ -22,6 +23,13 @@ bench = false
 [[bin]]
 name = "stream"
 path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
 test = false
 doc = false
 bench = false

@@ -9,7 +9,9 @@ fn fixture(name: &str) -> Vec<u8> {
     let hex: String = text.split('[').next().unwrap().split_whitespace().collect();
     assert_eq!(hex.len() % 2, 0, "odd hex length in {name}");
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
         .collect()
 }
