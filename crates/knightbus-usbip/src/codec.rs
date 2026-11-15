@@ -292,16 +292,13 @@ fn iso(
 /// step. No body allocation occurs until a complete, bounded frame is present.
 /// Bytes after the frame are left to the caller. Other errors are fatal to the
 /// connection; do not scan ahead for a plausible header.
-pub fn decode(bytes: &[u8], context: Context, limits: Limits) -> Result<(Message, usize), Error> {
-    decode_with_admission(bytes, context, limits, &mut |_| Ok(()))
-}
 /// Decode with caller-owned aggregate admission. The hook receives additional
 /// allocation bytes before each allocation/growth, including parsing metadata.
 /// Keep its charges alive through all returned storage; failures may also have
 /// allocated storage. Existing input storage is the caller's separate charge.
 /// Requested capacities are admitted first; allocator-reported excess is charged
 /// before exposure. Allocator bookkeeping is not included.
-pub fn decode_with_admission(
+pub fn decode(
     bytes: &[u8],
     context: Context,
     limits: Limits,
@@ -639,6 +636,50 @@ impl Writer {
         )?;
         Ok(())
     }
+    fn return_submit(
+        &mut self,
+        s: &ReturnHeader,
+        data: &[u8],
+        packets: &[IsoPacket],
+        limits: Limits,
+    ) -> Result<(), Error> {
+        transfer_length(s.request.transfer_buffer_length, limits)?;
+        transfer_length(s.actual_length, limits)?;
+        let count = packet_count(s.number_of_packets, limits)?;
+        if count != packet_count(s.request.number_of_packets, limits)? {
+            return Err(Error::Invalid("completion ISO count"));
+        }
+        if s.actual_length > s.request.transfer_buffer_length {
+            return Err(Error::Invalid("completion exceeds request"));
+        }
+        if s.error_count as usize > count {
+            return Err(Error::Invalid("ISO error count"));
+        }
+        self.basic(USBIP_RET_SUBMIT, s.request.seqnum, 0, Direction::Out, 0)?;
+        self.i32(s.status)?;
+        self.u32(s.actual_length)?;
+        self.i32(s.start_frame)?;
+        self.i32(s.number_of_packets)?;
+        self.u32(s.error_count)?;
+        self.put(&[0; 8])?;
+        let expected = if s.request.direction == Direction::In {
+            s.actual_length as usize
+        } else {
+            0
+        };
+        if data.len() != expected {
+            return Err(Error::Invalid("completion payload length"));
+        }
+        self.put(data)?;
+        self.iso(
+            packets,
+            s.number_of_packets,
+            s.request.transfer_buffer_length,
+            Some(s.actual_length),
+            limits,
+        )?;
+        Ok(())
+    }
     fn message(&mut self, message: &Message, limits: Limits) -> Result<(), Error> {
         match message {
             Message::DevListRequest => self.management(OP_REQ_DEVLIST, 0)?,
@@ -678,41 +719,7 @@ impl Writer {
             }
             Message::Submit(s) => self.submit(&s.into(), &s.data, &s.iso_packets, limits)?,
             Message::ReturnSubmit(s) => {
-                transfer_length(s.request.transfer_buffer_length, limits)?;
-                transfer_length(s.actual_length, limits)?;
-                let count = packet_count(s.number_of_packets, limits)?;
-                if count != packet_count(s.request.number_of_packets, limits)? {
-                    return Err(Error::Invalid("completion ISO count"));
-                }
-                if s.actual_length > s.request.transfer_buffer_length {
-                    return Err(Error::Invalid("completion exceeds request"));
-                }
-                if s.error_count as usize > count {
-                    return Err(Error::Invalid("ISO error count"));
-                }
-                self.basic(USBIP_RET_SUBMIT, s.request.seqnum, 0, Direction::Out, 0)?;
-                self.i32(s.status)?;
-                self.u32(s.actual_length)?;
-                self.i32(s.start_frame)?;
-                self.i32(s.number_of_packets)?;
-                self.u32(s.error_count)?;
-                self.put(&[0; 8])?;
-                let expected = if s.request.direction == Direction::In {
-                    s.actual_length as usize
-                } else {
-                    0
-                };
-                if s.data.len() != expected {
-                    return Err(Error::Invalid("completion payload length"));
-                }
-                self.put(&s.data)?;
-                self.iso(
-                    &s.iso_packets,
-                    s.number_of_packets,
-                    s.request.transfer_buffer_length,
-                    Some(s.actual_length),
-                    limits,
-                )?;
+                self.return_submit(&s.into(), &s.data, &s.iso_packets, limits)?
             }
             Message::Unlink {
                 seqnum,
@@ -732,32 +739,27 @@ impl Writer {
         Ok(())
     }
 }
-/// Encode a validated message in canonical network order. No partial output is
-/// returned on error. Encoding allocates only after size and semantic validation.
-pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>, Error> {
-    encode_with_admission(message, limits, &mut |_| Ok(()))
-}
-/// Encode with admission before allocating output. Input storage remains charged
-/// separately; the caller must retain the output charge until its Vec is dropped.
-pub fn encode_with_admission(
-    message: &Message,
+/// Validate and encode a frame in network order. Admission runs before allocation;
+/// the caller retains its charge until the returned buffer is dropped.
+/// Invalid messages produce no output and consume no allocation credits.
+pub fn encode<'a>(
+    frame: impl Into<Frame<'a>>,
     limits: Limits,
     admit: &mut dyn FnMut(usize) -> Result<(), Error>,
 ) -> Result<Vec<u8>, Error> {
-    encode_frame(limits, admit, |writer| writer.message(message, limits))
-}
-/// Encode SUBMIT directly from borrowed payload and ISO slices. Validation and
-/// admission match [`encode_with_admission`]; no temporary owned payload is needed.
-/// The caller retains the input storage and the output's allocation charge.
-pub fn encode_submit_with_admission(
-    header: &SubmitHeader,
-    data: &[u8],
-    packets: &[IsoPacket],
-    limits: Limits,
-    admit: &mut dyn FnMut(usize) -> Result<(), Error>,
-) -> Result<Vec<u8>, Error> {
-    encode_frame(limits, admit, |writer| {
-        writer.submit(header, data, packets, limits)
+    let frame = frame.into();
+    encode_frame(limits, admit, |writer| match frame {
+        Frame::Message(message) => writer.message(message, limits),
+        Frame::ReturnSubmit {
+            header,
+            data,
+            packets,
+        } => writer.return_submit(&header, data, packets, limits),
+        Frame::Submit {
+            header,
+            data,
+            packets,
+        } => writer.submit(header, data, packets, limits),
     })
 }
 fn encode_frame(

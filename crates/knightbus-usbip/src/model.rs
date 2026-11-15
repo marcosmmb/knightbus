@@ -1,5 +1,10 @@
 use std::fmt;
 
+/// USB/IP URB_ISO_ASAP transfer flag.
+pub const ISO_ASAP: u32 = 2;
+/// Bus-number shift in the USB/IP device identifier.
+pub const DEVICE_BUS_SHIFT: u32 = 16;
+
 /// USB/IP 1.1.1 management version.
 pub const VERSION: u16 = 0x0111;
 /// Fixed transfer header size, including command-specific padding.
@@ -307,6 +312,34 @@ pub struct ReturnSubmit {
     /// ISO completion descriptors.
     pub iso_packets: Vec<IsoPacket>,
 }
+/// Completion fields without owned payload or ISO storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReturnHeader {
+    /// Original request bounds and sequence.
+    pub request: ReplyContext,
+    /// Signed USB completion status.
+    pub status: i32,
+    /// Bytes transferred, including OUT completions.
+    pub actual_length: u32,
+    /// Completion scheduling field.
+    pub start_frame: i32,
+    /// Wire ISO count; -1 and 0 both mean non-ISO.
+    pub number_of_packets: i32,
+    /// Number of failed ISO packets.
+    pub error_count: u32,
+}
+impl From<&ReturnSubmit> for ReturnHeader {
+    fn from(reply: &ReturnSubmit) -> Self {
+        Self {
+            request: reply.request,
+            status: reply.status,
+            actual_length: reply.actual_length,
+            start_frame: reply.start_frame,
+            number_of_packets: reply.number_of_packets,
+            error_count: reply.error_count,
+        }
+    }
+}
 /// All eight standard messages. Management error replies have no body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -358,4 +391,33 @@ pub enum Context {
     Requests,
     /// Exporter-to-importer completions; context needed for RET_SUBMIT only.
     Replies(Option<ReplyContext>),
+}
+
+/// Borrowed encoding input. Native transfers can supply their existing buffers.
+pub enum Frame<'a> {
+    /// Any complete protocol message.
+    Message(&'a Message),
+    /// A SUBMIT without copying its payload into an owned message.
+    Submit {
+        /// Original request fields.
+        header: &'a SubmitHeader,
+        /// OUT data; empty for IN requests.
+        data: &'a [u8],
+        /// ISO layout; empty for other transfer types.
+        packets: &'a [IsoPacket],
+    },
+    /// A completion borrowing a retired transfer's storage.
+    ReturnSubmit {
+        /// Completion fields and original request bounds.
+        header: ReturnHeader,
+        /// IN bytes in wire order; empty for OUT completions.
+        data: &'a [u8],
+        /// Completed ISO packet descriptors.
+        packets: &'a [IsoPacket],
+    },
+}
+impl<'a> From<&'a Message> for Frame<'a> {
+    fn from(message: &'a Message) -> Self {
+        Self::Message(message)
+    }
 }

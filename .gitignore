@@ -23,7 +23,10 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Local lab artifacts and fuzz output (fixtures and reports are tracked).
+# Local lab tools, fixtures, diagnostics, and development artifacts.
+/lab/
+
+# Fuzz output and historical local evidence.
 /applications/usb-inspector/
 **/evidence/
 **/evidences/

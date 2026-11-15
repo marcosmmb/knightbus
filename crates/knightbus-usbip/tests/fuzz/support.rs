@@ -34,9 +34,9 @@ fn inputs(data: &[u8]) -> Option<(&[u8], Context, Limits)> {
 /// Successful parses must preserve exactly their consumed bytes when encoded.
 pub fn decode_target(data: &[u8]) {
     if let Some((bytes, context, limits)) = inputs(data) {
-        let expected = decode(bytes, context, limits);
+        let expected = decode(bytes, context, limits, &mut |_| Ok(()));
         let mut remaining = usize::from(data[0]) * 128 + usize::from(*data.last().unwrap()) * 64;
-        let admitted = decode_with_admission(bytes, context, limits, &mut |n| {
+        let admitted = decode(bytes, context, limits, &mut |n| {
             remaining = remaining
                 .checked_sub(n)
                 .ok_or(Error::Limit("fuzz allocation"))?;
@@ -48,10 +48,10 @@ pub fn decode_target(data: &[u8]) {
         if let Ok((message, consumed)) = expected {
             assert!(consumed <= bytes.len());
             assert!(consumed <= limits.frame_bytes);
-            let encoded = encode(&message, limits).unwrap();
+            let encoded = encode(&message, limits, &mut |_| Ok(())).unwrap();
             assert_eq!(encoded, bytes[..consumed]);
             assert_eq!(
-                decode(&encoded, context, limits).unwrap(),
+                decode(&encoded, context, limits, &mut |_| Ok(())).unwrap(),
                 (message, consumed)
             );
         }
@@ -60,13 +60,13 @@ pub fn decode_target(data: &[u8]) {
 /// Fragmentation must agree with whole-prefix parsing, including malformed input.
 pub fn stream_target(data: &[u8]) {
     if let Some((bytes, context, limits)) = inputs(data) {
-        let expected = decode(bytes, context, limits);
+        let expected = decode(bytes, context, limits, &mut |_| Ok(()));
         let mut decoder = Decoder::new(context, limits);
         let mut pos = 0;
         let mut remaining = usize::from(data[0]) * 128 + usize::from(*data.last().unwrap()) * 64;
         while pos < bytes.len() {
             let end = bytes.len().min(pos + 1 + bytes[pos] as usize % 31);
-            match decoder.push_with_admission(&bytes[pos..end], &mut |n| {
+            match decoder.push(&bytes[pos..end], &mut |n| {
                 remaining = remaining
                     .checked_sub(n)
                     .ok_or(Error::Limit("fuzz allocation"))?;
@@ -85,7 +85,7 @@ pub fn stream_target(data: &[u8]) {
                     if error != Error::Limit("fuzz allocation") {
                         assert_eq!(expected, Err(error));
                     }
-                    assert_eq!(decoder.push(&[]), Err(Error::Poisoned));
+                    assert_eq!(decoder.push(&[], &mut |_| Ok(())), Err(Error::Poisoned));
                     return;
                 }
             }

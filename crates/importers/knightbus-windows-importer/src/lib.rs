@@ -3,9 +3,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 pub mod backend;
 pub mod channel;
-pub mod descriptors;
+mod notification;
+pub use knightbus_windows_protocol::descriptors;
+pub use notification::Notification as DriverWake;
 
 #[cfg(windows)]
 pub mod native;
-
-pub mod transport;

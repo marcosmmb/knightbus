@@ -21,7 +21,7 @@ impl Retirement {
             a == u16::from(*b)
         });
         if !equal {
-            return STATUS_SUCCESS; // Explicit preinstalled-controller diagnostics.
+            return STATUS_INVALID_PARAMETER;
         }
         let suffix = &instance[prefix.len()..];
         let count = suffix.iter().position(|v| *v == 0).unwrap_or(0);

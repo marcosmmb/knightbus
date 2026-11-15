@@ -1,0 +1,13 @@
+[package]
+name = "knightbus-windows-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Allocation-free contract between the Windows importer and driver"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+knightbus-usb = { path = "../knightbus-usb" }

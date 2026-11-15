@@ -84,7 +84,7 @@ struct Subscription {
     reserved: bool,
     _credit: Credit,
 }
-/// Deterministic, single-owner shared engine. Hosts serialize calls and drive
+/// Deterministic, single-owner engine. Hosts serialize calls and drive
 /// ticks; they must retain the engine/backend while shutdown is still draining.
 pub struct Engine<B, C> {
     backend: B,
@@ -114,29 +114,15 @@ pub enum UnlinkState {
     TooLate,
 }
 impl<B: ExporterBackend, C: Clock> Engine<B, C> {
-    /// Inject backend, clock, bounds, and a fresh nonzero host epoch.
-    pub fn new(backend: B, clock: C, config: Config, epoch: u64) -> Result<Self> {
-        Self::with_budget(backend, clock, config, epoch, Budget::new(config.resources))
-    }
     /// Build a backend against the same aggregate admission budget as the
     /// engine, before any platform handles or asynchronous work are acquired.
-    pub fn with_backend_factory(
+    pub fn new(
         clock: C,
         config: Config,
         epoch: u64,
         factory: impl FnOnce(&Budget) -> Result<B>,
     ) -> Result<Self> {
         let budget = Budget::new(config.resources);
-        let backend = factory(&budget)?;
-        Self::with_budget(backend, clock, config, epoch, budget)
-    }
-    fn with_budget(
-        backend: B,
-        clock: C,
-        config: Config,
-        epoch: u64,
-        budget: Budget,
-    ) -> Result<Self> {
         if epoch == 0
             || config.events == 0
             || config.batch == 0
@@ -149,6 +135,7 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
         {
             return Err(Error::Invalid);
         }
+        let backend = factory(&budget)?;
         let now = clock.now();
         let replies = ReplyPool::new(&budget, config.resources.requests)?;
         let size = std::mem::size_of::<(VecDeque<Event>, Credit)>();
@@ -190,6 +177,10 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
     /// Shared data admission authority for parsers, native storage and transport.
     pub fn budget(&self) -> Budget {
         self.budget.clone()
+    }
+    /// Bind a host scheduler to native progress.
+    pub fn set_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.backend.set_waker(waker)
     }
     /// Register trusted backend inventory after descriptor validation. Replug
     /// requires a greater generation and clears grants (explicit reauthorization).
@@ -836,6 +827,129 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
         }
     }
 }
+impl<B: ExporterBackend, C: Clock> Engine<B, C> {
+    fn authorize(
+        &mut self,
+        caller: Caller,
+        device: DeviceKey,
+        peer: PeerId,
+        allow: bool,
+    ) -> Result<Reply> {
+        if !caller.administrator {
+            return Err(Error::Denied);
+        }
+        if !self.allowed(caller, device) {
+            return Err(Error::NotFound);
+        }
+        if allow {
+            if self.stopped {
+                return Err(Error::State);
+            }
+            if self.grants.len() >= self.config.grants
+                && !self.grants.contains_key(&(device.id, peer))
+            {
+                return Err(Error::Exhausted);
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.grants.entry((device.id, peer))
+            {
+                let credit = self
+                    .budget
+                    .reserve(std::mem::size_of::<((DeviceId, PeerId), Credit)>(), 0)?;
+                entry.insert(credit);
+            }
+        } else {
+            self.grants.remove(&(device.id, peer));
+            let mut cursor = None;
+            while let Some(id) = self.next_session(cursor) {
+                cursor = Some(id);
+                let view = &self.sessions[&id].view;
+                if view.peer == peer && view.devices.contains(&device) {
+                    self.drain(id, Error::Denied);
+                }
+            }
+        }
+        self.emit_inventory(device.id, Some(peer));
+        Ok(Reply::Done)
+    }
+    fn subscribe(&mut self, caller: Caller) -> Result<Reply> {
+        let reserved = caller.administrator
+            && !self.admin_queues.is_empty()
+            && !self
+                .subscribers
+                .values()
+                .any(|s| s.reserved && s.caller.peer == caller.peer);
+        if !reserved
+            && self
+                .subscribers
+                .values()
+                .filter(|s| !s.reserved && s.caller.peer == caller.peer)
+                .count()
+                >= self.config.subscriptions_per_peer
+        {
+            return Err(Error::Exhausted);
+        }
+        if !reserved
+            && self.subscribers.values().filter(|s| !s.reserved).count()
+                >= self.config.subscriptions - self.config.admin_subscriptions
+        {
+            return Err(Error::Exhausted);
+        }
+        let id = self.subscription.checked_add(1).ok_or(Error::Exhausted)?;
+        let (events, credit) = if reserved {
+            self.admin_queues.pop().unwrap()
+        } else {
+            Self::event_queue(&self.budget, self.config.events)?
+        };
+        self.subscription = id;
+        self.subscribers.insert(
+            id,
+            Subscription {
+                caller,
+                events,
+                overflow: false,
+                sequence: 0,
+                reserved,
+                _credit: credit,
+            },
+        );
+        Ok(Reply::Subscription(id))
+    }
+    fn poll_event(&mut self, caller: Caller, id: u64) -> Result<Reply> {
+        let sub = self
+            .subscribers
+            .get_mut(&id)
+            .filter(|s| s.caller == caller)
+            .ok_or(Error::Denied)?;
+        let event = if sub.overflow {
+            sub.overflow = false;
+            Some(Event {
+                sequence: sub.sequence,
+                kind: EventKind::Resync,
+                session: None,
+            })
+        } else {
+            sub.events.pop_front()
+        };
+        Ok(Reply::Event(event))
+    }
+    fn unsubscribe(&mut self, caller: Caller, id: u64) -> Result<Reply> {
+        if !self
+            .subscribers
+            .get(&id)
+            .is_some_and(|s| s.caller == caller)
+        {
+            return Err(Error::Denied);
+        }
+        let mut sub = self.subscribers.remove(&id).unwrap();
+        if sub.reserved {
+            sub.events.clear();
+            self.admin_queues.push((sub.events, sub._credit));
+        }
+        Ok(Reply::Done)
+    }
+}
+
 impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
     fn now(&self) -> u64 {
         self.clock.now()
@@ -859,44 +973,7 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
                 device,
                 peer,
                 allow,
-            } => {
-                if !caller.administrator {
-                    return Err(Error::Denied);
-                }
-                if !self.allowed(caller, device) {
-                    return Err(Error::NotFound);
-                }
-                if allow {
-                    if self.stopped {
-                        return Err(Error::State);
-                    }
-                    if self.grants.len() >= self.config.grants
-                        && !self.grants.contains_key(&(device.id, peer))
-                    {
-                        return Err(Error::Exhausted);
-                    }
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        self.grants.entry((device.id, peer))
-                    {
-                        let credit = self
-                            .budget
-                            .reserve(std::mem::size_of::<((DeviceId, PeerId), Credit)>(), 0)?;
-                        entry.insert(credit);
-                    }
-                } else {
-                    self.grants.remove(&(device.id, peer));
-                    let mut cursor = None;
-                    while let Some(id) = self.next_session(cursor) {
-                        cursor = Some(id);
-                        let view = &self.sessions[&id].view;
-                        if view.peer == peer && view.devices.contains(&device) {
-                            self.drain(id, Error::Denied);
-                        }
-                    }
-                }
-                self.emit_inventory(device.id, Some(peer));
-                Ok(Reply::Done)
-            }
+            } => self.authorize(caller, device, peer, allow),
             Command::Attach(keys) => self.attach(caller, keys, deadline),
             Command::Detach(id) => {
                 self.owner(caller, id)?;
@@ -916,82 +993,9 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
                 l.expires = self.clock.now().saturating_add(self.config.lease_ms);
                 Ok(Reply::Done)
             }
-            Command::Subscribe => {
-                let reserved = caller.administrator
-                    && !self.admin_queues.is_empty()
-                    && !self
-                        .subscribers
-                        .values()
-                        .any(|s| s.reserved && s.caller.peer == caller.peer);
-                if !reserved
-                    && self
-                        .subscribers
-                        .values()
-                        .filter(|s| !s.reserved && s.caller.peer == caller.peer)
-                        .count()
-                        >= self.config.subscriptions_per_peer
-                {
-                    return Err(Error::Exhausted);
-                }
-                if !reserved
-                    && self.subscribers.values().filter(|s| !s.reserved).count()
-                        >= self.config.subscriptions - self.config.admin_subscriptions
-                {
-                    return Err(Error::Exhausted);
-                }
-                let id = self.subscription.checked_add(1).ok_or(Error::Exhausted)?;
-                let (events, credit) = if reserved {
-                    self.admin_queues.pop().unwrap()
-                } else {
-                    Self::event_queue(&self.budget, self.config.events)?
-                };
-                self.subscription = id;
-                self.subscribers.insert(
-                    id,
-                    Subscription {
-                        caller,
-                        events,
-                        overflow: false,
-                        sequence: 0,
-                        reserved,
-                        _credit: credit,
-                    },
-                );
-                Ok(Reply::Subscription(id))
-            }
-            Command::Poll(id) => {
-                let sub = self
-                    .subscribers
-                    .get_mut(&id)
-                    .filter(|s| s.caller == caller)
-                    .ok_or(Error::Denied)?;
-                let event = if sub.overflow {
-                    sub.overflow = false;
-                    Some(Event {
-                        sequence: sub.sequence,
-                        kind: EventKind::Resync,
-                        session: None,
-                    })
-                } else {
-                    sub.events.pop_front()
-                };
-                Ok(Reply::Event(event))
-            }
-            Command::Unsubscribe(id) => {
-                if !self
-                    .subscribers
-                    .get(&id)
-                    .is_some_and(|s| s.caller == caller)
-                {
-                    return Err(Error::Denied);
-                }
-                let mut sub = self.subscribers.remove(&id).unwrap();
-                if sub.reserved {
-                    sub.events.clear();
-                    self.admin_queues.push((sub.events, sub._credit));
-                }
-                Ok(Reply::Done)
-            }
+            Command::Subscribe => self.subscribe(caller),
+            Command::Poll(id) => self.poll_event(caller, id),
+            Command::Unsubscribe(id) => self.unsubscribe(caller, id),
             Command::Forget(id) => {
                 self.owner(caller, id)?;
                 if self.sessions[&id].view.state != SessionState::Closed {

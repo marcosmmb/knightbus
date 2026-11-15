@@ -1,0 +1,10 @@
+[package]
+name = "knightbus-usb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Allocation-free USB descriptor validation and topology"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,7 +1,6 @@
 //! Deterministic native retirement, policy and shared host contract scenarios.
 use knightbus_core::{Device, Interface};
 use knightbus_core::{usbip::*, *};
-use knightbus_embedded::InProcessControl;
 use knightbus_ipc::{IpcControl, Service, decode_request, encode_request};
 use std::{
     cell::{Cell, RefCell},
@@ -51,6 +50,17 @@ struct Native {
 #[derive(Clone, Default)]
 struct Mock(Rc<RefCell<Native>>);
 impl ExporterBackend for Mock {
+    fn manages_topology(&self) -> bool {
+        false
+    }
+    fn poll_removed(&mut self) -> Option<knightbus_core::DeviceKey> {
+        None
+    }
+    fn set_waker(&mut self, waker: Option<std::task::Waker>) {
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
     fn claim(&mut self, session: SessionId, device: &Device) -> Poll<knightbus_core::Result<()>> {
         let mut n = self.0.borrow_mut();
         n.claimed.insert((session, device.key));
@@ -170,7 +180,7 @@ fn device(key: DeviceKey) -> Device {
 fn fixture(config: Config) -> (TestEngine, Mock, Time) {
     let mock = Mock::default();
     let time = Time::default();
-    let mut e = Engine::new(mock.clone(), time.clone(), config, 7).unwrap();
+    let mut e = Engine::new(time.clone(), config, 7, |_| Ok(mock.clone())).unwrap();
     e.register(device(KEY)).unwrap();
     (e, mock, time)
 }
@@ -253,7 +263,7 @@ fn shared_control_suite_through_both_hosts() {
     }
     let (mut direct, _, _) = fixture(Config::default());
     let (mut service, _, _) = fixture(Config::default());
-    let a = suite(&mut InProcessControl::new(&mut direct, USER, CONTROL_VERSION).unwrap());
+    let a = suite(&mut ControlConnection::new(&mut direct, USER, CONTROL_VERSION).unwrap());
     let b = suite(&mut IpcControl::new(&mut service, USER, true, 7, CONTROL_VERSION).unwrap());
     assert_eq!(a, b);
     assert_eq!(
@@ -266,7 +276,7 @@ fn shared_control_suite_through_both_hosts() {
             Err(knightbus_core::Error::Deadline)
         ]
     );
-    assert!(InProcessControl::new(&mut direct, USER, 2).is_err());
+    assert!(ControlConnection::new(&mut direct, USER, 2).is_err());
     assert!(IpcControl::new(&mut service, USER, true, 7, 2).is_err());
     assert!(IpcControl::new(&mut service, USER, false, 7, 1).is_err());
 }
@@ -281,7 +291,7 @@ fn lifecycle_event_and_shutdown_parity() {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
                 Box::new(IpcControl::new(&mut e, USER, true, 7, 1).unwrap())
             } else {
-                Box::new(InProcessControl::new(&mut e, USER, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, USER, 1).unwrap())
             };
             let Reply::Subscription(sub) = c.call(Command::Subscribe, END).unwrap() else {
                 panic!()
@@ -314,7 +324,7 @@ fn lifecycle_event_and_shutdown_parity() {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
                 Box::new(IpcControl::new(&mut e, ADMIN, true, 7, 1).unwrap())
             } else {
-                Box::new(InProcessControl::new(&mut e, ADMIN, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, ADMIN, 1).unwrap())
             };
             c.call(Command::Shutdown, END).unwrap();
         }
@@ -615,7 +625,7 @@ fn leases_expire_reconnect_tokens_stale_and_shutdown_drains() {
     ready(&mock, second, 1);
     e.tick();
     assert!(e.shutdown_complete());
-    let mut restarted = Engine::new(Mock::default(), time, Config::default(), 8).unwrap();
+    let mut restarted = Engine::new(time, Config::default(), 8, |_| Ok(Mock::default())).unwrap();
     assert_eq!(
         restarted.execute(USER, Command::Status(second), END),
         Err(error())
@@ -906,11 +916,13 @@ fn fabricated_usbip_import_cannot_bypass_exporter_policy() {
         status: 0,
         devices: e.discover(USER),
     };
-    let bytes = encode(&wire, Limits::default()).unwrap();
+    let bytes = encode(&wire, Limits::default(), &mut |_| Ok(())).unwrap();
     assert_eq!(
-        decode(&bytes, Context::Management, Limits::default())
-            .unwrap()
-            .0,
+        decode(&bytes, Context::Management, Limits::default(), &mut |_| Ok(
+            ()
+        ))
+        .unwrap()
+        .0,
         wire
     );
     let id = e.import(USER, &KEY.id.bus_id(), END).unwrap();
@@ -993,8 +1005,16 @@ fn response_frames_preserve_errors_sessions_events_and_wide_ids() {
 }
 
 #[derive(Clone, Default)]
-struct Virtual(Rc<Cell<bool>>);
+struct Virtual(Rc<Cell<bool>>, Rc<RefCell<Option<Transfer>>>);
 impl ImporterBackend for Virtual {
+    fn next_cancellation(&mut self, _: SessionId) -> Option<u32> {
+        None
+    }
+    fn set_waker(&mut self, waker: Option<std::task::Waker>) {
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
     fn attach(&mut self, _: SessionId, _: &Device) -> Poll<knightbus_core::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -1003,7 +1023,7 @@ impl ImporterBackend for Virtual {
         _: SessionId,
         _: &Budget,
     ) -> Option<knightbus_core::Result<Transfer>> {
-        None
+        self.1.borrow_mut().take().map(Ok)
     }
     fn complete(&mut self, _: SessionId, _: Completion) -> std::result::Result<(), Completion> {
         Ok(())
@@ -1048,6 +1068,66 @@ fn importer_native_retirement_gates_reattachment() {
     importer.disconnect();
     importer.tick();
     assert_eq!(importer.state(), ImporterState::Idle);
+}
+
+#[test]
+fn importer_clock_regression_drains_without_permitting_reuse() {
+    let backend = Virtual::default();
+    let time = Time::default();
+    let budget = Budget::new(Config::default().resources);
+    let mut importer = Importer::new(backend.clone(), time.clone(), 5, budget.clone()).unwrap();
+    let session = SessionId {
+        epoch: 1,
+        serial: 1,
+    };
+    importer.attach(session, device(KEY), END).unwrap();
+    time.0.set(10);
+    importer.tick();
+    assert_eq!(importer.state(), ImporterState::Active);
+    time.0.set(9);
+    importer.tick();
+    assert_eq!(importer.state(), ImporterState::Draining);
+    assert_eq!(importer.error(), Some(knightbus_core::Error::State));
+    assert!(budget.usage().bytes > 0);
+    assert!(importer.next_transfer().is_none());
+    backend.0.set(true);
+    importer.tick();
+    assert_eq!(importer.state(), ImporterState::Idle);
+    assert_eq!(budget.usage(), Usage::default());
+    time.0.set(11);
+    assert_eq!(
+        importer.attach(session, device(KEY), END),
+        Err(knightbus_core::Error::State)
+    );
+}
+
+#[test]
+fn importer_rejects_foreign_transfer_credits_and_drains() {
+    let backend = Virtual::default();
+    let budget = Budget::new(Config::default().resources);
+    let foreign = Budget::new(Config::default().resources);
+    *backend.1.borrow_mut() = Some(Transfer::new(&foreign, header(1, 8), &[]).unwrap());
+    let mut importer = Importer::new(backend.clone(), Time::default(), 5, budget.clone()).unwrap();
+    importer
+        .attach(
+            SessionId {
+                epoch: 1,
+                serial: 1,
+            },
+            device(KEY),
+            END,
+        )
+        .unwrap();
+    importer.tick();
+    assert!(matches!(
+        importer.next_transfer(),
+        Some(Err(knightbus_core::Error::Invalid))
+    ));
+    assert_eq!(importer.state(), ImporterState::Draining);
+    assert_eq!(foreign.usage(), Usage::default());
+    backend.0.set(true);
+    importer.tick();
+    assert_eq!(budget.usage(), Usage::default());
 }
 
 #[test]
@@ -1120,7 +1200,7 @@ fn host_drop_retires_events_and_does_not_release_engine_owned_leases() {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
                 Box::new(IpcControl::new(&mut e, USER, true, 7, 1).unwrap())
             } else {
-                Box::new(InProcessControl::new(&mut e, USER, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, USER, 1).unwrap())
             };
             c.call(Command::Subscribe, END).unwrap();
         }
@@ -1308,7 +1388,7 @@ fn subscription_quotas_span_connections_and_admin_queue_survives_full_data_budge
             if ipc {
                 Box::new(IpcControl::new(target, caller, true, 7, 1).unwrap())
             } else {
-                Box::new(InProcessControl::new(target, caller, 1).unwrap())
+                Box::new(ControlConnection::new(target, caller, 1).unwrap())
             }
         };
         let mut first = adapter(&mut a, USER);
@@ -1477,7 +1557,7 @@ fn interleaved_completion_slots_reuse_capacity_and_cleanup_only_their_session() 
 #[test]
 fn admitted_wire_storage_moves_to_native_and_stays_charged_through_completion() {
     let mock = Mock::default();
-    let mut e = Engine::new(mock.clone(), Time::default(), Config::default(), 7).unwrap();
+    let mut e = Engine::new(Time::default(), Config::default(), 7, |_| Ok(mock.clone())).unwrap();
     let mut d = device(KEY);
     let mut out = d.configurations[0].interfaces[0].endpoints[0].clone();
     out.address = 1;
@@ -1489,7 +1569,7 @@ fn admitted_wire_storage_moves_to_native_and_stays_charged_through_completion() 
     let mut h = header(1, 4096);
     h.direction = Direction::Out;
     let request = Message::Submit(h.with_payload(vec![42; 4096], vec![]));
-    let wire = encode(&request, Limits::default()).unwrap();
+    let wire = encode(&request, Limits::default(), &mut |_| Ok(())).unwrap();
     let mut decoder = budget
         .decoder(Context::Requests, Limits::default())
         .unwrap();
@@ -1537,6 +1617,7 @@ fn admitted_decoder_rejects_large_bodies_and_releases_truncation_and_conversion_
     let wire = encode(
         &Message::Submit(h.with_payload(vec![0; 8192], vec![])),
         Limits::default(),
+        &mut |_| Ok(()),
     )
     .unwrap();
     let mut decoder = budget
@@ -1559,6 +1640,7 @@ fn admitted_decoder_rejects_large_bodies_and_releases_truncation_and_conversion_
     let wire = encode(
         &Message::Submit(header(1, 8192).with_payload(vec![], vec![])),
         Limits::default(),
+        &mut |_| Ok(()),
     )
     .unwrap();
     let mut decoder = budget
@@ -1651,4 +1733,15 @@ fn release_failure_notifies_quarantine_once_and_later_notifies_retirement() {
     e.tick();
     assert_eq!(status(&mut e, id).state, SessionState::Closed);
     assert_eq!(e.execute(USER, Command::Poll(sub), END), Ok(event(3)));
+}
+
+#[test]
+fn engine_validates_configuration_before_constructing_native_backend() {
+    let called = std::cell::Cell::new(false);
+    let result = Engine::new(Time::default(), Config::default(), 0, |_| {
+        called.set(true);
+        Ok(Mock::default())
+    });
+    assert!(matches!(result, Err(knightbus_core::Error::Invalid)));
+    assert!(!called.get());
 }

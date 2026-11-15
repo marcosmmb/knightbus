@@ -19,6 +19,7 @@ kmdf-version-major = 1
 target-kmdf-version-minor = 33
 
 [dependencies]
+knightbus-windows-protocol = { path = "../../crates/knightbus-windows-protocol" }
 wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "04523040779d80125f280c4f9421f54a6059f470", features = ["usb"] }
 wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "04523040779d80125f280c4f9421f54a6059f470" }
 

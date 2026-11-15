@@ -1,5 +1,5 @@
 use crate::{Completion, Device, DeviceKey, Result, SessionId, Transfer, TransferId};
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 /// Injected monotonic milliseconds. Never use wall clock or peer timestamps.
 pub trait Clock {
@@ -12,17 +12,17 @@ pub trait Clock {
 /// storage on unexpected host destruction; dropping this Rust owner alone is
 /// never evidence that native callbacks stopped. No callback may outlive storage.
 pub trait ExporterBackend {
+    /// Register a host wakeup for lifecycle, removal and completion changes.
+    /// Signal existing work on registration and every later progress change.
+    /// Wakeups only schedule work; None unregisters. Hosts do not poll for work.
+    fn set_waker(&mut self, waker: Option<Waker>);
     /// A backend opting in validates requests against its live configuration and
     /// alternates, serializes topology changes, and retains old pipes until drain.
-    /// The default keeps the M6 fixed-topology validation contract.
-    fn manages_topology(&self) -> bool {
-        false
-    }
+    /// Otherwise, the engine validates against alternate zero.
+    fn manages_topology(&self) -> bool;
     /// Report a terminated physical generation, including idle devices. The
     /// engine revokes its availability and drains any affected leases.
-    fn poll_removed(&mut self) -> Option<DeviceKey> {
-        None
-    }
+    fn poll_removed(&mut self) -> Option<DeviceKey>;
     /// Poll acquisition, idempotent for the same session/device. Pending owns
     /// provisional resources; release must retire them even if claim never wins.
     fn claim(&mut self, session: SessionId, device: &Device) -> Poll<Result<()>>;
@@ -43,10 +43,13 @@ pub trait ExporterBackend {
     /// Ready(Err) retains the claim in quarantine and must be retryable.
     fn release(&mut self, session: SessionId, device: DeviceKey) -> Poll<Result<()>>;
 }
-/// Virtual USB importer backend contract. Production driver implementations are
-/// later milestones; neither adapter handles USB requests or native pointers.
+/// Virtual USB attachment and request ownership.
 /// Drop has the same native-storage retirement obligation as ExporterBackend.
 pub trait ImporterBackend {
+    /// Register a host wakeup for lifecycle, requests and cancellation changes.
+    /// Signal existing work on registration and every later progress change.
+    /// Wakeups only schedule work; None unregisters. Hosts do not poll for work.
+    fn set_waker(&mut self, waker: Option<Waker>);
     /// Attach validated descriptors with a generation-scoped native identity.
     fn attach(&mut self, session: SessionId, device: &Device) -> Poll<Result<()>>;
     /// Deliver a bounded owned native request from this generation.
@@ -57,9 +60,7 @@ pub trait ImporterBackend {
     ) -> Option<Result<Transfer>>;
     /// Native cancellation of an already delivered request. The transport must
     /// unlink that sequence and keep its transfer owner until remote retirement.
-    fn next_cancellation(&mut self, _session: SessionId) -> Option<u32> {
-        None
-    }
+    fn next_cancellation(&mut self, session: SessionId) -> Option<u32>;
     /// Consume a validated completion, retaining its credits until driver access
     /// retires. Failure returns ownership so the session can drain safely.
     #[allow(clippy::result_large_err)] // Preserve ownership without allocating on failure.
@@ -126,8 +127,8 @@ impl ImporterState {
 
 /// Portable importer attachment lifecycle. The transport supplies authorized
 /// remote metadata and a fresh session ID; the native driver is injected.
-/// Data forwarding uses [`ImporterBackend`] directly in later backend milestones.
-pub struct Importer<B, C> {
+/// Forwarding is gated by the same attachment state and admission budget.
+pub struct Importer<B: ImporterBackend, C: Clock> {
     backend: B,
     clock: C,
     state: ImporterState,
@@ -136,6 +137,8 @@ pub struct Importer<B, C> {
     deadline: u64,
     cleanup_ms: u64,
     error: Option<crate::Error>,
+    last_now: u64,
+    clock_failed: bool,
 }
 impl<B: ImporterBackend, C: Clock> Importer<B, C> {
     /// Construct an idle importer; cleanup deadlines never imply native retirement.
@@ -143,6 +146,7 @@ impl<B: ImporterBackend, C: Clock> Importer<B, C> {
         if cleanup_ms == 0 {
             return Err(crate::Error::Invalid);
         }
+        let last_now = clock.now();
         Ok(Self {
             backend,
             clock,
@@ -152,10 +156,16 @@ impl<B: ImporterBackend, C: Clock> Importer<B, C> {
             deadline: 0,
             cleanup_ms,
             error: None,
+            last_now,
+            clock_failed: false,
         })
     }
     /// Begin native attachment after authenticated remote import authorization.
     pub fn attach(&mut self, session: SessionId, device: Device, deadline: u64) -> Result<()> {
+        self.observe_clock();
+        if self.clock_failed {
+            return Err(crate::Error::State);
+        }
         device.validate()?;
         if session.epoch == 0 || session.serial == 0 {
             return Err(crate::Error::Invalid);
@@ -184,6 +194,7 @@ impl<B: ImporterBackend, C: Clock> Importer<B, C> {
     /// Advance nonblocking native attachment/removal, retaining quarantined state
     /// on cleanup failure and retrying until the backend confirms retirement.
     pub fn tick(&mut self) {
+        self.observe_clock();
         let Some((session, device, _credit)) = &self.attachment else {
             return;
         };
@@ -226,6 +237,50 @@ impl<B: ImporterBackend, C: Clock> Importer<B, C> {
             }
         }
     }
+    /// Register the host scheduler for all native progress.
+    pub fn set_waker(&mut self, waker: Option<Waker>) {
+        self.backend.set_waker(waker);
+    }
+    /// Fetch work only from the live attachment and its admission budget.
+    pub fn next_transfer(&mut self) -> Option<Result<Transfer>> {
+        if self.state != ImporterState::Active {
+            return None;
+        }
+        let result = self
+            .backend
+            .next_transfer(self.attachment.as_ref()?.0, &self.budget)?;
+        Some(result.and_then(|transfer| {
+            if transfer.budget_matches(&self.budget) {
+                Ok(transfer)
+            } else {
+                self.disconnect();
+                Err(crate::Error::Invalid)
+            }
+        }))
+    }
+    /// Cancellation intent for the live attachment.
+    pub fn next_cancellation(&mut self) -> Option<u32> {
+        if self.state != ImporterState::Active {
+            return None;
+        }
+        self.backend.next_cancellation(self.attachment.as_ref()?.0)
+    }
+    /// Return a completion to the native owner while its attachment is active.
+    #[allow(clippy::result_large_err)]
+    pub fn complete(&mut self, completion: Completion) -> std::result::Result<(), Completion> {
+        if self.state != ImporterState::Active || !completion.transfer.budget_matches(&self.budget)
+        {
+            return Err(completion);
+        }
+        let Some((session, _, _)) = &self.attachment else {
+            return Err(completion);
+        };
+        self.backend.complete(*session, completion)
+    }
+    /// Validated inventory retained until native retirement.
+    pub fn device(&self) -> Option<&Device> {
+        self.attachment.as_ref().map(|(_, device, _)| device)
+    }
     /// Current native lifecycle, independent of exporter lease lifetime.
     pub fn state(&self) -> ImporterState {
         self.state
@@ -233,5 +288,23 @@ impl<B: ImporterBackend, C: Clock> Importer<B, C> {
     /// Sanitized attachment/cleanup diagnostic.
     pub fn error(&self) -> Option<crate::Error> {
         self.error
+    }
+    fn observe_clock(&mut self) {
+        let now = self.clock.now();
+        if now < self.last_now {
+            self.clock_failed = true;
+            self.error = Some(crate::Error::State);
+            self.disconnect();
+        }
+        self.last_now = now;
+    }
+}
+
+impl<B: ImporterBackend, C: Clock> Drop for Importer<B, C> {
+    fn drop(&mut self) {
+        self.backend.set_waker(None);
+        if let Some((session, _, _)) = &self.attachment {
+            let _ = self.backend.detach(*session);
+        }
     }
 }

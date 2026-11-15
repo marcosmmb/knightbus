@@ -7,8 +7,9 @@ license.workspace = true
 description = "Original macOS IOUSBHost physical USB exporter"
 
 [dependencies]
+knightbus-usb = { path = "../../knightbus-usb" }
+knightbus-transport = { path = "../../knightbus-transport" }
 knightbus-core = { path = "../../knightbus-core" }
-knightbus-embedded = { path = "../../knightbus-embedded" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"

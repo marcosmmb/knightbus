@@ -7,11 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+knightbus-usb = { path = "../knightbus-usb" }
 knightbus-usbip = { path = "../knightbus-usbip" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-knightbus-embedded = { path = "../knightbus-embedded" }
 knightbus-ipc = { path = "../knightbus-ipc" }

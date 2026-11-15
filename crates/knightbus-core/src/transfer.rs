@@ -127,6 +127,76 @@ impl Transfer {
     pub fn packets(&self) -> &[IsoPacket] {
         &self.packets
     }
+    /// Validate a native submission against the currently selected endpoint.
+    /// The device worker orders topology changes before this check. Native
+    /// adapters provide their actual selected endpoint and preserve OS ownership.
+    pub fn validate_native(
+        &self,
+        wire_id: u32,
+        endpoint: Option<&crate::Endpoint>,
+        capabilities: crate::Capabilities,
+    ) -> Result<u8> {
+        use knightbus_usb as usb;
+        let t = self;
+        let h = t.header();
+        if h.endpoint > u32::from(usb::ENDPOINT_NUMBER_MASK)
+            || h.transfer_buffer_length as usize != t.buffer().len()
+            || t.buffer().len() > capabilities.transfer_bytes
+            || t.layout().len() > capabilities.iso_packets
+            || h.device_id != wire_id
+        {
+            return Err(Error::Invalid);
+        }
+        if h.endpoint == 0 {
+            if h.transfer_flags != 0
+                || !t.layout().is_empty()
+                || usize::from(u16::from_le_bytes([
+                    h.setup[usb::SETUP_LENGTH],
+                    h.setup[usb::SETUP_LENGTH + 1],
+                ])) != t.buffer().len()
+                || (h.setup[usb::SETUP_TYPE] & usb::DIRECTION_IN != 0)
+                    != (h.direction == Direction::In)
+            {
+                return Err(Error::Invalid);
+            }
+            if h.setup[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK == 0
+                && h.setup[usb::SETUP_REQUEST] == usb::SET_ADDRESS
+            {
+                return Err(Error::Unsupported);
+            }
+            return Ok(0);
+        }
+        let address = h.endpoint as u8
+            | if h.direction == Direction::In {
+                usb::DIRECTION_IN
+            } else {
+                0
+            };
+        let e = endpoint
+            .filter(|e| e.address == address)
+            .ok_or(Error::Invalid)?;
+        if h.setup != [0; usb::SETUP_SIZE]
+            || h.transfer_flags & !e.allowed_flags != 0
+            || (e.kind == TransferKind::Isochronous) == t.layout().is_empty()
+        {
+            return Err(Error::Unsupported);
+        }
+        if e.kind == TransferKind::Isochronous {
+            // USB/IP frame numbers are importer-local. Only ASAP is safely
+            // translatable without an explicit cross-host frame-clock contract.
+            if h.transfer_flags & crate::usbip::ISO_ASAP == 0 {
+                return Err(Error::Unsupported);
+            }
+            let packet = (e.max_packet_size & usb::PACKET_SIZE_MASK) as u32
+                * (1 + u32::from(
+                    (e.max_packet_size >> usb::TRANSACTIONS_SHIFT) & usb::TRANSACTIONS_MASK,
+                ));
+            if t.layout().iter().any(|p| p.length > packet) {
+                return Err(Error::Invalid);
+            }
+        }
+        Ok(address)
+    }
     pub(crate) fn bind(&mut self, token: crate::TransferId) -> Result<()> {
         if self.token.is_some() {
             return Err(Error::State);

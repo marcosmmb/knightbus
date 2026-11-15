@@ -114,7 +114,7 @@ pub struct Interface {
     /// Endpoints for this alternate setting.
     pub endpoints: Vec<Endpoint>,
 }
-/// Configuration metadata. M6 activates alternate zero only.
+/// Configuration metadata, including all interface alternate settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Configuration {
     /// Nonzero bConfigurationValue.
@@ -245,7 +245,7 @@ impl Device {
             .find(|e| e.address == address)
     }
     pub(crate) fn wire_id(&self) -> u32 {
-        (self.wire.bus_number << 16) | self.wire.device_number
+        (self.wire.bus_number << usbip::DEVICE_BUS_SHIFT) | self.wire.device_number
     }
 }
 /// Exporter lease lifecycle. Draining and quarantined leases retain ownership.

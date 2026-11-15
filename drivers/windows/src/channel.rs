@@ -6,62 +6,16 @@
 //! cancel completions. Every URB completes from our separate DPC, never inline.
 
 use super::{structure_size, ude_entry};
-use core::{
-    mem, ptr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::{mem, ptr};
 use wdk_sys::{call_unsafe_wdf_function_binding as wdf, *};
 
-const LIMIT: usize = 65536;
-const ENDPOINT_COUNT: usize = 31;
+use knightbus_windows_protocol::{
+    descriptors,
+    wire::{MAX_TRANSFER as LIMIT, SLOTS as ENDPOINT_COUNT},
+};
 const QUEUE_COUNT: usize = ENDPOINT_COUNT * 2;
-const STATS_BYTES: usize = (8 + ENDPOINT_COUNT) * 8;
-const HEADER: usize = 32;
-const SUBMIT_URB: u32 = 0x0022_0003; // USB IOCTL_INTERNAL_USB_SUBMIT_URB.
-// FILE_DEVICE_UNKNOWN, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA.
-const FETCH: u32 = 0x0022_e404;
-const REPLY: u32 = 0x0022_e408;
-const DETACH: u32 = 0x0022_e40c;
-const STATS: u32 = 0x0022_e410;
-const LIFECYCLE: u32 = 0x0022_e414;
-const ATTACH_PHYSICAL: u32 = 0x0022_e424;
-const RETIREMENT_READY: u32 = 0x0022_e42c;
-const CHILD_CREATED: usize = 0;
-const CHILD_CLEANUP: usize = 1;
-const CHILD_DESTROYED: usize = 2;
-const DEFAULT_ADDED: usize = 3;
-const ENDPOINT_CREATED: usize = 4;
-const ENDPOINT_CLEANUP: usize = 5;
-const ENDPOINT_DESTROYED: usize = 6;
-const QUEUE_CREATED: usize = 7;
-const QUEUE_CLEANUP: usize = 8;
-const QUEUE_DESTROYED: usize = 9;
-const PLUGOUT_CALLS: usize = 10;
-const PLUGOUT_SUCCEEDED: usize = 11;
-const UNPUBLISHED_DELETED: usize = 13;
-// Image lifetime, not device-context lifetime: a destroy callback must not
-// dereference its retired object or assume its controller context still exists.
-// Atomics allocate nothing and are usable at every callback IRQL on this x64 ABI.
-static LIFETIMES: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
-fn observe(index: usize) {
-    LIFETIMES[index].fetch_add(1, Ordering::Relaxed);
-}
-unsafe extern "C" fn child_cleanup_observation(_object: WDFOBJECT) {
-    observe(CHILD_CLEANUP);
-}
-unsafe extern "C" fn child_destroy_observation(_object: WDFOBJECT) {
-    observe(CHILD_DESTROYED);
-}
-unsafe extern "C" fn endpoint_cleanup_observation(_object: WDFOBJECT) {
-    observe(ENDPOINT_CLEANUP);
-}
-unsafe extern "C" fn endpoint_destroy_observation(_object: WDFOBJECT) {
-    observe(ENDPOINT_DESTROYED);
-}
-unsafe extern "C" fn queue_destroy_observation(_object: WDFOBJECT) {
-    observe(QUEUE_DESTROYED);
-}
-const LAB_INTERFACE: GUID = GUID {
+const SUBMIT_URB: u32 = 0x0022_0003;
+const PRIVATE_INTERFACE: GUID = GUID {
     Data1: 0x53baf142,
     Data2: 0xc628,
     Data3: 0x47de,
@@ -98,6 +52,8 @@ struct State {
     physical_device: [u8; 18],
     physical_configuration: [u8; 4096],
     physical_length: usize,
+    physical_bos: [u8; 4096],
+    bos_length: usize,
     speed: u32,
     lock: WDFSPINLOCK,
     gate: WDFWAITLOCK,
@@ -106,6 +62,7 @@ struct State {
     filtered_pending: u32, // Accepted filter requests, including DPC delivery.
     failed_head: PIRP,     // Context-allocation failures; owned, non-cancelable IRPs only.
     owner: WDFFILEOBJECT,
+    wake_event: PKEVENT, // Referenced event; protected by lock.
     quarantined: u8,
     closing: u8, // Protected by lock; rejects newly delivered URBs during teardown.
     child: UDECXUSBDEVICE,
@@ -119,15 +76,6 @@ struct State {
     canceled: u64,
     rejected: u64,
     dpc_wrong_irql: u64,
-    maximum_length: [u32; ENDPOINT_COUNT],
-    last_urb_error: [u32; ENDPOINT_COUNT],
-    starts: [u64; ENDPOINT_COUNT],
-    resets: [u64; ENDPOINT_COUNT],
-    admitted_by_endpoint: [u64; ENDPOINT_COUNT],
-    fetched_by_endpoint: [u64; ENDPOINT_COUNT],
-    canceled_by_endpoint: [u64; ENDPOINT_COUNT],
-    delivered: u64,
-    queued_cancels: u64,
     slots: [Slot; ENDPOINT_COUNT],
 }
 #[repr(C)]
@@ -295,6 +243,11 @@ pub(super) unsafe fn configure_init(init: PWDFDEVICE_INIT) {
     unsafe {
         wdf!(WdfDeviceInitSetRequestAttributes, init, &mut attributes);
         wdf!(
+            WdfDeviceInitSetIoInCallerContextCallback,
+            init,
+            Some(notification::in_caller_context)
+        );
+        wdf!(
             WdfDeviceInitSetFileObjectConfig,
             init,
             &mut files,
@@ -342,7 +295,7 @@ pub(super) unsafe fn initialize(device: WDFDEVICE) -> NTSTATUS {
             ptr::addr_of_mut!((*s).lock)
         )
     };
-    unsafe { initialization_stage(device, 8, status) };
+
     if status < 0 {
         return status;
     }
@@ -353,7 +306,7 @@ pub(super) unsafe fn initialize(device: WDFDEVICE) -> NTSTATUS {
             ptr::addr_of_mut!((*s).gate)
         )
     };
-    unsafe { initialization_stage(device, 9, status) };
+
     if status < 0 {
         return status;
     }
@@ -371,26 +324,19 @@ pub(super) unsafe fn initialize(device: WDFDEVICE) -> NTSTATUS {
             ptr::addr_of_mut!((*s).dpc)
         )
     };
-    unsafe { initialization_stage(device, 10, status) };
+
     if status < 0 {
         return status;
     }
-    // SAFETY: Live FDO and our independently selected private lab GUID.
+    // SAFETY: Live FDO and our independently selected private interface GUID.
     unsafe {
         wdf!(
             WdfDeviceCreateDeviceInterface,
             device,
-            &LAB_INTERFACE,
+            &PRIVATE_INTERFACE,
             ptr::null()
         )
     }
-}
-
-// SAFETY: Called only synchronously during passive initialization; no payload.
-unsafe fn initialization_stage(device: WDFDEVICE, stage: u32, status: NTSTATUS) {
-    let driver = unsafe { wdf!(WdfDeviceGetDriver, device) };
-    let object = unsafe { wdf!(WdfDriverWdmGetDriverObject, driver) };
-    unsafe { super::trace_stage(object, stage, status) };
 }
 
 // The caller owns the request exclusively, not marked cancelable. At <=DISPATCH
@@ -535,10 +481,8 @@ unsafe extern "C" fn cancel(request: WDFREQUEST) {
         if index < ENDPOINT_COUNT && (*s).slots[index].request == request {
             (*s).slots[index].request = ptr::null_mut();
         }
+        notification::signal(s);
         (*s).canceled += 1;
-        if index < ENDPOINT_COUNT {
-            (*s).canceled_by_endpoint[index] += 1;
-        }
         wdf!(WdfSpinLockRelease, (*s).lock);
         finish(device, request, STATUS_CANCELLED);
     }
@@ -548,14 +492,10 @@ unsafe extern "C" fn canceled_on_queue(queue: WDFQUEUE, request: WDFREQUEST) {
     // never presented, so no slot points to it. Foreign requests may lack context.
     let device = unsafe { wdf!(WdfIoQueueGetDevice, queue) };
     let s = unsafe { state(device) };
-    let index = unsafe { queue_index(queue) };
     unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
         (*s).canceled += 1;
-        (*s).queued_cancels += 1;
-        if index < ENDPOINT_COUNT {
-            (*s).canceled_by_endpoint[index] += 1;
-        }
+
         wdf!(WdfSpinLockRelease, (*s).lock);
         if request_state(request).is_null() {
             fail_without_context(device, request, STATUS_CANCELLED);
@@ -577,134 +517,157 @@ unsafe extern "C" fn urb(
     if !unsafe { prepare_request(device, request, true) } {
         return;
     }
-    let s = unsafe { state(device) };
-    unsafe {
-        wdf!(WdfSpinLockAcquire, (*s).lock);
-        (*s).delivered += 1;
-        wdf!(WdfSpinLockRelease, (*s).lock);
-    }
     if code != SUBMIT_URB {
         unsafe { finish(device, request, STATUS_INVALID_DEVICE_REQUEST) };
         return;
     }
     let index = unsafe { queue_index(queue) };
-    let result = (|| -> Result<(), NTSTATUS> {
-        if index >= ENDPOINT_COUNT {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let mut setup = WDF_USB_CONTROL_SETUP_PACKET::default();
-        let mut bytes = [0u8; 8];
-        let input = if index == 0 {
-            let status = ude!(
-                UdecxUrbRetrieveControlSetupPacketTableIndex,
-                PFN_UDECXURBRETRIEVECONTROLSETUPPACKET,
-                request,
-                &mut setup
-            )?;
-            if status < 0 {
-                return Err(status);
-            }
-            // SAFETY: SDK union is exactly the eight USB setup packet bytes;
-            // copying object representation avoids unaligned field references.
-            unsafe {
-                ptr::copy_nonoverlapping(ptr::addr_of!(setup).cast::<u8>(), bytes.as_mut_ptr(), 8)
-            };
-            bytes[0] & 0x80 != 0
-        } else {
-            unsafe { (*state(device)).endpoints[index] & 0x80 != 0 }
-        };
-        let mut buffer: *mut u8 = ptr::null_mut();
-        let mut length = 0u32;
-        // A no-data control transfer has no transfer buffer to map. In the
-        // measured v6 run Get/SetLineCoding succeeded, but SetControlLineState
-        // (wLength zero) failed before publication to userspace.
-        if index != 0 || u16::from_le_bytes([bytes[6], bytes[7]]) != 0 {
-            let status = ude!(
-                UdecxUrbRetrieveBufferTableIndex,
-                PFN_UDECXURBRETRIEVEBUFFER,
-                request,
-                &mut buffer,
-                &mut length
-            )?;
-            if status < 0 {
-                return Err(status);
-            }
-        }
-        if index == 0 {
-            let requested = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
-            if requested > length {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            length = requested;
-        }
-        let s = unsafe { state(device) };
-        unsafe {
-            wdf!(WdfSpinLockAcquire, (*s).lock);
-            (*s).maximum_length[index] = (*s).maximum_length[index].max(length);
-            wdf!(WdfSpinLockRelease, (*s).lock);
-        }
-        if length as usize > LIMIT || (length != 0 && buffer.is_null()) {
-            return Err(STATUS_INVALID_BUFFER_SIZE);
-        }
-        let s = unsafe { state(device) };
-        // SAFETY: Mapping belongs to our live URB. No copying after publishing
-        // cancellation. The lock protects publication against FETCH/REPLY.
-        let status = unsafe {
-            wdf!(WdfSpinLockAcquire, (*s).lock);
-            let token = (*s).next_token.checked_add(1);
-            if (*s).closing != 0 {
-                wdf!(WdfSpinLockRelease, (*s).lock);
-                return Err(STATUS_CANCELLED);
-            }
-            if !(*s).slots[index].request.is_null() || token.is_none() {
-                wdf!(WdfSpinLockRelease, (*s).lock);
-                return Err(STATUS_DEVICE_BUSY);
-            }
-            let token = token.unwrap_or(0);
-            (*s).next_token = token;
-            let slot = ptr::addr_of_mut!((*s).slots[index]);
-            (*slot).token = token;
-            (*slot).length = length;
-            (*slot).input = u8::from(input);
-            (*slot).setup = bytes;
-            (*slot).fetched = 0;
-            if !input && length != 0 {
-                ptr::copy_nonoverlapping(buffer, (*slot).data.as_mut_ptr(), length as usize);
-            }
-            (*slot).request = request;
-            let context = request_state(request);
-            (*context).controller = device;
-            (*context).slot = index;
-            (*context).operation = 0;
-            (*s).submitted += 1;
-            (*s).admitted_by_endpoint[index] += 1;
-            // MarkCancelableEx never synchronously calls cancel on an already
-            // canceled request. A concurrent cancel waits for this lock; it
-            // cannot complete before publication is finished.
-            let status = wdf!(WdfRequestMarkCancelableEx, request, Some(cancel));
-            if status < 0 {
-                (*slot).request = ptr::null_mut();
-            }
-            wdf!(WdfSpinLockRelease, (*s).lock);
-            status
-        };
-        if status < 0 { Err(status) } else { Ok(()) }
-    })();
+    let result = unsafe { submit_urb(device, request, index) };
     if let Err(status) = result {
-        let s = unsafe { state(device) };
-        unsafe {
-            wdf!(WdfSpinLockAcquire, (*s).lock);
-            if index < ENDPOINT_COUNT {
-                (*s).last_urb_error[index] = status as u32;
-            }
-            wdf!(WdfSpinLockRelease, (*s).lock);
-            finish(device, request, status);
-        }
+        unsafe { finish(device, request, status) };
     }
 }
 
+// Passive callback, live request; no cancellation ownership is published yet.
+unsafe fn submit_urb(device: WDFDEVICE, request: WDFREQUEST, index: usize) -> Result<(), NTSTATUS> {
+    if index >= ENDPOINT_COUNT {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut setup = WDF_USB_CONTROL_SETUP_PACKET::default();
+    let mut bytes = [0u8; 8];
+    let input = if index == 0 {
+        let status = ude!(
+            UdecxUrbRetrieveControlSetupPacketTableIndex,
+            PFN_UDECXURBRETRIEVECONTROLSETUPPACKET,
+            request,
+            &mut setup
+        )?;
+        if status < 0 {
+            return Err(status);
+        }
+        // SAFETY: SDK union is exactly the eight USB setup packet bytes;
+        // copying object representation avoids unaligned field references.
+        unsafe {
+            ptr::copy_nonoverlapping(ptr::addr_of!(setup).cast::<u8>(), bytes.as_mut_ptr(), 8)
+        };
+        bytes[0] & 0x80 != 0
+    } else {
+        unsafe { (*state(device)).endpoints[index] & 0x80 != 0 }
+    };
+    let requested = if index == 0 {
+        u32::from(u16::from_le_bytes([bytes[6], bytes[7]]))
+    } else {
+        unsafe { bulk_length(request, input)? }
+    };
+    let mut buffer: *mut u8 = ptr::null_mut();
+    let mut length = 0u32;
+    // Zero-length transfers have no buffer to map.
+    if requested != 0 {
+        let status = ude!(
+            UdecxUrbRetrieveBufferTableIndex,
+            PFN_UDECXURBRETRIEVEBUFFER,
+            request,
+            &mut buffer,
+            &mut length
+        )?;
+        if status < 0 {
+            return Err(status);
+        }
+    }
+    if requested > length {
+        return Err(STATUS_INVALID_BUFFER_SIZE);
+    }
+    let length = requested;
+    if length as usize > LIMIT || (length != 0 && buffer.is_null()) {
+        return Err(STATUS_INVALID_BUFFER_SIZE);
+    }
+    unsafe { publish_urb(device, request, index, bytes, input, buffer, length) }
+}
+
+unsafe fn bulk_length(request: WDFREQUEST, input: bool) -> Result<u32, NTSTATUS> {
+    let mut parameters = WDF_REQUEST_PARAMETERS {
+        Size: mem::size_of::<WDF_REQUEST_PARAMETERS>() as u16,
+        ..Default::default()
+    };
+    // The mapped buffer can span more bytes than this URB requests
+    // (notably a partial storage read backed by a larger MDL).
+    // Preserve TransferBufferLength, rather than submitting its capacity.
+    unsafe {
+        wdf!(WdfRequestGetParameters, request, &mut parameters);
+        let header = parameters.Parameters.Others.Arg1.cast::<_URB_HEADER>();
+        if parameters.Type != _WDF_REQUEST_TYPE::WdfRequestTypeDeviceControlInternal
+            || header.is_null()
+            || (*header).Function != 0x0009 // URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER.
+            || usize::from((*header).Length) < mem::size_of::<_URB_BULK_OR_INTERRUPT_TRANSFER>()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let urb = header.cast::<_URB_BULK_OR_INTERRUPT_TRANSFER>();
+        if ((*urb).TransferFlags & 1 != 0) != input {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok((*urb).TransferBufferLength)
+    }
+}
+
+// The payload copy precedes MarkCancelableEx. After publication only the slot
+// lock and successful unmarking may grant completion ownership.
+unsafe fn publish_urb(
+    device: WDFDEVICE,
+    request: WDFREQUEST,
+    index: usize,
+    bytes: [u8; 8],
+    input: bool,
+    buffer: *mut u8,
+    length: u32,
+) -> Result<(), NTSTATUS> {
+    let s = unsafe { state(device) };
+    // SAFETY: Mapping belongs to our live URB. No copying after publishing
+    // cancellation. The lock protects publication against FETCH/REPLY.
+    let status = unsafe {
+        wdf!(WdfSpinLockAcquire, (*s).lock);
+        let token = (*s).next_token.checked_add(1);
+        if (*s).closing != 0 {
+            wdf!(WdfSpinLockRelease, (*s).lock);
+            return Err(STATUS_CANCELLED);
+        }
+        if !(*s).slots[index].request.is_null() || token.is_none() {
+            wdf!(WdfSpinLockRelease, (*s).lock);
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        let token = token.unwrap_or(0);
+        (*s).next_token = token;
+        let slot = ptr::addr_of_mut!((*s).slots[index]);
+        (*slot).token = token;
+        (*slot).length = length;
+        (*slot).input = u8::from(input);
+        (*slot).setup = bytes;
+        (*slot).fetched = 0;
+        if !input && length != 0 {
+            ptr::copy_nonoverlapping(buffer, (*slot).data.as_mut_ptr(), length as usize);
+        }
+        (*slot).request = request;
+        let context = request_state(request);
+        (*context).controller = device;
+        (*context).slot = index;
+        (*context).operation = 0;
+        (*s).submitted += 1;
+
+        // MarkCancelableEx never synchronously calls cancel on an already
+        // canceled request. A concurrent cancel waits for this lock; it
+        // cannot complete before publication is finished.
+        let status = wdf!(WdfRequestMarkCancelableEx, request, Some(cancel));
+        if status < 0 {
+            (*slot).request = ptr::null_mut();
+        }
+        notification::signal(s);
+        wdf!(WdfSpinLockRelease, (*s).lock);
+        status
+    };
+    if status < 0 { Err(status) } else { Ok(()) }
+}
+
 unsafe extern "C" fn queue_cleanup(object: WDFOBJECT) {
-    observe(QUEUE_CLEANUP);
     // SAFETY: WDF invokes queue cleanup at PASSIVE_LEVEL with its context live;
     // its endpoint parent chain keeps the controller context alive. No queue
     // methods or payload access after this callback returns.
@@ -742,25 +705,6 @@ unsafe fn endpoint_queue(endpoint: UDECXUSBENDPOINT) -> WDFQUEUE {
         .queue
     }
 }
-unsafe extern "C" fn start(endpoint: UDECXUSBENDPOINT) {
-    // SAFETY: UDE invokes start only after endpoint construction/queue binding.
-    // This resumes our own endpoint queue; no additional forwarded queues exist.
-    let queue = unsafe { endpoint_queue(endpoint) };
-    if queue.is_null() {
-        return;
-    }
-    let device = unsafe { wdf!(WdfIoQueueGetDevice, queue) };
-    let s = unsafe { state(device) };
-    let index = unsafe { queue_index(queue) };
-    unsafe {
-        wdf!(WdfSpinLockAcquire, (*s).lock);
-        if index < ENDPOINT_COUNT {
-            (*s).starts[index] += 1;
-        }
-        wdf!(WdfSpinLockRelease, (*s).lock);
-        // UdeCx owns queue start/purge state. Do not start its queue manually.
-    }
-}
 unsafe extern "C" fn reset(endpoint: UDECXUSBENDPOINT, request: WDFREQUEST) {
     let queue = unsafe { endpoint_queue(endpoint) };
     if queue.is_null() {
@@ -770,13 +714,6 @@ unsafe extern "C" fn reset(endpoint: UDECXUSBENDPOINT, request: WDFREQUEST) {
     let device = unsafe { wdf!(WdfIoQueueGetDevice, queue) };
     let s = unsafe { state(device) };
     let index = unsafe { queue_index(queue) };
-    unsafe {
-        wdf!(WdfSpinLockAcquire, (*s).lock);
-        if index < ENDPOINT_COUNT {
-            (*s).resets[index] += 1;
-        }
-        wdf!(WdfSpinLockRelease, (*s).lock);
-    }
 
     // Endpoint halt recovery must reach the physical device, not just the
     // local virtual pipe. USB/IP has no independent bus-reset wire operation.
@@ -886,6 +823,7 @@ unsafe fn forward_control(device: WDFDEVICE, request: WDFREQUEST, setup: [u8; 8]
             }
             result
         };
+        notification::signal(s);
         wdf!(WdfSpinLockRelease, (*s).lock);
         result
     };
@@ -932,7 +870,9 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             match (*s).speed {
                 1 => _UDECX_USB_DEVICE_SPEED::UdecxUsbLowSpeed,
                 2 => _UDECX_USB_DEVICE_SPEED::UdecxUsbFullSpeed,
-                _ => _UDECX_USB_DEVICE_SPEED::UdecxUsbHighSpeed,
+                3 => _UDECX_USB_DEVICE_SPEED::UdecxUsbHighSpeed,
+                5 | 6 => _UDECX_USB_DEVICE_SPEED::UdecxUsbSuperSpeed,
+                _ => return Err(STATUS_INVALID_PARAMETER),
             }
         )?;
         ude!(
@@ -950,7 +890,14 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
                 unsafe { ptr::addr_of_mut!((*s).physical_configuration).cast::<u8>() },
                 unsafe { (*s).physical_length },
             ),
+            (
+                unsafe { ptr::addr_of_mut!((*s).physical_bos).cast::<u8>() },
+                unsafe { (*s).bos_length },
+            ),
         ] {
+            if length == 0 {
+                continue;
+            }
             let status = ude!(
                 UdecxUsbDeviceInitAddDescriptorTableIndex,
                 PFN_UDECXUSBDEVICEINITADDDESCRIPTOR,
@@ -968,8 +915,6 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             SynchronizationScope:
                 _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
             ContextTypeInfo: ptr::addr_of!(CHILD_TYPE),
-            EvtCleanupCallback: Some(child_cleanup_observation),
-            EvtDestroyCallback: Some(child_destroy_observation),
             ..Default::default()
         };
         let status = ude!(
@@ -982,7 +927,7 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
         if status < 0 {
             return Err(status);
         }
-        observe(CHILD_CREATED);
+
         unsafe {
             (*wdf!(
                 WdfObjectGetTypedContextWorker,
@@ -992,11 +937,20 @@ unsafe fn create_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             .cast::<ChildState>())
             .controller = device;
         }
+        // Select the root port matching the physical speed.
+        let superspeed = unsafe { (*s).speed >= 5 };
+        let mut plug = UDECX_USB_DEVICE_PLUG_IN_OPTIONS {
+            Size: structure_size::<UDECX_USB_DEVICE_PLUG_IN_OPTIONS>(),
+            Usb20PortNumber: if superspeed { 0 } else { 1 },
+            // Root-hub numbering is shared across speed groups: port 1 is
+            // USB2 and port 2 is USB3 (one port in each configured group).
+            Usb30PortNumber: if superspeed { 2 } else { 0 },
+        };
         let status = ude!(
             UdecxUsbDevicePlugInTableIndex,
             PFN_UDECXUSBDEVICEPLUGIN,
             (*s).child,
-            ptr::null_mut()
+            &mut plug
         )?;
         if status < 0 {
             Err(status)
@@ -1055,8 +1009,6 @@ unsafe fn create_endpoint(
         let mut callbacks = UDECX_USB_ENDPOINT_CALLBACKS {
             Size: structure_size::<UDECX_USB_ENDPOINT_CALLBACKS>(),
             EvtUsbEndpointReset: Some(reset),
-            // UdeCx owns queue state; start only records a lifecycle observation.
-            EvtUsbEndpointStart: Some(start),
             ..Default::default()
         };
         ude!(
@@ -1072,8 +1024,6 @@ unsafe fn create_endpoint(
             SynchronizationScope:
                 _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
             ContextTypeInfo: ptr::addr_of!(ENDPOINT_TYPE),
-            EvtCleanupCallback: Some(endpoint_cleanup_observation),
-            EvtDestroyCallback: Some(endpoint_destroy_observation),
             ..Default::default()
         };
         let status = ude!(
@@ -1086,7 +1036,7 @@ unsafe fn create_endpoint(
         if status < 0 {
             return Err(status);
         }
-        observe(ENDPOINT_CREATED);
+
         // Queue lifetime follows the endpoint, not the detach IOCTL. UDE may
         // issue release callbacks after PlugOutAndDelete returns.
         let mut config = WDF_IO_QUEUE_CONFIG {
@@ -1104,7 +1054,6 @@ unsafe fn create_endpoint(
             ContextTypeInfo: ptr::addr_of!(QUEUE_TYPE),
             ParentObject: endpoint.cast(),
             EvtCleanupCallback: Some(queue_cleanup),
-            EvtDestroyCallback: Some(queue_destroy_observation),
             ..Default::default()
         };
         let mut queue: WDFQUEUE = ptr::null_mut();
@@ -1120,29 +1069,17 @@ unsafe fn create_endpoint(
         if status < 0 {
             return Err(status);
         }
-        observe(QUEUE_CREATED);
+
         unsafe {
-            (*wdf!(
+            let context = wdf!(
                 WdfObjectGetTypedContextWorker,
                 queue.cast(),
                 ptr::addr_of!(QUEUE_TYPE)
             )
-            .cast::<QueueState>())
-            .index = index;
-            (*wdf!(
-                WdfObjectGetTypedContextWorker,
-                queue.cast(),
-                ptr::addr_of!(QUEUE_TYPE)
-            )
-            .cast::<QueueState>())
-            .storage = storage;
-            (*wdf!(
-                WdfObjectGetTypedContextWorker,
-                queue.cast(),
-                ptr::addr_of!(QUEUE_TYPE)
-            )
-            .cast::<QueueState>())
-            .controller = device;
+            .cast::<QueueState>();
+            (*context).index = index;
+            (*context).storage = storage;
+            (*context).controller = device;
             wdf!(WdfSpinLockAcquire, (*s).lock);
             (*s).queues[storage] = queue;
             wdf!(WdfSpinLockRelease, (*s).lock);
@@ -1201,7 +1138,6 @@ unsafe fn mark_default_added(child: UDECXUSBDEVICE, device: WDFDEVICE) {
         .default_added = 1;
         wdf!(WdfSpinLockRelease, (*s).lock);
     }
-    observe(DEFAULT_ADDED);
 }
 unsafe extern "C" fn default_endpoint_add(
     child: UDECXUSBDEVICE,
@@ -1219,7 +1155,7 @@ unsafe extern "C" fn default_endpoint_add(
         // under the same lock before invoking the consuming disconnect API.
         unsafe { mark_default_added(child, device) };
     }
-    unsafe { initialization_stage(device, 20, status) };
+
     status
 }
 unsafe extern "C" fn endpoint_add(
@@ -1250,7 +1186,7 @@ unsafe extern "C" fn endpoint_add(
     let status = unsafe { create_endpoint(device, &mut init, index, address) }
         .err()
         .unwrap_or(STATUS_SUCCESS);
-    unsafe { initialization_stage(device, 20 + index as u32, status) };
+
     status
 }
 unsafe extern "C" fn endpoints_configure(
@@ -1278,16 +1214,12 @@ unsafe extern "C" fn endpoints_configure(
             {
                 STATUS_INVALID_PARAMETER
             } else {
-                // Released endpoints are no longer used by UDE. Retire only
-                // the callback-owned endpoint's still-live queue. Detach must
-                // never delete it ahead of this callback.
-                for i in 0..(*parameters).ReleasedEndpointsCount as usize {
-                    let endpoint = (*parameters).ReleasedEndpoints.add(i).read();
-                    let context = wdf!(WdfObjectGetTypedContextWorker, endpoint.cast(), ptr::addr_of!(ENDPOINT_TYPE)).cast::<EndpointState>();
-                    let queue = (*context).queue;
-                    (*context).queue = ptr::null_mut();
-                    if !queue.is_null() { wdf!(WdfObjectDelete, queue.cast()); }
-                }
+                // Release is a configuration notification, not destruction.
+                // UdeCx/UCX can still purge these queues during device recovery.
+                // Deleting one here makes that later purge bugcheck with
+                // STATUS_DELETE_PENDING.
+                // The endpoint parent owns final queue retirement; its cleanup
+                // callback clears our bounded tracking entry.
                 STATUS_SUCCESS
             }
         }
@@ -1305,20 +1237,21 @@ unsafe fn allowed_setting(device: WDFDEVICE, interface: u8, alternate: u8) -> bo
     // Immutable descriptor storage until all callbacks retire; no allocation.
     let s = unsafe { state(device) };
     let topology = unsafe {
-        super::descriptors::validate(
+        descriptors::validate(
             &(*s).physical_device,
             &(&(*s).physical_configuration)[..(*s).physical_length],
-            match super::descriptors::Speed::try_from((*s).speed) {
+            match descriptors::Speed::try_from((*s).speed) {
                 Ok(speed) => speed,
                 Err(_) => return false,
             },
         )
     };
     topology.is_ok_and(|t| {
-        t.settings
-            .iter()
-            .flatten()
-            .any(|setting| setting.interface == interface && setting.alternate == alternate)
+        t.settings.iter().flatten().any(|setting| {
+            setting.interface == interface
+                && setting.alternate == alternate
+                && setting.stream_endpoints == 0
+        })
     })
 }
 
@@ -1333,6 +1266,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
     unsafe {
         wdf!(WdfSpinLockAcquire, (*s).lock);
         (*s).closing = 1;
+        notification::signal(s);
         for (index, output) in owned.iter_mut().enumerate() {
             let request = (*s).slots[index].request;
             if request.is_null() {
@@ -1344,7 +1278,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             if status >= 0 {
                 (*s).slots[index].request = ptr::null_mut();
                 (*s).canceled += 1;
-                (*s).canceled_by_endpoint[index] += 1;
+
                 *output = request;
             } else if status != STATUS_CANCELLED {
                 failure = status;
@@ -1394,7 +1328,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
                 wdf!(WdfObjectDelete, child.cast());
                 (*s).child = ptr::null_mut();
             }
-            observe(UNPUBLISHED_DELETED);
+
             return Ok(());
         }
         loop {
@@ -1414,7 +1348,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
             if ready {
                 break;
             }
-            // Original lab readiness policy: stay within the documented live
+            // Stay within the documented live
             // handle lifetime instead of deleting it again after disconnect.
             // UDE endpoint callbacks do not acquire our passive owner gate.
             if remaining_waits == 0 {
@@ -1426,7 +1360,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
                 let _ = wdk_sys::ntddk::KeDelayExecutionThread(0, 0, &mut delay);
             }
         }
-        observe(PLUGOUT_CALLS);
+
         let status = ude!(
             UdecxUsbDevicePlugOutAndDeleteTableIndex,
             PFN_UDECXUSBDEVICEPLUGOUTANDDELETE,
@@ -1435,7 +1369,7 @@ unsafe fn remove_child(device: WDFDEVICE) -> Result<(), NTSTATUS> {
         if status < 0 {
             return Err(status);
         }
-        observe(PLUGOUT_SUCCEEDED);
+
         unsafe {
             (*s).child = ptr::null_mut();
             (*s).child_published = 0;
@@ -1483,6 +1417,7 @@ unsafe extern "C" fn file_cleanup(file: WDFFILEOBJECT) {
         return;
     }
     if unsafe { (*s).owner == file } {
+        unsafe { notification::clear(s) };
         let result = unsafe { remove_child(device) };
         // Never retain a retiring file handle as authorization identity. Failed
         // cleanup quarantines this controller until owned devnode removal.
@@ -1506,6 +1441,7 @@ unsafe extern "C" fn device_cleanup(object: WDFOBJECT) {
         if status < 0 {
             return;
         }
+        unsafe { notification::clear(s) };
         let _ = unsafe { remove_child(device) };
         unsafe { wdf!(WdfWaitLockRelease, (*s).gate) };
     }
@@ -1516,474 +1452,6 @@ unsafe extern "C" fn device_cleanup(object: WDFOBJECT) {
     }
 }
 
-// These functions parse fixed offsets, never cast untrusted data to a Rust
-// reference or trust an advertised length. METHOD_BUFFERED gives live kernel
-// buffers for this owned IOCTL only; maximum copied data is HEADER + LIMIT.
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-fn token_at(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]))
-}
-
-/// # Safety
-/// Own passive controller queue, live request. Returns true only if completed.
-// Keep descriptor parsing off the dispatch/removal stack. UDE removal can
-// synchronously recurse through the native hub and registry paths.
-#[inline(never)]
-unsafe fn store_descriptors(
-    s: *mut State,
-    request: WDFREQUEST,
-    input: usize,
-) -> Result<(), NTSTATUS> {
-    if !(20 + 18 + 9..=20 + 18 + 4096).contains(&input) {
-        return Err(STATUS_INVALID_BUFFER_SIZE);
-    }
-    let mut pointer: PVOID = ptr::null_mut();
-    let status = unsafe {
-        wdf!(
-            WdfRequestRetrieveInputBuffer,
-            request,
-            input,
-            &mut pointer,
-            ptr::null_mut()
-        )
-    };
-    if status < 0 {
-        return Err(status);
-    }
-    // SAFETY: WDF validates the input buffer size, fixed fields are
-    // checked before slicing; no network parser lives in the kernel.
-    let bytes = unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), input) };
-    let config_len = u32_at(bytes, 16) as usize;
-    if &bytes[..4] != b"KBWD"
-        || u32_at(bytes, 4) != 1
-        || u32_at(bytes, 12) != 18
-        || config_len > 4096
-        || 38usize.checked_add(config_len) != Some(input)
-    {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    let physical = super::descriptors::validate(
-        &bytes[20..38],
-        &bytes[38..],
-        super::descriptors::Speed::try_from(u32_at(bytes, 8))
-            .map_err(|_| STATUS_INVALID_PARAMETER)?,
-    )
-    .map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let mut endpoints = [0u8; ENDPOINT_COUNT];
-    for (i, endpoint) in physical.endpoints.iter().flatten().enumerate() {
-        endpoints[i + 1] = endpoint.address;
-    }
-    // SAFETY: No child or owner exists; passive gate excludes attach
-    // and cleanup. These arrays remain immutable while published.
-    unsafe {
-        (*s).physical_device.copy_from_slice(&bytes[20..38]);
-        (&mut (*s).physical_configuration)[..config_len].copy_from_slice(&bytes[38..]);
-        (*s).physical_length = config_len;
-        (*s).speed = u32_at(bytes, 8);
-        (*s).endpoints = endpoints;
-    }
-    Ok(())
-}
-#[inline(never)]
-unsafe fn attach_physical(
-    device: WDFDEVICE,
-    request: WDFREQUEST,
-    file: WDFFILEOBJECT,
-    output: usize,
-    input: usize,
-) -> Result<usize, NTSTATUS> {
-    let s = unsafe { state(device) };
-    if output != 0 {
-        return Err(STATUS_INVALID_BUFFER_SIZE);
-    }
-    if !unsafe { super::filter::ready(device) } {
-        return Err(STATUS_DEVICE_NOT_READY);
-    }
-    if unsafe { !(*s).owner.is_null() || !(*s).child.is_null() } {
-        return Err(STATUS_DEVICE_BUSY);
-    }
-    unsafe { store_descriptors(s, request, input) }?;
-    unsafe {
-        wdf!(WdfSpinLockAcquire, (*s).lock);
-        (*s).closing = 0;
-        wdf!(WdfSpinLockRelease, (*s).lock);
-        (*s).owner = file;
-    }
-    if let Err(status) = unsafe { create_child(device) } {
-        if unsafe { (*s).child.is_null() } {
-            unsafe { (*s).owner = ptr::null_mut() };
-        }
-        return Err(status);
-    }
-    return Ok(0);
-}
-
-pub(super) unsafe fn ioctl(
-    device: WDFDEVICE,
-    request: WDFREQUEST,
-    output: usize,
-    input: usize,
-    code: u32,
-) -> bool {
-    if ![
-        ATTACH_PHYSICAL,
-        FETCH,
-        REPLY,
-        DETACH,
-        STATS,
-        LIFECYCLE,
-        RETIREMENT_READY,
-    ]
-    .contains(&code)
-    {
-        return false;
-    }
-    let s = unsafe { state(device) };
-    // SAFETY: Private interface is exposed only after gate initialization.
-    let status = unsafe { wdf!(WdfWaitLockAcquire, (*s).gate, ptr::null_mut()) };
-    if status < 0 {
-        unsafe { wdf!(WdfRequestComplete, request, status) };
-        return true;
-    }
-    let result = (|| -> Result<usize, NTSTATUS> {
-        if unsafe { (*s).quarantined != 0 } && code != LIFECYCLE {
-            return Err(STATUS_DEVICE_NOT_READY);
-        }
-        let file = unsafe { wdf!(WdfRequestGetFileObject, request) };
-        if file.is_null() {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        if code == RETIREMENT_READY {
-            if input != 0 || output != 0 {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            return if unsafe { (*s).retirement.bound() } {
-                Ok(0)
-            } else {
-                Err(STATUS_NOT_SUPPORTED)
-            };
-        }
-        if code == LIFECYCLE {
-            if input != 0 || output != 128 {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            // Metadata-only lab observations remain readable after detach.
-            // An attached child's owner still excludes every other file.
-            if unsafe { !(*s).owner.is_null() && (*s).owner != file } {
-                return Err(STATUS_ACCESS_DENIED);
-            }
-            let mut buffer: PVOID = ptr::null_mut();
-            let status = unsafe {
-                wdf!(
-                    WdfRequestRetrieveOutputBuffer,
-                    request,
-                    128usize,
-                    &mut buffer,
-                    ptr::null_mut()
-                )
-            };
-            if status < 0 {
-                return Err(status);
-            }
-            let mut values = [0u64; 16];
-            values[0] = 1;
-            for (i, counter) in LIFETIMES.iter().enumerate() {
-                values[i + 1] = counter.load(Ordering::Relaxed);
-            }
-            unsafe {
-                wdf!(WdfSpinLockAcquire, (*s).lock);
-                values[15] = (*s).queues.iter().enumerate().fold(0, |mask, (i, q)| {
-                    mask | if q.is_null() { 0 } else { 1 << i }
-                });
-                wdf!(WdfSpinLockRelease, (*s).lock);
-            }
-            // SAFETY: WDF owns the validated 128-byte output for this call;
-            // encode fields individually, with no pointers or borrowed data.
-            let bytes = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), 128) };
-            for (i, value) in values.iter().enumerate() {
-                bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
-            }
-            return Ok(128);
-        }
-        if code == ATTACH_PHYSICAL {
-            return unsafe { attach_physical(device, request, file, output, input) };
-        }
-        if unsafe { (*s).owner != file } {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        if code == DETACH {
-            if input != 0 || output != 0 {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            unsafe { remove_child(device) }?;
-            unsafe { (*s).owner = ptr::null_mut() };
-            return Ok(0);
-        }
-        if code == FETCH || code == STATS {
-            let needed = if code == FETCH {
-                HEADER + LIMIT
-            } else {
-                STATS_BYTES
-            };
-            if (input != 0 && (code != FETCH || input != 4))
-                || output < needed
-                || output > HEADER + LIMIT
-            {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            let mask = if input == 4 {
-                let mut pointer: PVOID = ptr::null_mut();
-                let status = unsafe {
-                    wdf!(
-                        WdfRequestRetrieveInputBuffer,
-                        request,
-                        4usize,
-                        &mut pointer,
-                        ptr::null_mut()
-                    )
-                };
-                if status < 0 {
-                    return Err(status);
-                }
-                // Copy before overwriting the shared METHOD_BUFFERED buffer.
-                let mask = unsafe { ptr::read_unaligned(pointer.cast::<u32>()) };
-                if mask == 0 || mask & !(u32::MAX >> 1) != 0 {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
-                mask
-            } else {
-                u32::MAX >> 1
-            };
-            let mut buffer: PVOID = ptr::null_mut();
-            let status = unsafe {
-                wdf!(
-                    WdfRequestRetrieveOutputBuffer,
-                    request,
-                    needed,
-                    &mut buffer,
-                    ptr::null_mut()
-                )
-            };
-            if status < 0 {
-                return Err(status);
-            }
-            unsafe { wdf!(WdfSpinLockAcquire, (*s).lock) };
-            if code == STATS {
-                let mut values = [0u64; 8 + ENDPOINT_COUNT];
-                unsafe {
-                    values[..8].copy_from_slice(&[
-                        1,
-                        (*s).submitted,
-                        (*s).completed,
-                        (*s).canceled,
-                        (*s).rejected,
-                        (*s).dpc_wrong_irql,
-                        (*s).next_token,
-                        (0..ENDPOINT_COUNT).fold(0, |mask, i| {
-                            mask | if (*s).slots[i].request.is_null() {
-                                0
-                            } else {
-                                1u64 << i
-                            }
-                        }),
-                    ]);
-                    for i in 0..ENDPOINT_COUNT {
-                        values[8 + i] = (*s).slots[i].token;
-                    }
-                }
-                for (i, value) in values.iter().enumerate() {
-                    // Initialize every returned byte; no read of the OS buffer.
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            value.to_le_bytes().as_ptr(),
-                            buffer.cast::<u8>().add(i * 8),
-                            8,
-                        )
-                    };
-                }
-                unsafe { wdf!(WdfSpinLockRelease, (*s).lock) };
-                return Ok(STATS_BYTES);
-            }
-            for offset in 0..ENDPOINT_COUNT {
-                let index = (unsafe { (*s).next_fetch } + offset) % ENDPOINT_COUNT;
-                if mask & (1 << index) == 0 {
-                    continue;
-                }
-                let slot = unsafe { ptr::addr_of_mut!((*s).slots[index]) };
-                if unsafe { !(*slot).request.is_null() && (*slot).fetched == 0 } {
-                    let length = unsafe { (*slot).length as usize };
-                    let payload = if unsafe { (*slot).input } != 0 {
-                        0
-                    } else {
-                        length
-                    };
-                    // Initialize only the returned header and payload. Never
-                    // form a byte slice over the unused METHOD_BUFFERED tail.
-                    unsafe { ptr::write_bytes(buffer.cast::<u8>(), 0, HEADER) };
-                    let out =
-                        unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), HEADER) };
-                    out[0..4].copy_from_slice(&1u32.to_le_bytes());
-                    out[4..8]
-                        .copy_from_slice(&(unsafe { (*s).endpoints[index] } as u32).to_le_bytes());
-                    out[8..16].copy_from_slice(&unsafe { (*slot).token }.to_le_bytes());
-                    out[16..20].copy_from_slice(&(length as u32).to_le_bytes());
-                    out[20..24].copy_from_slice(&(payload as u32).to_le_bytes());
-                    out[24..32].copy_from_slice(&unsafe { (*slot).setup });
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            (*slot).data.as_ptr(),
-                            buffer.cast::<u8>().add(HEADER),
-                            payload,
-                        );
-                        (*slot).fetched = 1;
-                        (*s).next_fetch = (index + 1) % ENDPOINT_COUNT;
-                        (*s).fetched_by_endpoint[index] += 1;
-                        wdf!(WdfSpinLockRelease, (*s).lock);
-                    }
-                    return Ok(HEADER + payload);
-                }
-            }
-            unsafe { wdf!(WdfSpinLockRelease, (*s).lock) };
-            return Ok(0); // Nonblocking bounded poll, no pended userspace IOCTL.
-        }
-        if output != 0 || !(HEADER..=HEADER + LIMIT).contains(&input) {
-            return Err(STATUS_INVALID_BUFFER_SIZE);
-        }
-        let mut buffer: PVOID = ptr::null_mut();
-        let status = unsafe {
-            wdf!(
-                WdfRequestRetrieveInputBuffer,
-                request,
-                HEADER,
-                &mut buffer,
-                ptr::null_mut()
-            )
-        };
-        if status < 0 {
-            return Err(status);
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), input) };
-        let addresses = unsafe { (*s).endpoints };
-        let index = addresses
-            .iter()
-            .position(|ep| u32::from(*ep) == u32_at(bytes, 4))
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        let completed = u32_at(bytes, 16) as usize;
-        let payload = u32_at(bytes, 20) as usize;
-        let reply_status = u32_at(bytes, 24);
-        if u32_at(bytes, 0) != 1
-            || payload > LIMIT
-            || HEADER.checked_add(payload) != Some(input)
-            || reply_status > 2
-            || bytes[28..32] != [0; 4]
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        // SAFETY: Slot ownership and cancellation share this short spin lock.
-        // Unmark does not wait for cancel. STATUS_CANCELLED leaves sole ownership
-        // with cancel, which cannot complete until after releasing this lock.
-        let owned = unsafe {
-            wdf!(WdfSpinLockAcquire, (*s).lock);
-            let slot = ptr::addr_of_mut!((*s).slots[index]);
-            if (*slot).request.is_null() || (*slot).token != token_at(bytes) || (*slot).fetched == 0
-            {
-                wdf!(WdfSpinLockRelease, (*s).lock);
-                return Err(STATUS_NOT_FOUND);
-            }
-            if completed > (*slot).length as usize
-                || (reply_status != 0 && (completed != 0 || payload != 0))
-                || ((*slot).input != 0 && completed != payload)
-                || ((*slot).input == 0 && payload != 0)
-            {
-                wdf!(WdfSpinLockRelease, (*s).lock);
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            let owned = (*slot).request;
-            let status = wdf!(WdfRequestUnmarkCancelable, owned);
-            if status < 0 {
-                wdf!(WdfSpinLockRelease, (*s).lock);
-                return Err(status);
-            }
-            (*slot).request = ptr::null_mut();
-            let input = (*slot).input != 0;
-            wdf!(WdfSpinLockRelease, (*s).lock);
-            (owned, input)
-        };
-        let result = (|| -> Result<(), NTSTATUS> {
-            let (urb, input) = owned;
-            if reply_status != 0 {
-                return Err(if reply_status == 1 {
-                    STATUS_NOT_SUPPORTED
-                } else {
-                    STATUS_IO_DEVICE_ERROR
-                });
-            }
-            if unsafe { (*request_state(urb)).operation != 0 } {
-                return if completed == 0 && payload == 0 {
-                    Ok(())
-                } else {
-                    Err(STATUS_INVALID_PARAMETER)
-                };
-            }
-            let mut target: *mut u8 = ptr::null_mut();
-            let mut length = 0u32;
-            if completed != 0 {
-                let status = ude!(
-                    UdecxUrbRetrieveBufferTableIndex,
-                    PFN_UDECXURBRETRIEVEBUFFER,
-                    urb,
-                    &mut target,
-                    &mut length
-                )?;
-                if status < 0 {
-                    return Err(status);
-                }
-            }
-            if completed > length as usize || (completed != 0 && target.is_null()) {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            if input && completed != 0 {
-                // SAFETY: Exclusive URB and mapped buffer, both checked lengths;
-                // independent IOCTL buffer cannot overlap this kernel URB data.
-                unsafe { ptr::copy_nonoverlapping(bytes[HEADER..].as_ptr(), target, completed) };
-            }
-            ude!(
-                UdecxUrbSetBytesCompletedTableIndex,
-                PFN_UDECXURBSETBYTESCOMPLETED,
-                urb,
-                completed as u32
-            )?;
-            Ok(())
-        })();
-        unsafe { finish(device, owned.0, result.err().unwrap_or(STATUS_SUCCESS)) };
-        Ok(0)
-    })();
-    let (status, information) = match result {
-        Ok(n) => (STATUS_SUCCESS, n),
-        Err(e) => (e, 0),
-    };
-    if status < 0 {
-        unsafe {
-            wdf!(WdfSpinLockAcquire, (*s).lock);
-            (*s).rejected += 1;
-            wdf!(WdfSpinLockRelease, (*s).lock);
-        }
-    }
-    unsafe {
-        wdf!(WdfWaitLockRelease, (*s).gate);
-        wdf!(
-            WdfRequestCompleteWithInformation,
-            request,
-            status,
-            information as ULONG_PTR
-        );
-    }
-    true
-}
+mod ioctl;
+mod notification;
+pub(super) use ioctl::ioctl;

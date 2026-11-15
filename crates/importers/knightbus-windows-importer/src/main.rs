@@ -1,87 +1,55 @@
-//! Explicit development runner; production authentication/CLI hosting is later.
+//! Standalone importer over an explicitly authorized raw USB/IP connection.
+#[cfg(any(windows, test))]
+mod options;
+
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use knightbus_core::{Budget, ResourceLimits, SessionId, usbip::WireString};
-    use knightbus_windows_importer::{
-        backend::Backend,
-        native::Controller,
-        transport::{Forwarder, Wire},
-    };
+    use knightbus_core::{Budget, ResourceLimits, SessionId};
+    use knightbus_windows_importer::{backend, native::Controller};
     use std::{
-        net::{SocketAddr, TcpStream},
+        net::TcpStream,
         task::Poll,
         time::{Duration, Instant},
     };
-    const MAX_LAB_SECONDS: u64 = 300;
-    const LAB_LIMITS: ResourceLimits = ResourceLimits {
-        bytes: 16 * 1024 * 1024,
+    const RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
+        bytes: 96 * 1024 * 1024,
         requests: 64,
     };
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-    const TICK_INTERVAL: Duration = Duration::from_millis(1);
-    const MODE_ARG: usize = 0;
-    const ADDRESS_ARG: usize = 1;
-    const BUS_ARG: usize = 2;
-    const SECONDS_ARG: usize = 3;
-    const REQUIRED_ARGS: usize = 4;
-    const CONTROLLER_ARG: usize = REQUIRED_ARGS;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !(REQUIRED_ARGS..=REQUIRED_ARGS + 1).contains(&args.len())
-        || args[MODE_ARG] != "--insecure-lab"
-    {
-        return Err("usage: knightbus-windows-importer --insecure-lab ADDRESS:PORT BUS_ID SECONDS [CONTROLLER_INSTANCE]; raw USB/IP has no peer authentication".into());
-    }
-    let address: SocketAddr = args[ADDRESS_ARG].parse()?;
-    let bus = WireString::new(args[BUS_ARG].as_bytes())?;
-    let seconds: u64 = args[SECONDS_ARG].parse()?;
-    if !(1..=MAX_LAB_SECONDS).contains(&seconds) {
-        return Err(format!("lab duration must be 1..{MAX_LAB_SECONDS} seconds").into());
-    }
-    eprintln!(
-        "Development-only raw USB/IP: unauthenticated peer; use only the isolated test lab or an authenticated tunnel."
-    );
-    let budget = Budget::new(LAB_LIMITS);
+    let options = options::Options::parse(&std::env::args().skip(1).collect::<Vec<_>>())?;
+    eprintln!("Raw USB/IP does not authenticate peers; use an authenticated tunnel.");
+    let budget = Budget::new(RESOURCE_LIMITS);
     let timeout = REQUEST_TIMEOUT;
-    let mut wire = Wire::new(
-        TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?,
-        budget.clone(),
-        timeout,
-    )?;
-    let (device, descriptors) = wire.import(bus)?;
-    eprintln!(
-        "Imported descriptors {:04x}:{:04x}, speed {}, {} interfaces",
-        device.device().wire.vendor_id,
-        device.device().wire.product_id,
-        device.device().wire.speed,
-        descriptors.topology.interfaces
-    );
-    let instance = args.get(CONTROLLER_ARG).cloned();
-    let backend = Backend::new(
-        move || match instance.as_deref() {
-            Some(id) => Controller::open(Some(id)),
-            None => Ok(Controller::owned()),
-        },
-        descriptors,
-        budget.clone(),
-    )?;
     let session = SessionId {
         epoch: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos() as u64,
         serial: 1,
     };
-    let mut forwarding = Forwarder::new(backend, wire, device, session, budget.clone(), timeout)?;
+    let mut forwarding = backend::connect(
+        TcpStream::connect_timeout(&options.address, CONNECT_TIMEOUT)?,
+        options.bus,
+        session,
+        budget.clone(),
+        timeout,
+        || Ok(Controller::owned()),
+    )?;
+    let device = forwarding.device().ok_or(knightbus_core::Error::State)?;
+    eprintln!(
+        "Imported descriptors {:04x}:{:04x}, speed {}, {} interfaces",
+        device.wire.vendor_id, device.wire.product_id, device.wire.speed, device.wire.interfaces
+    );
     let start = Instant::now();
     loop {
-        if start.elapsed() >= Duration::from_secs(seconds) {
+        if options.stop.requested(start) {
             forwarding.disconnect();
         }
         if let Poll::Ready(result) = forwarding.tick() {
             result?;
             break;
         }
-        std::thread::sleep(TICK_INTERVAL);
+        forwarding.wait();
     }
     drop(forwarding);
     // The worker publishes retirement after its native owners have been dropped.
