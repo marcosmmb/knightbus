@@ -1851,3 +1851,56 @@ fn every_admitted_permission_list_fits_the_control_protocol() {
         .unwrap();
     grant(&mut engine, KEY, peer(MAX_DEVICE_GRANTS));
 }
+
+#[test]
+fn unshare_notifies_only_administrators_and_former_grantees() {
+    let (mut e, _, _) = fixture(Config::default());
+    let former = Caller {
+        peer: OTHER,
+        administrator: false,
+    };
+    grant(&mut e, KEY, OTHER);
+    let subscribe = |e: &mut Engine<Mock, Time>, caller| {
+        let Reply::Subscription(id) = e.execute(caller, Command::Subscribe, END).unwrap() else {
+            panic!()
+        };
+        id
+    };
+    let hidden = subscribe(&mut e, USER);
+    let affected = subscribe(&mut e, former);
+    let admin = subscribe(&mut e, ADMIN);
+    assert_eq!(
+        e.execute(USER, Command::List, END),
+        Ok(Reply::Devices(vec![]))
+    );
+    e.execute(ADMIN, Command::Unshare(KEY), END).unwrap();
+    for (caller, subscription) in [(ADMIN, admin), (former, affected)] {
+        assert_eq!(
+            e.execute(caller, Command::Poll(subscription), END),
+            Ok(Reply::Event(Some(Event {
+                sequence: 1,
+                kind: EventKind::Inventory,
+                session: None,
+            })))
+        );
+    }
+    assert_eq!(
+        e.execute(USER, Command::Poll(hidden), END),
+        Ok(Reply::Event(None))
+    );
+    // Hidden activity must not leave a gap in this peer's sequence.
+    grant(&mut e, KEY, PEER);
+    assert_eq!(
+        e.execute(USER, Command::Poll(hidden), END),
+        Ok(Reply::Event(Some(Event {
+            sequence: 1,
+            kind: EventKind::Inventory,
+            session: None,
+        })))
+    );
+    e.execute(ADMIN, Command::Unshare(KEY), END).unwrap();
+    assert_eq!(
+        e.execute(former, Command::Poll(affected), END),
+        Ok(Reply::Event(None))
+    );
+}

@@ -31,7 +31,7 @@ pub trait Driver: Send + 'static {
 /// Connect the Windows channel to USB/IP discovery and forwarding.
 pub fn connect<D: Driver>(
     stream: knightbus_transport::Stream,
-    bus: knightbus_core::usbip::WireString<32>,
+    bus: knightbus_core::usbip::WireString<{ knightbus_core::usbip::BUS_ID_BYTES }>,
     session: knightbus_core::SessionId,
     budget: Budget,
     timeout: std::time::Duration,
@@ -40,6 +40,27 @@ pub fn connect<D: Driver>(
     knightbus_transport::importer::connect(stream, bus, session, budget, timeout, move |_| {
         Ok(Channel::new(factory()?))
     })
+}
+
+/// Connect with a deadline/cancellation scope shared by all bootstrap exchanges.
+pub fn connect_until<D: Driver, F: FnOnce() -> Result<D> + Send + 'static>(
+    stream: knightbus_transport::Stream,
+    bus: knightbus_core::usbip::WireString<{ knightbus_core::usbip::BUS_ID_BYTES }>,
+    session: knightbus_core::SessionId,
+    budget: Budget,
+    timeout: std::time::Duration,
+    operation: &knightbus_transport::operation::Operation<'_>,
+    factory: F,
+) -> Result<knightbus_transport::importer::Forwarder<impl ImporterBackend + use<D, F>>> {
+    knightbus_transport::importer::connect_until(
+        stream,
+        bus,
+        session,
+        budget,
+        timeout,
+        operation,
+        move |_| Ok(Channel::new(factory()?)),
+    )
 }
 
 /// Bind the UDE channel to the importer worker and its admission budget.

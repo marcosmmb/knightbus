@@ -27,7 +27,6 @@ rustc-ice-*.txt
 /lab/
 
 # Fuzz output and historical local evidence.
-/applications/usb-inspector/
 **/evidence/
 **/evidences/
 /evidence-local/

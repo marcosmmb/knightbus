@@ -1,5 +1,6 @@
 //! Bounded management framing, separate from USB/IP.
 use crate::Stream;
+use crate::operation::Operation;
 use knightbus_core::{CONTROL_VERSION, Error, Event, Reply, Response, Result};
 use std::{
     io::{Read, Write},
@@ -145,18 +146,21 @@ impl Framed {
             .map_err(|_| Error::Unavailable)
     }
     pub fn send(&mut self, payload: &[u8]) -> Result<()> {
+        self.send_until(
+            payload,
+            &Operation::new(Instant::now() + TIMEOUT, &|| false),
+        )
+    }
+    pub fn send_until(&mut self, payload: &[u8], operation: &Operation<'_>) -> Result<()> {
         if payload.is_empty() || payload.len() > MAX_FRAME {
             return Err(Error::Invalid);
         }
         let mut output = [0; MAX_FRAME + LENGTH_PREFIX_BYTES];
         output[..LENGTH_PREFIX_BYTES].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         output[LENGTH_PREFIX_BYTES..LENGTH_PREFIX_BYTES + payload.len()].copy_from_slice(payload);
-        let deadline = Instant::now() + TIMEOUT;
         let mut offset = 0;
         loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
+            operation.check()?;
             if offset < LENGTH_PREFIX_BYTES + payload.len() {
                 match self
                     .stream
@@ -170,14 +174,26 @@ impl Framed {
             }
             self.stream.pump().map_err(|_| Error::Unavailable)?;
             if offset == LENGTH_PREFIX_BYTES + payload.len() && !self.stream.pending_write() {
+                operation.check()?;
                 return Ok(());
             }
-            self.wait(deadline.saturating_duration_since(Instant::now()))?;
+            self.wait(operation.wait()?)?;
         }
     }
     pub fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        self.receive_until(
+            timeout,
+            &Operation::new(Instant::now() + timeout + TIMEOUT, &|| false),
+        )
+    }
+    pub fn receive_until(
+        &mut self,
+        timeout: Duration,
+        operation: &Operation<'_>,
+    ) -> Result<Option<Vec<u8>>> {
         let deadline = Instant::now() + timeout;
         loop {
+            operation.check()?;
             if self.started.is_some_and(|t| t.elapsed() >= TIMEOUT) {
                 return Err(Error::Deadline);
             }
@@ -199,6 +215,7 @@ impl Framed {
                         self.used = 0;
                         self.expected = LENGTH_PREFIX_BYTES;
                         self.started = None;
+                        operation.check()?;
                         return Ok(Some(bytes));
                     }
                 }
@@ -208,7 +225,7 @@ impl Framed {
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     self.wait(
-                        remaining.min(
+                        remaining.min(operation.wait()?).min(
                             self.started
                                 .map_or(TIMEOUT, |t| TIMEOUT.saturating_sub(t.elapsed())),
                         ),

@@ -7,6 +7,14 @@ pub const MAX_DEVICE_GRANTS: usize = 255;
 /// Host-neutral management request. Contains no USB payloads or credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Negotiate the contract and learn the host's monotonic clock and epoch.
+    Info,
+    /// Authorized descriptor topology, without claiming the device.
+    Inspect(DeviceKey),
+    /// Snapshot of visible session IDs; fetch each with Status.
+    Sessions,
+    /// Revoke every grant for this generation and drain its leases.
+    Unshare(DeviceKey),
     /// Authorized device snapshot.
     List,
     /// Exporter administrator changes a peer grant; revoke drains affected leases.
@@ -50,6 +58,19 @@ pub struct DeviceInfo {
 /// Control result, identical in direct and service hosts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    /// Negotiation result; clocks are local to this host epoch.
+    Info {
+        /// Control schema version.
+        version: u16,
+        /// Restart identity.
+        epoch: u64,
+        /// Monotonic milliseconds.
+        now: u64,
+    },
+    /// Authorized descriptor topology. Inspection does not prove claimability.
+    Inspection(Box<crate::Device>),
+    /// Authorized session identifiers.
+    Sessions(Vec<SessionId>),
     /// Mutation accepted; inspect lifecycle/events for retirement.
     Done,
     /// Filtered device snapshot.
@@ -119,14 +140,14 @@ pub struct Response {
 
 /// A control connection bound to trusted caller authority. Owns subscriptions,
 /// checks their scope, and releases them on close without ending device leases.
-pub struct ControlConnection<'a, T: ControlTarget> {
-    target: &'a mut T,
+pub struct ControlConnection<T: ControlTarget> {
+    target: T,
     caller: Caller,
     subscriptions: std::collections::BTreeSet<u64>,
 }
-impl<'a, T: ControlTarget> ControlConnection<'a, T> {
+impl<T: ControlTarget> ControlConnection<T> {
     /// Check the protocol version before exposing engine operations.
-    pub fn new(target: &'a mut T, caller: Caller, version: u16) -> Result<Self> {
+    pub fn new(target: T, caller: Caller, version: u16) -> Result<Self> {
         if version != CONTROL_VERSION {
             return Err(Error::Version);
         }
@@ -145,7 +166,7 @@ impl<'a, T: ControlTarget> ControlConnection<'a, T> {
         }
     }
 }
-impl<T: ControlTarget> KnightBusControl for ControlConnection<'_, T> {
+impl<T: ControlTarget> KnightBusControl for ControlConnection<T> {
     fn call(&mut self, command: Command, deadline: u64) -> Result<Reply> {
         let unsubscribe = match command {
             Command::Poll(id) | Command::Unsubscribe(id) => {
@@ -172,8 +193,17 @@ impl<T: ControlTarget> KnightBusControl for ControlConnection<'_, T> {
         result
     }
 }
-impl<T: ControlTarget> Drop for ControlConnection<'_, T> {
+impl<T: ControlTarget> Drop for ControlConnection<T> {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+impl<T: ControlTarget + ?Sized> ControlTarget for &mut T {
+    fn now(&self) -> u64 {
+        (**self).now()
+    }
+    fn execute(&mut self, caller: Caller, command: Command, deadline: u64) -> Result<Reply> {
+        (**self).execute(caller, command, deadline)
     }
 }

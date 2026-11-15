@@ -1,3 +1,4 @@
+use crate::operation::Operation;
 use crate::security::{Channel, Identity, Peers};
 use knightbus_core::{Caller, Error, PeerId, Result};
 use std::{
@@ -62,8 +63,27 @@ impl Stream {
         channel: Channel,
         timeout: Duration,
     ) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(Error::Invalid);
+        }
+        let operation = Operation::new(
+            Instant::now().checked_add(timeout).ok_or(Error::Invalid)?,
+            &|| false,
+        );
+        Self::connect_until(stream, identity, peers, peer, channel, &operation)
+    }
+    /// Authenticate within the caller's shared connection/bootstrap operation.
+    pub fn connect_until(
+        stream: TcpStream,
+        identity: &Identity,
+        peers: &Peers,
+        peer: PeerId,
+        channel: Channel,
+        operation: &Operation<'_>,
+    ) -> Result<Self> {
+        operation.check()?;
         let tls = peers.client(identity, peer, channel)?;
-        let stream = Self::handshake(stream, tls, peers, channel, timeout)?;
+        let stream = Self::handshake(stream, tls, peers, channel, operation)?;
         if stream.caller.map(|c| c.peer) != Some(peer) {
             return Err(Error::Denied);
         }
@@ -77,12 +97,18 @@ impl Stream {
         channel: Channel,
         timeout: Duration,
     ) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(Error::Invalid);
+        }
         Self::handshake(
             stream,
             peers.server(identity, channel)?,
             peers,
             channel,
-            timeout,
+            &Operation::new(
+                Instant::now().checked_add(timeout).ok_or(Error::Invalid)?,
+                &|| false,
+            ),
         )
     }
     fn handshake(
@@ -90,11 +116,9 @@ impl Stream {
         mut tls: rustls::Connection,
         peers: &Peers,
         channel: Channel,
-        timeout: Duration,
+        operation: &Operation<'_>,
     ) -> Result<Self> {
-        if timeout.is_zero() {
-            return Err(Error::Invalid);
-        }
+        operation.check()?;
         stream
             .set_nonblocking(true)
             .map_err(|_| Error::Unavailable)?;
@@ -114,11 +138,8 @@ impl Stream {
                 mio::Interest::READABLE | mio::Interest::WRITABLE,
             )
             .map_err(|_| Error::Unavailable)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or(Error::Invalid)?;
         loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
+            operation.check()?;
             stream.pump().map_err(|_| Error::Denied)?;
             if !stream.tls.as_ref().unwrap().is_handshaking() && !stream.pending_write() {
                 break;
@@ -131,12 +152,10 @@ impl Stream {
             poll.registry()
                 .reregister(&mut stream.socket, SOCKET, interests)
                 .map_err(|_| Error::Unavailable)?;
-            poll.poll(
-                &mut events,
-                Some(deadline.saturating_duration_since(Instant::now())),
-            )
-            .map_err(|_| Error::Unavailable)?;
+            poll.poll(&mut events, Some(operation.wait()?))
+                .map_err(|_| Error::Unavailable)?;
         }
+        operation.check()?;
         stream.caller = Some(peers.verify(stream.tls.as_ref().unwrap(), channel)?);
         poll.registry()
             .deregister(&mut stream.socket)

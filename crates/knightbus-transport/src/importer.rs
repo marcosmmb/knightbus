@@ -1,12 +1,20 @@
 //! Standard USB/IP stream, bounded framing and request correlation. The caller
 //! supplies a stream authenticated by the shared host, or an explicitly authorized
 //! raw compatibility connection.
+use crate::operation::Operation;
 use knightbus_core::{
     DescriptorSet as Descriptors,
     topology::{self as usb, Speed},
 };
 const MAX_TRANSFER: usize = 1024 * 1024;
 const SLOTS: usize = 31;
+/// Maximum devices accepted in an authenticated discovery reply.
+pub const MAX_DISCOVERY_DEVICES: usize = 128;
+// Include every interface record permitted by the protocol's count field.
+const MANAGEMENT_FRAME_BYTES: usize = usbip::DEVLIST_HEADER_BYTES
+    + MAX_DISCOVERY_DEVICES
+        * (usbip::DEVICE_RECORD_BYTES
+            + usbip::MAX_DEVICE_INTERFACES * usbip::INTERFACE_RECORD_BYTES);
 use knightbus_core::{
     Budget, Buffer, Completion, DecodedMessage, Device, DeviceId, DeviceKey, Error,
     ImporterBackend, MemoryReservation, Result, SessionId, Transfer,
@@ -17,8 +25,8 @@ use std::{
     time::{Duration, Instant},
 };
 // USB/IP fixed fields inspected before handing a frame to the codec.
-const USBIP_TRANSFER_HEADER_BYTES: usize = 48;
-const USBIP_BUS_ID_BYTES: usize = 32;
+const USBIP_TRANSFER_HEADER_BYTES: usize = usbip::TRANSFER_HEADER_LEN;
+const USBIP_BUS_ID_BYTES: usize = usbip::BUS_ID_BYTES;
 const USBIP_RET_SUBMIT: u32 = 3;
 const USBIP_RET_UNLINK: u32 = 4;
 const EXCHANGE_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -34,7 +42,7 @@ const DESCRIPTOR_TYPE_SHIFT: u32 = 8; // High byte of GET_DESCRIPTOR wValue.
 const LIMITS: Limits = Limits {
     frame_bytes: MAX_TRANSFER + USBIP_TRANSFER_HEADER_BYTES,
     transfer_bytes: MAX_TRANSFER,
-    devices: 128,
+    devices: MAX_DISCOVERY_DEVICES,
     iso_packets: 0,
 };
 /// Import and attach a device with protocol and policy checks.
@@ -47,14 +55,45 @@ pub fn connect<D: knightbus_core::importer::Driver>(
     timeout: Duration,
     factory: impl FnOnce(&Budget) -> Result<D> + Send + 'static,
 ) -> Result<Forwarder<impl ImporterBackend>> {
+    connect_until(
+        stream,
+        bus_id,
+        session,
+        budget,
+        timeout,
+        &Operation::new(
+            Instant::now().checked_add(timeout).ok_or(Error::Invalid)?,
+            &|| false,
+        ),
+        factory,
+    )
+}
+/// Import with a shared deadline/cancellation scope, then publish natively.
+/// `timeout` still bounds subsequent forwarding requests and cleanup.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_until<
+    D: knightbus_core::importer::Driver,
+    F: FnOnce(&Budget) -> Result<D> + Send + 'static,
+>(
+    stream: crate::Stream,
+    bus_id: usbip::WireString<USBIP_BUS_ID_BYTES>,
+    session: SessionId,
+    budget: Budget,
+    timeout: Duration,
+    operation: &Operation<'_>,
+    factory: F,
+) -> Result<Forwarder<impl ImporterBackend + use<D, F>>> {
+    operation.check()?;
     let mut wire = Wire::new(stream, budget.clone(), timeout, D::CAPABILITIES)?;
-    let (device, descriptors) = wire.import(bus_id)?;
+    let (device, descriptors) = wire.import_until(bus_id, operation)?;
+    operation.check()?;
     let native_budget = budget.clone();
     let backend = knightbus_core::importer::Backend::new(
         move || factory(&native_budget),
         descriptors,
         budget,
     )?;
+    operation.check()?;
     Forwarder::new(backend, wire, device, session)
 }
 
@@ -95,7 +134,8 @@ impl Wire {
             frame_bytes: capabilities
                 .transfer_bytes
                 .checked_add(USBIP_TRANSFER_HEADER_BYTES + capabilities.iso_packets * 16)
-                .ok_or(Error::Exhausted)?,
+                .ok_or(Error::Exhausted)?
+                .max(MANAGEMENT_FRAME_BYTES),
             iso_packets: capabilities.iso_packets,
             ..LIMITS
         };
@@ -107,21 +147,41 @@ impl Wire {
             capabilities,
         })
     }
-    fn exchange(&mut self, message: &Message, context: Context) -> Result<DecodedMessage> {
+    /// Read the authorized USB/IP inventory without importing or claiming a device.
+    pub fn list(&mut self) -> Result<Vec<usbip::ListedDevice>> {
+        self.list_until(&Operation::new(Instant::now() + self.timeout, &|| false))
+    }
+    /// Discover within the same operation as connection setup.
+    pub fn list_until(&mut self, operation: &Operation<'_>) -> Result<Vec<usbip::ListedDevice>> {
+        if self.imported {
+            return Err(Error::State);
+        }
+        let reply = self.exchange(&Message::DevListRequest, Context::Management, operation)?;
+        match reply.message() {
+            Message::DevListReply { status: 0, devices } => Ok(devices.clone()),
+            _ => Err(Error::Denied),
+        }
+    }
+    fn exchange(
+        &mut self,
+        message: &Message,
+        context: Context,
+        operation: &Operation<'_>,
+    ) -> Result<DecodedMessage> {
+        operation.check()?;
         self.connection.send(message)?;
-        let deadline = Instant::now() + self.timeout;
         loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
+            operation.check()?;
             self.connection.flush()?;
             if let Some(reply) = self.connection.receive(|_, _| Ok(context))? {
+                operation.check()?;
                 return Ok(reply);
             }
             if self.connection.take_progress() {
                 std::thread::yield_now();
             } else {
-                self.connection.wait(EXCHANGE_POLL_INTERVAL)?;
+                self.connection
+                    .wait(EXCHANGE_POLL_INTERVAL.min(operation.wait()?))?;
             }
         }
     }
@@ -132,11 +192,22 @@ impl Wire {
         &mut self,
         bus_id: usbip::WireString<USBIP_BUS_ID_BYTES>,
     ) -> Result<(ImportedDevice, Descriptors)> {
+        self.import_until(
+            bus_id,
+            &Operation::new(Instant::now() + self.timeout, &|| false),
+        )
+    }
+    /// Keep one deadline across import and all descriptor/configuration exchanges.
+    pub fn import_until(
+        &mut self,
+        bus_id: usbip::WireString<USBIP_BUS_ID_BYTES>,
+        operation: &Operation<'_>,
+    ) -> Result<(ImportedDevice, Descriptors)> {
         if self.imported {
             return Err(Error::State);
         }
         self.imported = true;
-        let result = self.import_inner(bus_id);
+        let result = self.import_inner(bus_id, operation);
         if result.is_err() {
             self.connection.close();
         }
@@ -145,8 +216,13 @@ impl Wire {
     fn import_inner(
         &mut self,
         bus_id: usbip::WireString<USBIP_BUS_ID_BYTES>,
+        operation: &Operation<'_>,
     ) -> Result<(ImportedDevice, Descriptors)> {
-        let reply = self.exchange(&Message::ImportRequest(bus_id.clone()), Context::Management)?;
+        let reply = self.exchange(
+            &Message::ImportRequest(bus_id.clone()),
+            Context::Management,
+            operation,
+        )?;
         let metadata = match reply.message() {
             Message::ImportReply {
                 status: 0,
@@ -160,7 +236,7 @@ impl Wire {
         }
         let id = (metadata.bus_number << u16::BITS) | metadata.device_number;
         let speed = Speed::try_from(metadata.speed).map_err(|_| Error::Unsupported)?;
-        let (descriptors, config) = self.read_descriptors(id, speed)?;
+        let (descriptors, config) = self.read_descriptors(id, speed, operation)?;
         self.capabilities.descriptors(&descriptors)?;
         if descriptors.topology().vid != metadata.vendor_id
             || descriptors.topology().pid != metadata.product_id
@@ -175,23 +251,30 @@ impl Wire {
             return Err(Error::Invalid);
         }
         let mut device = self.inventory(id, metadata, config.as_slice())?;
-        self.select_configuration(id, speed, descriptors.topology().configuration)?;
+        self.select_configuration(id, speed, descriptors.topology().configuration, operation)?;
         device.device.wire.configuration = descriptors.topology().configuration;
         device.device.wire.interfaces = descriptors.topology().interfaces;
         Ok((device, descriptors))
     }
-    fn read_descriptors(&mut self, id: u32, speed: Speed) -> Result<(Descriptors, Buffer)> {
+    fn read_descriptors(
+        &mut self,
+        id: u32,
+        speed: Speed,
+        operation: &Operation<'_>,
+    ) -> Result<(Descriptors, Buffer)> {
         let device = self.descriptor(
             id,
             SEQ_DEVICE_DESCRIPTOR,
             u16::from(usb::device::TYPE) << DESCRIPTOR_TYPE_SHIFT,
             usb::device::BYTES as u16,
+            operation,
         )?;
         let config_header = self.descriptor(
             id,
             SEQ_CONFIG_HEADER,
             u16::from(usb::configuration::TYPE) << DESCRIPTOR_TYPE_SHIFT,
             usb::configuration::BYTES as u16,
+            operation,
         )?;
         if config_header.as_slice().len() != usb::configuration::BYTES {
             return Err(Error::Invalid);
@@ -207,6 +290,7 @@ impl Wire {
             SEQ_CONFIG_DESCRIPTOR,
             u16::from(usb::configuration::TYPE) << DESCRIPTOR_TYPE_SHIFT,
             length,
+            operation,
         )?;
         let bos = if speed.superspeed() {
             let header = self.descriptor(
@@ -214,6 +298,7 @@ impl Wire {
                 SEQ_BOS_HEADER,
                 u16::from(usb::BOS_TYPE) << DESCRIPTOR_TYPE_SHIFT,
                 usb::BOS_HEADER as u16,
+                operation,
             )?;
             let length = usb::u16_at(header.as_slice(), 2);
             if !(usb::BOS_HEADER..=self.capabilities.descriptor_bytes)
@@ -226,6 +311,7 @@ impl Wire {
                 SEQ_BOS_DESCRIPTOR,
                 u16::from(usb::BOS_TYPE) << DESCRIPTOR_TYPE_SHIFT,
                 length,
+                operation,
             )?
         } else {
             self.budget.buffer(0)?
@@ -273,7 +359,13 @@ impl Wire {
             _storage: storage,
         })
     }
-    fn select_configuration(&mut self, id: u32, speed: Speed, configuration: u8) -> Result<()> {
+    fn select_configuration(
+        &mut self,
+        id: u32,
+        speed: Speed,
+        configuration: u8,
+        operation: &Operation<'_>,
+    ) -> Result<()> {
         // Establish and verify configuration/alternate-zero state before
         // publishing native endpoints, regardless of native startup ordering.
         self.control(
@@ -287,6 +379,7 @@ impl Wire {
                 0,
             ),
             0,
+            operation,
         )?;
         if self
             .control(
@@ -294,6 +387,7 @@ impl Wire {
                 SEQ_GET_CONFIGURATION + if speed.superspeed() { 2 } else { 0 },
                 usb::READ_CONFIGURATION,
                 1,
+                operation,
             )?
             .as_slice()
             != [configuration]
@@ -302,12 +396,20 @@ impl Wire {
         }
         Ok(())
     }
-    fn descriptor(&mut self, id: u32, sequence: u32, value: u16, length: u16) -> Result<Buffer> {
+    fn descriptor(
+        &mut self,
+        id: u32,
+        sequence: u32,
+        value: u16,
+        length: u16,
+        operation: &Operation<'_>,
+    ) -> Result<Buffer> {
         self.control(
             id,
             sequence,
             usb::setup(usb::DIRECTION_IN, usb::GET_DESCRIPTOR, value, 0, length),
             length,
+            operation,
         )
     }
     fn control(
@@ -316,6 +418,7 @@ impl Wire {
         sequence: u32,
         setup: [u8; usb::SETUP_SIZE],
         length: u16,
+        operation: &Operation<'_>,
     ) -> Result<Buffer> {
         let header = SubmitHeader {
             seqnum: sequence,
@@ -336,6 +439,7 @@ impl Wire {
         let reply = self.exchange(
             &Message::Submit(header.with_payload(vec![], vec![])),
             Context::Replies(Some((&header).into())),
+            operation,
         )?;
         match reply.message() {
             Message::ReturnSubmit(r)
@@ -415,6 +519,10 @@ impl<B: ImporterBackend> Forwarder<B> {
     /// Validated metadata while the attachment remains owned.
     pub fn device(&self) -> Option<&Device> {
         self.backend.device()
+    }
+    /// Native attachment state; Active is reported only after native confirmation.
+    pub fn state(&self) -> knightbus_core::ImporterState {
+        self.backend.state()
     }
     /// Stop admission and request native retirement, including a partial attach.
     pub fn disconnect(&mut self) {

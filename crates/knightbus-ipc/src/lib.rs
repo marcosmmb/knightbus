@@ -5,13 +5,13 @@
 mod wire;
 use knightbus_core::*;
 use std::collections::BTreeMap;
-pub use wire::{decode_request, decode_response, encode_request, encode_response};
+pub use wire::{MAX_FRAME, decode_request, decode_response, encode_request, encode_response};
 
 /// One authenticated management connection. Host code supplies verified authority
 /// and connection epoch, never data decoded from a request. There is no implicit
 /// reconnection/replay; a restart requires a newly constructed service connection.
 pub struct Service<'a, T: ControlTarget> {
-    control: ControlConnection<'a, T>,
+    control: ControlConnection<&'a mut T>,
     epoch: u64,
     last_id: u64,
     capacity: usize,

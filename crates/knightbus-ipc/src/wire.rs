@@ -1,10 +1,14 @@
 use knightbus_core::*;
-pub(crate) const MAX_FRAME: usize = 8192;
+/// Maximum complete control frame, including its length prefix.
+pub const MAX_FRAME: usize = 8192;
 const MAX_ITEMS: usize = 256;
 
-// Fixed widths in this provisional control schema, independent of Rust layouts.
+// Fixed widths in this control schema, independent of Rust layouts.
 pub(crate) const LENGTH_PREFIX_BYTES: usize = 4;
 const DEVICE_KEY_BYTES: usize = 16; // device ID + generation, both u64
+const SESSION_ID_BYTES: usize = size_of::<u64>() + size_of::<u64>();
+// Number, alternate, class/subclass/protocol, and endpoint count.
+const INTERFACE_HEADER_BYTES: usize = 6;
 const DEVICE_INFO_BYTES: usize = DEVICE_KEY_BYTES + 1; // key + busy boolean
 
 // Request and reply tags have separate namespaces; preserve their v1 wire values.
@@ -20,6 +24,10 @@ const CMD_UNSUBSCRIBE: u8 = 8;
 const CMD_FORGET: u8 = 9;
 const CMD_SHUTDOWN: u8 = 10;
 const CMD_PERMISSIONS: u8 = 11;
+const CMD_INFO: u8 = 12;
+const CMD_INSPECT: u8 = 13;
+const CMD_SESSIONS: u8 = 14;
+const CMD_UNSHARE: u8 = 15;
 
 const REPLY_DONE: u8 = 0;
 const REPLY_DEVICES: u8 = 1;
@@ -27,6 +35,9 @@ const REPLY_SESSION: u8 = 2;
 const REPLY_SUBSCRIPTION: u8 = 3;
 const REPLY_EVENT: u8 = 4;
 const REPLY_PEERS: u8 = 5;
+const REPLY_INFO: u8 = 6;
+const REPLY_INSPECTION: u8 = 7;
+const REPLY_SESSIONS: u8 = 8;
 
 const STATE_ACQUIRING: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
@@ -54,7 +65,7 @@ const STATUS_INTERNAL: u16 = Error::Internal as u16;
 const STATUS_CLEANUP: u16 = Error::Cleanup as u16;
 
 /// Encode a bounded management request with a little-endian u32 body length.
-/// This provisional harness format is independent of standard USB/IP framing.
+/// This management format is independent of standard USB/IP framing.
 pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
     let mut b = Vec::new();
     b.extend_from_slice(&[0; LENGTH_PREFIX_BYTES]);
@@ -63,6 +74,16 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
     b.extend_from_slice(&request.deadline.to_le_bytes());
     let mut put = |tag: u8| b.push(tag);
     match &request.command {
+        Command::Info => put(CMD_INFO),
+        Command::Sessions => put(CMD_SESSIONS),
+        Command::Inspect(k) => {
+            put(CMD_INSPECT);
+            key(&mut b, *k);
+        }
+        Command::Unshare(k) => {
+            put(CMD_UNSHARE);
+            key(&mut b, *k);
+        }
         Command::List => put(CMD_LIST),
         Command::Authorize {
             device,
@@ -114,6 +135,9 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
             key(&mut b, *device);
         }
         Command::Shutdown => put(CMD_SHUTDOWN),
+    }
+    if b.len() > MAX_FRAME {
+        return Err(Error::Exhausted);
     }
     let length = b.len() - LENGTH_PREFIX_BYTES;
     b[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_le_bytes());
@@ -170,6 +194,10 @@ pub fn decode_request(frame: &[u8]) -> Result<Request> {
     let id = r.u64()?;
     let deadline = r.u64()?;
     let command = match r.take::<1>()?[0] {
+        CMD_INFO => Command::Info,
+        CMD_INSPECT => Command::Inspect(r.key()?),
+        CMD_SESSIONS => Command::Sessions,
+        CMD_UNSHARE => Command::Unshare(r.key()?),
         CMD_LIST => Command::List,
         CMD_AUTHORIZE => {
             let device = r.key()?;
@@ -224,6 +252,30 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
         Ok(reply) => {
             b.extend_from_slice(&STATUS_OK.to_le_bytes());
             match reply {
+                Reply::Info {
+                    version,
+                    epoch,
+                    now,
+                } => {
+                    b.push(REPLY_INFO);
+                    b.extend_from_slice(&version.to_le_bytes());
+                    b.extend_from_slice(&epoch.to_le_bytes());
+                    b.extend_from_slice(&now.to_le_bytes());
+                }
+                Reply::Inspection(d) => {
+                    b.push(REPLY_INSPECTION);
+                    device(&mut b, d)?;
+                }
+                Reply::Sessions(ids) => {
+                    if ids.len() > MAX_ITEMS {
+                        return Err(Error::Exhausted);
+                    }
+                    b.push(REPLY_SESSIONS);
+                    b.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+                    for id in ids {
+                        session(&mut b, *id);
+                    }
+                }
                 Reply::Peers(peers) => {
                     if peers.len() > MAX_DEVICE_GRANTS {
                         return Err(Error::Exhausted);
@@ -289,6 +341,9 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
             }
         }
     }
+    if b.len() > MAX_FRAME {
+        return Err(Error::Exhausted);
+    }
     let length = b.len() - LENGTH_PREFIX_BYTES;
     b[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_le_bytes());
     Ok(b)
@@ -345,8 +400,22 @@ pub fn decode_response(frame: &[u8]) -> Result<Response> {
         Err(error)
     } else {
         Ok(match r.take::<1>()?[0] {
+            REPLY_INFO => Reply::Info {
+                version: u16::from_le_bytes(r.take()?),
+                epoch: r.u64()?,
+                now: r.u64()?,
+            },
+            REPLY_INSPECTION => Reply::Inspection(Box::new(r.device()?)),
+            REPLY_SESSIONS => {
+                let count = r.count(SESSION_ID_BYTES)?;
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ids.push(r.session()?);
+                }
+                Reply::Sessions(ids)
+            }
             REPLY_PEERS => {
-                let count = r.count(32)?;
+                let count = r.count(PEER_ID_BYTES)?;
                 let mut peers = Vec::with_capacity(count);
                 for _ in 0..count {
                     peers.push(PeerId(r.take()?));
@@ -422,4 +491,146 @@ pub fn decode_response(frame: &[u8]) -> Result<Response> {
         return Err(Error::Invalid);
     }
     Ok(Response { id, result })
+}
+
+// Stable control-schema values; never depend on Rust enum layout.
+#[repr(u8)]
+enum WireTransferKind {
+    Control = 0,
+    Isochronous = 1,
+    Bulk = 2,
+    Interrupt = 3,
+}
+impl WireTransferKind {
+    fn encode(kind: TransferKind) -> u8 {
+        (match kind {
+            TransferKind::Control => Self::Control,
+            TransferKind::Isochronous => Self::Isochronous,
+            TransferKind::Bulk => Self::Bulk,
+            TransferKind::Interrupt => Self::Interrupt,
+        }) as u8
+    }
+    fn decode(value: u8) -> Result<TransferKind> {
+        match value {
+            x if x == Self::Control as u8 => Ok(TransferKind::Control),
+            x if x == Self::Isochronous as u8 => Ok(TransferKind::Isochronous),
+            x if x == Self::Bulk as u8 => Ok(TransferKind::Bulk),
+            x if x == Self::Interrupt as u8 => Ok(TransferKind::Interrupt),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+
+// Metadata only; fixed field widths are independent of native Rust layouts.
+fn device(b: &mut Vec<u8>, d: &Device) -> Result<()> {
+    key(b, d.key);
+    // Reuse the protocol's canonical device metadata encoder, never a USB transfer.
+    let metadata = usbip::encode(
+        &usbip::Message::ImportReply {
+            status: 0,
+            device: Some(Box::new(d.wire.clone())),
+        },
+        usbip::Limits::default(),
+        &mut |_| Ok(()),
+    )
+    .map_err(|_| Error::Invalid)?;
+    b.extend_from_slice(&metadata);
+    if d.configurations.len() > usize::from(u8::MAX) {
+        return Err(Error::Exhausted);
+    }
+    b.push(d.configurations.len() as u8);
+    for c in &d.configurations {
+        b.push(c.value);
+        if c.interfaces.len() > MAX_ITEMS {
+            return Err(Error::Exhausted);
+        }
+        b.extend_from_slice(&(c.interfaces.len() as u16).to_le_bytes());
+        for i in &c.interfaces {
+            b.extend_from_slice(&[
+                i.number,
+                i.alternate,
+                i.class.class,
+                i.class.subclass,
+                i.class.protocol,
+            ]);
+            if i.endpoints.len() > topology::MAX_ENDPOINTS {
+                return Err(Error::Invalid);
+            }
+            b.push(i.endpoints.len() as u8);
+            for e in &i.endpoints {
+                let kind = WireTransferKind::encode(e.kind);
+                b.extend_from_slice(&[e.address, kind]);
+                b.extend_from_slice(&e.max_packet_size.to_le_bytes());
+                b.extend_from_slice(&e.service_bytes.to_le_bytes());
+                b.push(e.interval);
+                b.extend_from_slice(&e.allowed_flags.to_le_bytes());
+            }
+            if b.len() > MAX_FRAME {
+                return Err(Error::Exhausted);
+            }
+        }
+    }
+    Ok(())
+}
+impl Reader<'_> {
+    fn device(&mut self) -> Result<Device> {
+        let key = self.key()?;
+        let metadata = self.take::<{ usbip::IMPORT_REPLY_BYTES }>()?;
+        let (message, _) = usbip::decode(
+            &metadata,
+            usbip::Context::Management,
+            usbip::Limits::default(),
+            &mut |_| Ok(()),
+        )
+        .map_err(|_| Error::Invalid)?;
+        let usbip::Message::ImportReply {
+            status: 0,
+            device: Some(wire),
+        } = message
+        else {
+            return Err(Error::Invalid);
+        };
+        let count = self.take::<1>()?[0];
+        let mut configurations = Vec::new();
+        for _ in 0..count {
+            let value = self.take::<1>()?[0];
+            let count = self.count(INTERFACE_HEADER_BYTES)?;
+            let mut interfaces = Vec::new();
+            for _ in 0..count {
+                let [number, alternate, class, subclass, protocol, count] = self.take()?;
+                if usize::from(count) > topology::MAX_ENDPOINTS {
+                    return Err(Error::Invalid);
+                }
+                let mut endpoints = Vec::new();
+                for _ in 0..count {
+                    let [address, kind] = self.take()?;
+                    let kind = WireTransferKind::decode(kind)?;
+                    endpoints.push(Endpoint {
+                        address,
+                        kind,
+                        max_packet_size: u16::from_le_bytes(self.take()?),
+                        service_bytes: u32::from_le_bytes(self.take()?),
+                        interval: self.take::<1>()?[0],
+                        allowed_flags: u32::from_le_bytes(self.take()?),
+                    });
+                }
+                interfaces.push(Interface {
+                    number,
+                    alternate,
+                    class: usbip::Interface {
+                        class,
+                        subclass,
+                        protocol,
+                    },
+                    endpoints,
+                });
+            }
+            configurations.push(Configuration { value, interfaces });
+        }
+        Ok(Device {
+            key,
+            wire: *wire,
+            configurations,
+        })
+    }
 }

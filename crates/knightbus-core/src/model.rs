@@ -38,9 +38,12 @@ impl std::error::Error for Error {}
 /// Engine result with a stable, payload-free error.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Byte length of an authenticated SHA-256 peer fingerprint.
+pub const PEER_ID_BYTES: usize = 32;
+
 /// Authenticated peer key fingerprint, supplied by a trusted host, never a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PeerId(pub [u8; 32]);
+pub struct PeerId(pub [u8; PEER_ID_BYTES]);
 /// Persisted exporter-assigned device identity; not VID/PID or a USB address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DeviceId(pub u64);

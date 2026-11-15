@@ -1,0 +1,18 @@
+[package]
+name = "knightbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The C ABI library supplies the `knightbus` Rust API documentation.
+[[bin]]
+name = "knightbus"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+knightbus-sdk = { path = "../../crates/knightbus-sdk" }
+
+[lints]
+workspace = true

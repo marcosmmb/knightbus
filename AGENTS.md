@@ -16,3 +16,11 @@ Do not copy importer, exporter, shared-crate, or driver implementations into
 Keep public documentation focused on usage, architecture and contributions.
 Put development notes, validation reports and hardware instructions in `lab/`.
 Do not include milestones or internal project tracking in public documentation.
+
+# Numeric values
+
+Do not use magic numbers. Use named constants for limits, timeouts, intervals,
+buffer sizes, protocol widths and offsets; use enums for numeric tags or states.
+Reuse existing definitions and share constants when multiple components must agree
+on a value. Briefly explain non-obvious values or how they are derived. Ordinary
+zero/one values and self-explanatory test data may remain numeric literals.

@@ -423,3 +423,78 @@ fn tls_peer_that_stops_reading_cannot_hold_output_past_its_deadline() {
     done.send(()).unwrap();
     worker.join().unwrap();
 }
+
+#[test]
+fn connection_setup_observes_deadline_and_cancellation() {
+    use knightbus_transport::{host::Remote, operation::Operation};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    // Cover a silent TLS handshake and an authenticated peer withholding Hello.
+    for authenticate in [false, true] {
+        for cancel in [false, true] {
+            let (server_identity, client_identity, peers) = paired();
+            let peer = server_identity.peer();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let trust = peers.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let signal = cancelled.clone();
+            let (done, release) = mpsc::channel();
+            let (connected, wait_connected) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let socket = listener.accept().unwrap().0;
+                wait_connected.recv_timeout(TIMEOUT).unwrap();
+                let _stream = if authenticate {
+                    Stream::accept(socket, &server_identity, &trust, Channel::Control, TIMEOUT)
+                        .unwrap()
+                } else {
+                    Stream::insecure_loopback(socket).unwrap()
+                };
+                if cancel {
+                    signal.store(true, Ordering::SeqCst);
+                }
+                release.recv_timeout(TIMEOUT).unwrap();
+            });
+            let started = Instant::now();
+            let check = || cancelled.load(Ordering::SeqCst);
+            let operation = Operation::new(
+                started
+                    + if cancel {
+                        TIMEOUT
+                    } else {
+                        Duration::from_millis(200)
+                    },
+                &check,
+            );
+            let socket = operation.connect(address).unwrap();
+            connected.send(()).unwrap();
+            let result = Remote::connect_until(socket, &client_identity, &peers, peer, &operation);
+            assert!(
+                matches!(result, Err(e) if e == if cancel { Error::Cancelled } else { Error::Deadline })
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+            done.send(()).unwrap();
+            server.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn expired_or_cancelled_operations_never_open_tcp_connections() {
+    use knightbus_transport::operation::Operation;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    assert!(matches!(
+        Operation::new(Instant::now(), &|| false).connect(address),
+        Err(Error::Deadline)
+    ));
+    assert!(matches!(
+        Operation::new(Instant::now() + TIMEOUT, &|| true).connect(address),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}

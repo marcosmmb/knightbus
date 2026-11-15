@@ -1,0 +1,16 @@
+[package]
+name = "knightbus-host-mode-parity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+knightbus-sdk = { path = "../../crates/knightbus-sdk" }
+knightbus-core = { path = "../../crates/knightbus-core" }
+knightbus-transport = { path = "../../crates/knightbus-transport" }
+knightbus-ffi = { path = "../../crates/knightbus-ffi" }
+
+[lints]
+workspace = true

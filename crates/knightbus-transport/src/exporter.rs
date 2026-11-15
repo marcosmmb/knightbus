@@ -191,6 +191,14 @@ pub(crate) fn authenticated<E: Access>(
     wakes.unregister(registration);
     result
 }
+#[derive(Debug)]
+enum Phase {
+    Discovery,
+    Policy,
+    Attach,
+    Transfer,
+}
+
 fn serve_on<E: Access>(
     engine: &mut E,
     mut wire: Wire,
@@ -198,7 +206,11 @@ fn serve_on<E: Access>(
     alive: Option<&crate::host::Lease>,
 ) -> Result<()> {
     let mut session = None;
-    let result = run(engine, &mut wire, caller, &mut session, alive);
+    let mut phase = Phase::Discovery;
+    let result = run(engine, &mut wire, caller, &mut session, alive, &mut phase);
+    if let Err(error) = &result {
+        eprintln!("event=usb_session_failed phase={phase:?} error={error:?}");
+    }
     wire.connection.close();
     if let Some(id) = session {
         engine.with(|e| e.disconnect(id))?;
@@ -216,10 +228,12 @@ fn serve_on<E: Access>(
                 break;
             }
             if Instant::now() >= deadline {
+                eprintln!("event=detach error=Cleanup");
                 return Err(Error::Cleanup);
             }
             std::thread::sleep(POLL);
         }
+        eprintln!("event=detach outcome=closed");
     }
     result
 }
@@ -229,6 +243,7 @@ fn run<E: Access>(
     caller: Caller,
     session: &mut Option<SessionId>,
     alive: Option<&crate::host::Lease>,
+    phase: &mut Phase,
 ) -> Result<()> {
     let start = Instant::now();
     if let Some(alive) = alive {
@@ -258,30 +273,25 @@ fn run<E: Access>(
                 wire.connection.flush()?;
                 std::thread::sleep(POLL);
             }
+            eprintln!("event=discovery outcome=complete");
             return Ok(());
         }
         Message::ImportRequest(bus) => bus.clone(),
         _ => return Err(Error::Invalid),
     };
     drop(request);
+    *phase = Phase::Policy;
     let id = match engine.with(|e| e.import(caller, &bus, e.now() + TIMEOUT.as_millis() as u64)) {
         Ok(id) => id,
-        Err(error) => {
-            wire.connection.send(&Message::ImportReply {
-                status: 1,
-                device: None,
-            })?;
-            while !wire.connection.writable() {
-                wire.connection.flush()?;
-                std::thread::sleep(POLL);
-            }
-            return Err(error);
-        }
+        Err(error) => return reject_import(wire, error),
     };
     *session = Some(id);
+    *phase = Phase::Attach;
     loop {
-        if let Some(alive) = alive {
-            alive.check()?;
+        if let Some(alive) = alive
+            && let Err(error) = alive.check()
+        {
+            return reject_import(wire, error);
         }
         let Reply::Session(s) = engine.with(|e| {
             e.tick();
@@ -291,13 +301,13 @@ fn run<E: Access>(
             return Err(Error::Internal);
         };
         if let Some(error) = s.error {
-            return Err(error);
+            return reject_import(wire, error);
         }
         if s.state == SessionState::Active {
             break;
         }
         if start.elapsed() >= TIMEOUT {
-            return Err(Error::Deadline);
+            return reject_import(wire, Error::Deadline);
         }
         std::thread::sleep(POLL);
     }
@@ -313,8 +323,23 @@ fn run<E: Access>(
         status: 0,
         device: Some(Box::new(device)),
     })?;
-    eprintln!("exporter: physical acquisition complete; USB/IP imported");
+    eprintln!("event=attach outcome=active");
+    *phase = Phase::Transfer;
     forward(engine, wire, caller, id, wire_id, alive)
+}
+
+// Standard USB/IP rejection is sent for backend acquisition failures as well as
+// policy failures. Otherwise an authorized importer sees only an unexplained EOF.
+fn reject_import(wire: &mut Wire, error: Error) -> Result<()> {
+    wire.connection.send(&Message::ImportReply {
+        status: 1,
+        device: None,
+    })?;
+    while !wire.connection.writable() {
+        wire.connection.flush()?;
+        std::thread::sleep(POLL);
+    }
+    Err(error)
 }
 
 fn forward<E: Access>(

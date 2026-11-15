@@ -1,0 +1,20 @@
+[package]
+name = "knightbus-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "knightbus"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+knightbus-sdk = { path = "../knightbus-sdk" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

@@ -24,6 +24,7 @@ const KEY: DeviceKey = DeviceKey {
     generation: 1,
 };
 struct Mock {
+    fail_claim: Option<Error>,
     pending: VecDeque<(TransferId, Transfer)>,
     cancelled: Option<TransferId>,
     claims: Arc<AtomicUsize>,
@@ -42,7 +43,7 @@ impl ExporterBackend for Mock {
     }
     fn claim(&mut self, _: SessionId, _: &Device) -> Poll<Result<()>> {
         self.claims.fetch_add(1, Ordering::SeqCst);
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.fail_claim.map_or(Ok(()), Err))
     }
     fn release(&mut self, _: SessionId, _: DeviceKey) -> Poll<Result<()>> {
         self.claims.fetch_sub(1, Ordering::SeqCst);
@@ -152,6 +153,16 @@ fn start(
     std::thread::JoinHandle<Result<()>>,
     Arc<AtomicUsize>,
 ) {
+    start_with_claim_error(grant, None)
+}
+fn start_with_claim_error(
+    grant: bool,
+    fail_claim: Option<Error>,
+) -> (
+    TcpStream,
+    std::thread::JoinHandle<Result<()>>,
+    Arc<AtomicUsize>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -160,6 +171,7 @@ fn start(
     let task = std::thread::spawn(move || {
         let mut e = Engine::new(Mono::default(), Config::default(), 1, |_| {
             Ok(Mock {
+                fail_claim,
                 pending: VecDeque::new(),
                 cancelled: None,
                 claims: c,
@@ -520,6 +532,7 @@ fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
     let claims = Arc::new(AtomicUsize::new(0));
     let mut engine = Engine::new(Mono::default(), Config::default(), 1, |_| {
         Ok(Mock {
+            fail_claim: None,
             pending: VecDeque::new(),
             cancelled: None,
             claims: claims.clone(),
@@ -714,4 +727,19 @@ fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
     drop(host);
     assert_eq!(budget.usage().bytes, 0);
     assert_eq!(budget.usage().requests, 0);
+}
+
+#[test]
+fn native_claim_denial_returns_a_standard_import_rejection_before_disconnect() {
+    let (mut peer, task, claims) = start_with_claim_error(true, Some(Error::Denied));
+    send(&mut peer, &Message::ImportRequest(KEY.id.bus_id()));
+    assert_eq!(
+        read(&mut peer, Context::Management),
+        Message::ImportReply {
+            status: 1,
+            device: None
+        }
+    );
+    assert_eq!(task.join().unwrap(), Err(Error::Denied));
+    assert_eq!(claims.load(Ordering::SeqCst), 0);
 }
