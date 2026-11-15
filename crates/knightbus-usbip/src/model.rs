@@ -12,6 +12,23 @@ pub const VERSION: u16 = 0x0111;
 /// Fixed transfer header size, including command-specific padding.
 pub const TRANSFER_HEADER_LEN: usize = 48;
 
+/// Common management header: version, operation and status.
+pub const MANAGEMENT_HEADER_BYTES: usize = size_of::<u16>() + size_of::<u16>() + size_of::<u32>();
+/// Fixed-width bus identifier, including its NUL terminator and padding.
+pub const BUS_ID_BYTES: usize = 32;
+/// Encoded device metadata, excluding trailing interface records.
+pub const DEVICE_RECORD_BYTES: usize = 312;
+/// Encoded interface metadata, including its reserved byte.
+pub const INTERFACE_RECORD_BYTES: usize = 4;
+/// DEVLIST reply prefix, including the device count.
+pub const DEVLIST_HEADER_BYTES: usize = MANAGEMENT_HEADER_BYTES + size_of::<u32>();
+/// Successful IMPORT reply, containing one device record.
+pub const IMPORT_REPLY_BYTES: usize = MANAGEMENT_HEADER_BYTES + DEVICE_RECORD_BYTES;
+/// IMPORT request, containing a fixed-width bus identifier.
+pub const IMPORT_REQUEST_BYTES: usize = MANAGEMENT_HEADER_BYTES + BUS_ID_BYTES;
+/// Interface records per device are counted by one unsigned byte.
+pub const MAX_DEVICE_INTERFACES: usize = u8::MAX as usize;
+
 /// Codec failure. A malformed stream must be closed, not resynchronized.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -97,7 +114,7 @@ pub struct Device {
     /// Exporter path.
     pub path: WireString<256>,
     /// Exporter bus ID.
-    pub bus_id: WireString<32>,
+    pub bus_id: WireString<BUS_ID_BYTES>,
     /// USB bus number.
     pub bus_number: u32,
     /// USB device number.
@@ -355,7 +372,7 @@ pub enum Message {
         devices: Vec<ListedDevice>,
     },
     /// Import this bus ID.
-    ImportRequest(WireString<32>),
+    ImportRequest(WireString<BUS_ID_BYTES>),
     /// Import result; device is present exactly when status is zero.
     ImportReply {
         /// Zero for success, otherwise a peer-defined error status.

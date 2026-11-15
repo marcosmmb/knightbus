@@ -8,7 +8,8 @@ use std::{
 #[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
-pub(crate) const FILE_MODE: u32 = 0o600;
+/// Owner-only read/write permissions for private files, including diagnostics.
+pub const FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 pub(crate) const NON_OWNER_ACCESS: u32 = 0o077;
 const PENDING_PREFIX: &str = ".pending-";

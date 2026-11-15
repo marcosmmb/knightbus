@@ -4,6 +4,9 @@
 
 // USB descriptor types, lengths and field offsets. Shared with the kernel
 // validator so parsing and userspace topology construction use the same layout.
+/// USB mass-storage class code used when checking capture consent.
+pub const CLASS_MASS_STORAGE: u8 = 0x08;
+/// Length of the type/length prefix common to USB descriptors.
 pub const DESCRIPTOR_HEADER_BYTES: usize = 2;
 pub const DESCRIPTOR_TYPE: usize = 1;
 pub const DIRECTION_IN: u8 = 0x80;

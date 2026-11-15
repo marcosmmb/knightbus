@@ -35,8 +35,12 @@ separate build; see [Contributing](CONTRIBUTING.md#windows-driver).
 On macOS, list connected USB devices without capturing them:
 
 ```sh
-target/release/knightbus-macos-exporter list
+target/release/knightbus local-list
 ```
+
+The standalone daemon, unified CLI and embedded C library use the same native
+forwarding implementation. See [standalone operation](docs/standalone.md) for
+pairing, sharing, native attachment, diagnostics and platform prerequisites.
 
 ## Documentation
 

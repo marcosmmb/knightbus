@@ -138,7 +138,7 @@ fn management_frame_len(
     limits: Limits,
     cursor: &mut FrameCursor,
 ) -> Result<usize, Error> {
-    need(b, 8, limits)?;
+    need(b, MANAGEMENT_HEADER_BYTES, limits)?;
     if u16_at(b, 0) != VERSION {
         return Err(Error::Invalid("version"));
     }
@@ -148,30 +148,48 @@ fn management_frame_len(
             if status != 0 {
                 return Err(Error::Invalid("request status"));
             }
-            let n = if u16_at(b, 2) == OP_REQ_IMPORT { 40 } else { 8 };
+            let n = if u16_at(b, 2) == OP_REQ_IMPORT {
+                IMPORT_REQUEST_BYTES
+            } else {
+                MANAGEMENT_HEADER_BYTES
+            };
             need(b, n, limits)?;
             Ok(n)
         }
         OP_REP_IMPORT => {
-            let n = if status == 0 { 320 } else { 8 };
+            let n = if status == 0 {
+                IMPORT_REPLY_BYTES
+            } else {
+                MANAGEMENT_HEADER_BYTES
+            };
             need(b, n, limits)?;
             Ok(n)
         }
         OP_REP_DEVLIST => {
             if status != 0 {
-                return Ok(8);
+                return Ok(MANAGEMENT_HEADER_BYTES);
             }
-            need(b, 12, limits)?;
-            let count = bounded(u32_at(b, 8) as usize, limits.devices, "devices")?;
+            need(b, DEVLIST_HEADER_BYTES, limits)?;
+            let count = bounded(
+                u32_at(b, MANAGEMENT_HEADER_BYTES) as usize,
+                limits.devices,
+                "devices",
+            )?;
             bounded(
-                add(12, mul(count, 312)?)?,
+                add(DEVLIST_HEADER_BYTES, mul(count, DEVICE_RECORD_BYTES)?)?,
                 limits.frame_bytes,
                 "device records",
             )?;
-            let mut pos = cursor.list_end.max(12);
+            let mut pos = cursor.list_end.max(DEVLIST_HEADER_BYTES);
             for _ in cursor.listed_devices..count {
-                need(b, add(pos, 312)?, limits)?;
-                let end = add(add(pos, 312)?, mul(b[pos + 311] as usize, 4)?)?;
+                need(b, add(pos, DEVICE_RECORD_BYTES)?, limits)?;
+                let end = add(
+                    add(pos, DEVICE_RECORD_BYTES)?,
+                    mul(
+                        b[pos + DEVICE_RECORD_BYTES - 1] as usize,
+                        INTERFACE_RECORD_BYTES,
+                    )?,
+                )?;
                 need(b, end, limits)?;
                 pos = end;
                 cursor.list_end = end;
@@ -331,11 +349,13 @@ fn management(
     let status = u32_at(b, 4);
     let message = match u16_at(b, 2) {
         OP_REQ_DEVLIST => Message::DevListRequest,
-        OP_REQ_IMPORT => Message::ImportRequest(WireString::parse(&b[8..40])?),
+        OP_REQ_IMPORT => Message::ImportRequest(WireString::parse(
+            &b[MANAGEMENT_HEADER_BYTES..IMPORT_REQUEST_BYTES],
+        )?),
         OP_REP_IMPORT => Message::ImportReply {
             status,
             device: if status == 0 {
-                let device = device(&b[8..320])?;
+                let device = device(&b[MANAGEMENT_HEADER_BYTES..IMPORT_REPLY_BYTES])?;
                 admit(std::mem::size_of::<Device>())?;
                 Some(Box::new(device))
             } else {
@@ -344,15 +364,15 @@ fn management(
         },
         OP_REP_DEVLIST => {
             let count = if status == 0 {
-                u32_at(b, 8) as usize
+                u32_at(b, MANAGEMENT_HEADER_BYTES) as usize
             } else {
                 0
             };
             let mut devices = reserve(count, admit)?;
-            let mut pos = 12;
+            let mut pos = DEVLIST_HEADER_BYTES;
             for _ in 0..count {
-                let d = device(&b[pos..pos + 312])?;
-                pos += 312;
+                let d = device(&b[pos..pos + DEVICE_RECORD_BYTES])?;
+                pos += DEVICE_RECORD_BYTES;
                 let mut interfaces = reserve(d.interfaces as usize, admit)?;
                 for _ in 0..d.interfaces {
                     zero(&b[pos + 3..pos + 4])?;
@@ -361,7 +381,7 @@ fn management(
                         subclass: b[pos + 1],
                         protocol: b[pos + 2],
                     });
-                    pos += 4;
+                    pos += INTERFACE_RECORD_BYTES;
                 }
                 devices.push(ListedDevice {
                     device: d,

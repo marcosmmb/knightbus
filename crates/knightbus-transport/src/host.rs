@@ -1,4 +1,5 @@
 //! Authenticated sessions, peer liveness and shared exporter hosting.
+use crate::operation::Operation;
 use crate::{
     Stream,
     control::{Framed, Message, Rate, TICKET_BYTES, TIMEOUT},
@@ -253,7 +254,7 @@ impl<B: ExporterBackend, C: Clock> Host<B, C> {
     /// Execute locally authenticated management. Callers come from OS credentials,
     /// never from a network message. Both hosts retain the same core contract.
     pub fn execute(&self, caller: Caller, command: Command, deadline: u64) -> Result<Reply> {
-        let permission = matches!(command, Command::Authorize { .. });
+        let permission = matches!(command, Command::Authorize { .. } | Command::Unshare(_));
         let shutdown = matches!(command, Command::Shutdown);
         let result = self
             .engine
@@ -599,9 +600,28 @@ impl Remote {
         peers: &Peers,
         peer: PeerId,
     ) -> Result<Self> {
-        let stream = Stream::connect(stream, identity, peers, peer, Channel::Control, TIMEOUT)?;
+        Self::connect_until(
+            stream,
+            identity,
+            peers,
+            peer,
+            &Operation::new(Instant::now() + TIMEOUT, &|| false),
+        )
+    }
+    /// Negotiate using the caller's shared deadline and cancellation signal.
+    pub fn connect_until(
+        stream: TcpStream,
+        identity: &Identity,
+        peers: &Peers,
+        peer: PeerId,
+        operation: &Operation<'_>,
+    ) -> Result<Self> {
+        let stream =
+            Stream::connect_until(stream, identity, peers, peer, Channel::Control, operation)?;
         let mut wire = Framed::new(stream)?;
-        let hello = wire.receive(TIMEOUT)?.ok_or(Error::Deadline)?;
+        let hello = wire
+            .receive_until(TIMEOUT, operation)?
+            .ok_or(Error::Deadline)?;
         let Message::Hello(ticket) = Message::decode(&hello)? else {
             return Err(Error::Version);
         };
@@ -637,10 +657,16 @@ impl Remote {
             alive.check()?;
             if sent.elapsed() >= HEARTBEAT {
                 sequence = sequence.checked_add(1).ok_or(Error::Exhausted)?;
-                wire.send(&Message::Ping(sequence).encode()?)?;
+                wire.send_until(
+                    &Message::Ping(sequence).encode()?,
+                    &Operation::new(Instant::now() + TIMEOUT, &|| alive.check().is_err()),
+                )?;
                 sent = Instant::now();
             }
-            if let Some(frame) = wire.receive(HOUSEKEEPING)? {
+            if let Some(frame) = wire.receive_until(
+                HOUSEKEEPING,
+                &Operation::new(Instant::now() + TIMEOUT, &|| alive.check().is_err()),
+            )? {
                 match Message::decode(&frame)? {
                     Message::Pong(pong) => {
                         if pong != acknowledged.checked_add(1).ok_or(Error::Exhausted)?
@@ -679,11 +705,27 @@ impl Remote {
     }
     /// Bind one new USB stream to this link using its one-use capability.
     pub fn usb(&mut self, stream: TcpStream, identity: &Identity, peers: &Peers) -> Result<Stream> {
+        self.usb_until(
+            stream,
+            identity,
+            peers,
+            &Operation::new(Instant::now() + TIMEOUT, &|| false),
+        )
+    }
+    /// Bind USB within the same operation as control negotiation and bootstrap.
+    pub fn usb_until(
+        &mut self,
+        stream: TcpStream,
+        identity: &Identity,
+        peers: &Peers,
+        operation: &Operation<'_>,
+    ) -> Result<Stream> {
         self.alive.check()?;
         let ticket = self.ticket.take().ok_or(Error::State)?;
-        let stream = Stream::connect(stream, identity, peers, self.peer, Channel::Usb, TIMEOUT)?;
+        let stream =
+            Stream::connect_until(stream, identity, peers, self.peer, Channel::Usb, operation)?;
         let mut wire = Framed::new(stream)?;
-        wire.send(&ticket)?;
+        wire.send_until(&ticket, operation)?;
         wire.into_stream()
     }
     /// Fail promptly if the authenticated control link has stopped making progress.

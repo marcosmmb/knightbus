@@ -1,0 +1,13 @@
+[package]
+name = "knightbusd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlc = { version = "=3.5.2", features = ["termination"] }
+knightbus-sdk = { path = "../../crates/knightbus-sdk" }
+
+[lints]
+workspace = true

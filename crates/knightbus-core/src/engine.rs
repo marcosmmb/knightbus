@@ -1010,6 +1010,45 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
             return Err(Error::Deadline);
         }
         match command {
+            Command::Info => Ok(Reply::Info {
+                version: CONTROL_VERSION,
+                epoch: self.epoch,
+                now: self.clock.now(),
+            }),
+            Command::Inspect(key) => {
+                if !self.allowed(caller, key) {
+                    return Err(Error::Denied);
+                }
+                Ok(Reply::Inspection(Box::new(
+                    self.inventory[&key.id].device.clone(),
+                )))
+            }
+            Command::Sessions => Ok(Reply::Sessions(
+                self.sessions
+                    .values()
+                    .filter(|lease| caller.administrator || lease.view.peer == caller.peer)
+                    .map(|lease| lease.view.id)
+                    .collect(),
+            )),
+            Command::Unshare(key) => {
+                if !caller.administrator {
+                    return Err(Error::Denied);
+                }
+                if !self.allowed(caller, key) {
+                    return Err(Error::NotFound);
+                }
+                // Evaluate visibility before removing the former grantees.
+                self.emit_inventory(key.id, None);
+                self.grants.retain(|(id, _), _| *id != key.id);
+                let mut cursor = None;
+                while let Some(id) = self.next_session(cursor) {
+                    cursor = Some(id);
+                    if self.sessions[&id].view.devices.contains(&key) {
+                        self.drain(id, Error::Denied);
+                    }
+                }
+                Ok(Reply::Done)
+            }
             Command::List => Ok(Reply::Devices(
                 self.inventory
                     .values()

@@ -179,3 +179,17 @@ requires new state and explicit re-pairing. Disconnections never silently reatta
 Traffic is encrypted between paired hosts, but a permitted importer controls the
 USB device and can read its data. Ordinary logs contain status and metadata,
 not USB payloads or private keys.
+
+## Application hosting
+
+`knightbus-sdk` composes the native backends and existing core/transport hosts.
+`knightbusd` adds an authenticated local listener and process shutdown handling;
+`knightbus-ffi` adds opaque C handles, explicit response ownership and panic
+containment. Neither adapter implements USB forwarding. Service management clients
+can disconnect while native forwarding continues. Embedded owners retain the
+host until shutdown and confirmed cleanup. See the [control API](control-api.md)
+and [standalone commands](standalone.md).
+
+The optional `knightbus-sdk/mdns` feature supplies untrusted address hints only.
+It never changes identity enrollment or device authorization. User configuration
+selects one native role; starting an importer does not automatically attach.

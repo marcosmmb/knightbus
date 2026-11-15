@@ -1,0 +1,25 @@
+[package]
+name = "knightbus-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+mdns = ["dep:mdns-sd"]
+
+[dependencies]
+mdns-sd = { version = "=0.21.7", default-features = false, optional = true }
+knightbus-core = { path = "../knightbus-core" }
+knightbus-ipc = { path = "../knightbus-ipc" }
+knightbus-transport = { path = "../knightbus-transport" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+knightbus-macos-exporter = { path = "../exporters/knightbus-macos-exporter" }
+
+[target.'cfg(windows)'.dependencies]
+knightbus-windows-importer = { path = "../importers/knightbus-windows-importer" }
+
+[lints]
+workspace = true

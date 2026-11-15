@@ -255,6 +255,7 @@ impl Connection {
 }
 /// Local IPC client using the same versioned commands and stable errors as direct calls.
 pub struct Client {
+    failed: bool,
     stream: Stream,
     next: u64,
     runtime: Arc<Runtime>,
@@ -290,12 +291,16 @@ impl Client {
         Ok(Self {
             stream,
             next: 0,
+            failed: false,
             runtime,
         })
     }
 }
 impl KnightBusControl for Client {
     fn call(&mut self, command: Command, deadline: u64) -> Result<Reply> {
+        if self.failed {
+            return Err(Error::State);
+        }
         self.next = self.next.checked_add(1).ok_or(Error::Exhausted)?;
         let bytes = crate::encode_request(&Request {
             version: CONTROL_VERSION,
@@ -303,17 +308,28 @@ impl KnightBusControl for Client {
             deadline,
             command,
         })?;
-        self.runtime
-            .block_on(write_frame(&mut self.stream, &bytes))?;
-        let response = crate::decode_response(
-            &self
-                .runtime
-                .block_on(read_frame(&mut self.stream, IO_TIMEOUT))?,
-        )?;
-        if response.id != self.next {
-            return Err(Error::Invalid);
+        // After ambiguous I/O failure, never append another mutation to this stream.
+        // The caller must reconnect and inspect state before deciding to retry.
+        let response = (|| {
+            self.runtime
+                .block_on(write_frame(&mut self.stream, &bytes))?;
+            let response = crate::decode_response(
+                &self
+                    .runtime
+                    .block_on(read_frame(&mut self.stream, IO_TIMEOUT))?,
+            )?;
+            if response.id != self.next {
+                return Err(Error::Invalid);
+            }
+            Ok(response)
+        })();
+        match response {
+            Ok(response) => response.result,
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
         }
-        response.result
     }
 }
 #[cfg(windows)]

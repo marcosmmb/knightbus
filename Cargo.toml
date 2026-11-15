@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    "tests/host-mode-parity",
+    "crates/knightbus-ffi",
+    "applications/knightbusd",
+    "applications/knightbus",
+    "crates/knightbus-sdk",
     "crates/knightbus-usbip",
     "crates/knightbus-usb",
     "crates/knightbus-core",

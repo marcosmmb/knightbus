@@ -29,13 +29,13 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo +${{ matrix.rust }} fetch --locked
       - name: Lint
-        run: cargo +${{ matrix.rust }} clippy --workspace --all-targets --locked --offline -- -D warnings
+        run: cargo +${{ matrix.rust }} clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
       - name: Tests
-        run: cargo +${{ matrix.rust }} test --workspace --all-targets --locked --offline
+        run: cargo +${{ matrix.rust }} test --workspace --all-targets --all-features --locked --offline
       - name: Release tests and doctests
-        run: cargo +${{ matrix.rust }} test --workspace --release --locked --offline
+        run: cargo +${{ matrix.rust }} test --workspace --all-features --release --locked --offline
       - name: Documentation
-        run: cargo +${{ matrix.rust }} doc --workspace --no-deps --locked --offline
+        run: cargo +${{ matrix.rust }} doc --workspace --all-features --no-deps --locked --offline
         env:
           RUSTDOCFLAGS: -D warnings
   fuzz:

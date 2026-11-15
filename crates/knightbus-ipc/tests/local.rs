@@ -270,6 +270,7 @@ fn shutdown_acknowledges_then_closes_and_encoding_errors_keep_correlation() {
     );
     assert_eq!(client.call(Command::Shutdown, u64::MAX), Ok(Reply::Done));
     assert!(client.call(Command::List, u64::MAX).is_err());
+    assert_eq!(client.call(Command::List, u64::MAX), Err(Error::State));
     drop(client);
     worker.join().unwrap();
     drop(state);
