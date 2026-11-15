@@ -12,3 +12,7 @@ machine belong in `lab/`.
 Lab tools must depend on the actual crates or invoke their built executables.
 Do not copy importer, exporter, shared-crate, or driver implementations into
 `lab/`, and do not generate alternate source workspaces or restore lab hooks.
+
+Keep public documentation focused on usage, architecture and contributions.
+Put development notes, validation reports and hardware instructions in `lab/`.
+Do not include milestones or internal project tracking in public documentation.

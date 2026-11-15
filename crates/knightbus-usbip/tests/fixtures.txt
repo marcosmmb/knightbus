@@ -1,6 +1,6 @@
 # Original USB/IP 1.1.1 golden vectors; synthetic, independently authored.
 # Named sections contain whitespace-insensitive hex bytes.
-# See docs/protocol-usbip-1.1.1.md for provenance and reply contexts.
+# Reply contexts are defined beside their cases in protocol.rs.
 
 [bulk-in]
 00000001102030400007000400000001

@@ -212,7 +212,7 @@ fn open_device(
             }
         },
     );
-    let result = unsafe {
+    unsafe {
         IOUSBHostDevice::initWithIOService_options_queue_error_interestHandler(
             IOUSBHostDevice::alloc(),
             service.0,
@@ -226,8 +226,7 @@ fn open_device(
             RcBlock::as_ptr(&callback),
         )
         .ok_or_else(|| native_error(error.as_deref()))
-    };
-    result
+    }
 }
 fn read_snapshot(device: &IOUSBHostDevice, id: Identity, key: DeviceKey) -> Result<Snapshot> {
     let descriptor = control(device, usb::READ_DEVICE_DESCRIPTOR)?;

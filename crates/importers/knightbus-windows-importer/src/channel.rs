@@ -10,7 +10,7 @@ pub(crate) use knightbus_windows_protocol::wire::{
 pub(crate) use knightbus_windows_protocol::wire::{HEADER, STATS_BYTES};
 pub use knightbus_windows_protocol::wire::{MAX_TRANSFER, SLOTS};
 
-// Offsets in the private driver ABI; keep these aligned with windows-driver-ipc.md.
+// Offsets in the private driver ABI, defined by knightbus-windows-protocol.
 pub(crate) const ABI_VERSION: u32 = 1;
 pub(crate) mod transfer {
     pub const VERSION: usize = 0;
