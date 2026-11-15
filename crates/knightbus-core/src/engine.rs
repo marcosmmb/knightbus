@@ -717,6 +717,36 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
         // Notify once, whether timeout or backend release failure caused it.
         self.emit_session(id);
     }
+    /// Remove all grants and drain all leases for a revoked authenticated peer.
+    /// Only trusted host composition calls this after changing its trust store.
+    pub fn revoke_peer(&mut self, peer: PeerId) {
+        self.grants.retain(|(_, grantee), _| *grantee != peer);
+        let mut cursor = None;
+        while let Some(id) = self.next_session(cursor) {
+            cursor = Some(id);
+            if self.sessions[&id].view.peer == peer {
+                self.drain(id, Error::Denied);
+            }
+        }
+        // No device identifiers are disclosed by inventory notifications.
+        let mut after = None;
+        loop {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let next = match after {
+                None => self.inventory.keys().next().copied(),
+                Some(id) => self
+                    .inventory
+                    .range((Excluded(id), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id),
+            };
+            let Some(id) = next else {
+                break;
+            };
+            self.emit_inventory(id, Some(peer));
+            after = Some(id);
+        }
+    }
     /// Freeze ingress and begin idempotent drain. Continue ticking until stopped.
     pub fn shutdown(&mut self) {
         self.stopped = true;
@@ -845,8 +875,14 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
             if self.stopped {
                 return Err(Error::State);
             }
-            if self.grants.len() >= self.config.grants
-                && !self.grants.contains_key(&(device.id, peer))
+            let existing = self.grants.contains_key(&(device.id, peer));
+            let device_grants = self
+                .grants
+                .keys()
+                .filter(|(id, _)| *id == device.id)
+                .count();
+            if !existing
+                && (self.grants.len() >= self.config.grants || device_grants >= MAX_DEVICE_GRANTS)
             {
                 return Err(Error::Exhausted);
             }
@@ -915,6 +951,21 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
         );
         Ok(Reply::Subscription(id))
     }
+    fn permissions(&self, caller: Caller, key: DeviceKey) -> Result<Reply> {
+        if !caller.administrator {
+            return Err(Error::Denied);
+        }
+        if !self.allowed(caller, key) {
+            return Err(Error::NotFound);
+        }
+        Ok(Reply::Peers(
+            self.grants
+                .keys()
+                .filter(|(id, _)| *id == key.id)
+                .map(|(_, peer)| *peer)
+                .collect(),
+        ))
+    }
     fn poll_event(&mut self, caller: Caller, id: u64) -> Result<Reply> {
         let sub = self
             .subscribers
@@ -974,6 +1025,7 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
                 peer,
                 allow,
             } => self.authorize(caller, device, peer, allow),
+            Command::Permissions(key) => self.permissions(caller, key),
             Command::Attach(keys) => self.attach(caller, keys, deadline),
             Command::Detach(id) => {
                 self.owner(caller, id)?;

@@ -174,17 +174,16 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ImporterBackend for B
         if self.session.is_some_and(|s| s != session) {
             return Poll::Ready(Err(Error::State));
         }
-        if let Some(descriptors) = &self.descriptors {
-            if session.epoch == 0
+        if let Some(descriptors) = &self.descriptors
+            && (session.epoch == 0
                 || session.serial == 0
                 || device.wire.vendor_id != descriptors.topology.vid
                 || device.wire.product_id != descriptors.topology.pid
                 || device.wire.speed != descriptors.speed as u32
                 || device.wire.bus_number > u32::from(u16::MAX)
-                || device.wire.device_number > u32::from(u16::MAX)
-            {
-                return Poll::Ready(Err(Error::Invalid));
-            }
+                || device.wire.device_number > u32::from(u16::MAX))
+        {
+            return Poll::Ready(Err(Error::Invalid));
         }
         if let Some(factory) = self.factory.take() {
             self.session = Some(session);
@@ -227,16 +226,15 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ImporterBackend for B
         }
         for offset in 0..SLOTS {
             let index = (m.next_request + offset) % SLOTS;
-            if let Some(t) = &m.requests[index] {
-                if !t.layout().is_empty()
-                    && m.requests.iter().flatten().any(|earlier| {
-                        earlier.header().endpoint == t.header().endpoint
-                            && earlier.header().direction == t.header().direction
-                            && earlier.header().seqnum < t.header().seqnum
-                    })
-                {
-                    continue;
-                }
+            if let Some(t) = &m.requests[index]
+                && !t.layout().is_empty()
+                && m.requests.iter().flatten().any(|earlier| {
+                    earlier.header().endpoint == t.header().endpoint
+                        && earlier.header().direction == t.header().direction
+                        && earlier.header().seqnum < t.header().seqnum
+                })
+            {
+                continue;
             }
             if let Some(transfer) = m.requests[index].take() {
                 m.next_request = (index + 1) % SLOTS;

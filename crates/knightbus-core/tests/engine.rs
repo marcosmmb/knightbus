@@ -1747,3 +1747,107 @@ fn engine_validates_configuration_before_constructing_native_backend() {
     assert!(matches!(result, Err(knightbus_core::Error::Invalid)));
     assert!(!called.get());
 }
+
+#[test]
+fn revoking_a_peer_clears_all_grants_and_drains_active_and_partial_claims() {
+    for partial in [false, true] {
+        let (mut engine, native, _) = fixture(Config::default());
+        grant(&mut engine, KEY, PEER);
+        grant(&mut engine, KEY, OTHER);
+        assert_eq!(
+            engine.execute(USER, Command::Permissions(KEY), END),
+            Err(knightbus_core::Error::Denied)
+        );
+        assert_eq!(
+            engine.execute(ADMIN, Command::Permissions(KEY), END),
+            Ok(Reply::Peers(vec![PEER, OTHER]))
+        );
+        native.0.borrow_mut().pending_claim = partial;
+        let session = attach(&mut engine, vec![KEY]);
+        engine.tick();
+        engine.revoke_peer(PEER);
+        engine.revoke_peer(PEER);
+        native.0.borrow_mut().pending_claim = false;
+        engine.tick();
+        assert_eq!(status(&mut engine, session).state, SessionState::Closed);
+        assert!(engine.discover(USER).is_empty());
+        assert_eq!(
+            engine.execute(ADMIN, Command::Permissions(KEY), END),
+            Ok(Reply::Peers(vec![OTHER]))
+        );
+        assert!(
+            !engine
+                .discover(Caller {
+                    peer: OTHER,
+                    administrator: false
+                })
+                .is_empty()
+        );
+        let request = Request {
+            version: CONTROL_VERSION,
+            id: 1,
+            deadline: END,
+            command: Command::Permissions(KEY),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Response {
+            id: 1,
+            result: Ok(Reply::Peers(vec![OTHER])),
+        };
+        assert_eq!(
+            knightbus_ipc::decode_response(&knightbus_ipc::encode_response(&response).unwrap())
+                .unwrap(),
+            response
+        );
+    }
+}
+
+#[test]
+fn every_admitted_permission_list_fits_the_control_protocol() {
+    let (mut engine, _, _) = fixture(Config::default());
+    let peer = |index: usize| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        PeerId(bytes)
+    };
+    for index in 0..MAX_DEVICE_GRANTS {
+        grant(&mut engine, KEY, peer(index));
+    }
+    grant(&mut engine, KEY, peer(0)); // Idempotent even at capacity.
+    assert_eq!(
+        engine.execute(
+            ADMIN,
+            Command::Authorize {
+                device: KEY,
+                peer: peer(MAX_DEVICE_GRANTS),
+                allow: true
+            },
+            END
+        ),
+        Err(knightbus_core::Error::Exhausted)
+    );
+    let reply = engine
+        .execute(ADMIN, Command::Permissions(KEY), END)
+        .unwrap();
+    let response = Response {
+        id: 1,
+        result: Ok(reply),
+    };
+    let bytes = knightbus_ipc::encode_response(&response).unwrap();
+    assert_eq!(knightbus_ipc::decode_response(&bytes).unwrap(), response);
+    engine
+        .execute(
+            ADMIN,
+            Command::Authorize {
+                device: KEY,
+                peer: peer(0),
+                allow: false,
+            },
+            END,
+        )
+        .unwrap();
+    grant(&mut engine, KEY, peer(MAX_DEVICE_GRANTS));
+}

@@ -1,9 +1,9 @@
 use knightbus_core::*;
-const MAX_FRAME: usize = 8192;
+pub(crate) const MAX_FRAME: usize = 8192;
 const MAX_ITEMS: usize = 256;
 
 // Fixed widths in this provisional control schema, independent of Rust layouts.
-const LENGTH_PREFIX_BYTES: usize = 4;
+pub(crate) const LENGTH_PREFIX_BYTES: usize = 4;
 const DEVICE_KEY_BYTES: usize = 16; // device ID + generation, both u64
 const DEVICE_INFO_BYTES: usize = DEVICE_KEY_BYTES + 1; // key + busy boolean
 
@@ -19,12 +19,14 @@ const CMD_POLL: u8 = 7;
 const CMD_UNSUBSCRIBE: u8 = 8;
 const CMD_FORGET: u8 = 9;
 const CMD_SHUTDOWN: u8 = 10;
+const CMD_PERMISSIONS: u8 = 11;
 
 const REPLY_DONE: u8 = 0;
 const REPLY_DEVICES: u8 = 1;
 const REPLY_SESSION: u8 = 2;
 const REPLY_SUBSCRIPTION: u8 = 3;
 const REPLY_EVENT: u8 = 4;
+const REPLY_PEERS: u8 = 5;
 
 const STATE_ACQUIRING: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
@@ -106,6 +108,10 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
         Command::Forget(id) => {
             put(CMD_FORGET);
             session(&mut b, *id);
+        }
+        Command::Permissions(device) => {
+            put(CMD_PERMISSIONS);
+            key(&mut b, *device);
         }
         Command::Shutdown => put(CMD_SHUTDOWN),
     }
@@ -194,6 +200,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request> {
         CMD_UNSUBSCRIBE => Command::Unsubscribe(r.u64()?),
         CMD_FORGET => Command::Forget(r.session()?),
         CMD_SHUTDOWN => Command::Shutdown,
+        CMD_PERMISSIONS => Command::Permissions(r.key()?),
         _ => return Err(Error::Invalid),
     };
     if !r.0.is_empty() || id == 0 {
@@ -217,6 +224,16 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
         Ok(reply) => {
             b.extend_from_slice(&STATUS_OK.to_le_bytes());
             match reply {
+                Reply::Peers(peers) => {
+                    if peers.len() > MAX_DEVICE_GRANTS {
+                        return Err(Error::Exhausted);
+                    }
+                    b.push(REPLY_PEERS);
+                    b.extend_from_slice(&(peers.len() as u16).to_le_bytes());
+                    for peer in peers {
+                        b.extend_from_slice(&peer.0);
+                    }
+                }
                 Reply::Done => b.push(REPLY_DONE),
                 Reply::Devices(devices) => {
                     if devices.len() > MAX_ITEMS {
@@ -328,6 +345,14 @@ pub fn decode_response(frame: &[u8]) -> Result<Response> {
         Err(error)
     } else {
         Ok(match r.take::<1>()?[0] {
+            REPLY_PEERS => {
+                let count = r.count(32)?;
+                let mut peers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    peers.push(PeerId(r.take()?));
+                }
+                Reply::Peers(peers)
+            }
             REPLY_DONE => Reply::Done,
             REPLY_DEVICES => {
                 let count = r.count(DEVICE_INFO_BYTES)?;

@@ -46,8 +46,12 @@ fn native_iso_envelope_validates_every_boundary_before_borrowing() {
             },
         ]
         .iter()
-        .zip(bytes[iso::HEADER + payload..].chunks_exact_mut(16))
-        {
+        .zip(
+            bytes[iso::HEADER + payload..]
+                .as_chunks_mut::<16>()
+                .0
+                .iter_mut(),
+        ) {
             p.write(out);
         }
         let request = Request::decode(&bytes, &topology).unwrap();

@@ -6,7 +6,7 @@ Bug reports should include the OS, device and steps to reproduce the problem.
 
 ## Build and check
 
-The workspace pins Rust 1.85.0. From the repository root:
+The workspace pins Rust 1.88.0. From the repository root:
 
 ```sh
 cargo fetch --locked
@@ -50,7 +50,8 @@ interface; preserve other interfaces and report native USB errors through
 `ControlError`. Failed topology changes retire the device through the shared worker.
 
 Compose an exporter worker inside `Engine::new` and serve connections with
-`transport::exporter::serve`. Importers use `transport::importer::connect` to
+`transport::host::Host`. Importers keep a `transport::host::Remote` control link
+and use its authenticated stream with `transport::importer::connect` to
 validate descriptors, create the worker and forward requests using one budget.
 Implement new cross-platform behavior in the shared contract and its tests first.
 
@@ -74,18 +75,18 @@ installed separately.
 
 ## Fuzzing
 
-The USB/IP fuzz workspace tests whole-frame and incremental decoding. Its shared
+The fuzz workspace tests whole-frame USB/IP, incremental USB/IP and control decoding. Its shared
 assertions also run against synthetic fixtures in the ordinary test suite.
 On Linux or macOS with a C++ compiler, run from the repository root:
 
 ```sh
 rustup toolchain install nightly-2026-05-25 --profile minimal
-cargo +1.85.0 install cargo-fuzz --version 0.13.1 --locked
+cargo +1.88.0 install cargo-fuzz --version 0.13.1 --locked
 cargo +nightly-2026-05-25 fetch --manifest-path crates/knightbus-usbip/tests/fuzz/Cargo.toml --locked
 cargo test -p knightbus-usbip --locked --offline --test protocol write_fuzz_seeds -- --ignored
 ```
 
-Then run each target (`decode` and `stream`) using:
+Then run each target (`decode`, `stream` and `control`) using:
 
 ```sh
 ASAN_OPTIONS=quarantine_size_mb=32 CARGO_NET_OFFLINE=true cargo +nightly-2026-05-25 fuzz run --fuzz-dir crates/knightbus-usbip/tests/fuzz decode -- -max_total_time=45 -max_len=8192 -rss_limit_mb=512

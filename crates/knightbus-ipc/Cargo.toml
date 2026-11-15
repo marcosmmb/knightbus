@@ -9,5 +9,20 @@ repository.workspace = true
 [dependencies]
 knightbus-core = { path = "../knightbus-core" }
 
-[lints]
-workspace = true
+interprocess = { version = "=2.4.8", features = ["tokio"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "time", "io-util", "net", "sync", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.6", features = ["process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "=1.2.1"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_SystemServices"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

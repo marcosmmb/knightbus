@@ -183,7 +183,11 @@ fn start(
             .unwrap();
         }
         let budget = e.budget();
-        let result = transport::serve(&mut e, listener.accept().unwrap().0, CALLER);
+        let result = transport::serve_insecure(
+            &mut e,
+            knightbus_transport::Stream::insecure_loopback(listener.accept().unwrap().0).unwrap(),
+            CALLER,
+        );
         e.shutdown();
         e.tick();
         assert!(e.shutdown_complete());
@@ -495,4 +499,219 @@ fn iso_unlink_and_disconnect_retire_in_both_directions() {
         assert_eq!(task.join().unwrap(), Err(Error::Unavailable));
         assert_eq!(claims.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
+    use knightbus_transport::{
+        Connection,
+        host::{Host, Remote},
+        security::{Identity, Peers},
+    };
+    use std::time::Instant;
+    let exporter = Identity::generate().unwrap();
+    let importer = Identity::generate().unwrap();
+    let exporter_id = exporter.peer();
+    let importer_id = importer.peer();
+    let mut peers = Peers::default();
+    for id in [&exporter, &importer] {
+        peers.pair(id.certificate().to_vec(), id.peer()).unwrap();
+    }
+    let claims = Arc::new(AtomicUsize::new(0));
+    let mut engine = Engine::new(Mono::default(), Config::default(), 1, |_| {
+        Ok(Mock {
+            pending: VecDeque::new(),
+            cancelled: None,
+            claims: claims.clone(),
+        })
+    })
+    .unwrap();
+    engine.register(device()).unwrap();
+    let budget = engine.budget();
+    let host = Arc::new(Host::new(engine, exporter, peers.clone()));
+    let usb = TcpListener::bind("127.0.0.1:0").unwrap();
+    let usb_address = usb.local_addr().unwrap();
+    let control = TcpListener::bind("127.0.0.1:0").unwrap();
+    let control_address = control.local_addr().unwrap();
+    let management_dir = std::env::temp_dir().join(format!(
+        "kb-host-stop-{}-{}",
+        std::process::id(),
+        knightbus_transport::security::epoch().unwrap()
+    ));
+    let private = knightbus_ipc::private::Directory::open(&management_dir).unwrap();
+    #[cfg(unix)]
+    let management_path = management_dir.join("socket");
+    #[cfg(windows)]
+    let management_path = std::path::PathBuf::from(format!(
+        r"\\.\pipe\{}",
+        management_dir.file_name().unwrap().to_str().unwrap()
+    ));
+    let management = knightbus_transport::local::Listener::bind(&management_path).unwrap();
+    let server = host.clone();
+    let (finished, stopped) = std::sync::mpsc::channel();
+    let task = std::thread::spawn(move || {
+        let result = server.run(usb, control, Some(&management), None);
+        finished.send(()).unwrap();
+        result
+    });
+    let mut idle = knightbus_transport::local::Client::connect(&management_path).unwrap();
+    assert!(matches!(
+        idle.call(Command::Subscribe, u64::MAX),
+        Ok(Reply::Subscription(_))
+    ));
+    let open = || {
+        let mut remote = Remote::connect(
+            TcpStream::connect(control_address).unwrap(),
+            &importer,
+            &peers,
+            exporter_id,
+        )
+        .unwrap();
+        let stream = remote
+            .usb(TcpStream::connect(usb_address).unwrap(), &importer, &peers)
+            .unwrap();
+        // The ticket is consumed even if the import subsequently fails.
+        assert!(matches!(
+            remote.usb(TcpStream::connect(usb_address).unwrap(), &importer, &peers),
+            Err(Error::State)
+        ));
+        let wire = Connection::new(
+            stream,
+            Budget::new(ResourceLimits {
+                bytes: 4 * 1024 * 1024,
+                requests: 32,
+            }),
+            Limits::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        (remote, wire)
+    };
+    let exchange = |wire: &mut Connection, message: &Message, context| {
+        wire.send(message).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline);
+            wire.flush().unwrap();
+            if let Some(message) = wire.receive(|_, _| Ok(context)).unwrap() {
+                return message;
+            }
+            wire.wait(Duration::from_millis(10)).unwrap();
+        }
+    };
+    let (remote, mut wire) = open();
+    assert!(
+        matches!(exchange(&mut wire,&Message::DevListRequest,Context::Management).message(),Message::DevListReply {devices,..} if devices.is_empty())
+    );
+    drop(wire);
+    drop(remote);
+    assert_eq!(claims.load(Ordering::SeqCst), 0);
+    let admin = Caller {
+        administrator: true,
+        peer: importer_id,
+    };
+    host.execute(
+        admin,
+        Command::Authorize {
+            device: KEY,
+            peer: importer_id,
+            allow: true,
+        },
+        u64::MAX,
+    )
+    .unwrap();
+    // A control-link loss must retire native ownership even while USB TCP remains open.
+    let (remote, mut wire) = open();
+    assert!(matches!(
+        exchange(
+            &mut wire,
+            &Message::ImportRequest(KEY.id.bus_id()),
+            Context::Management
+        )
+        .message(),
+        Message::ImportReply { status: 0, .. }
+    ));
+    assert_eq!(claims.load(Ordering::SeqCst), 1);
+    // Keep the device through pushed lifecycle events and another heartbeat.
+    // Notifications use valid control response IDs, so receiving one cannot kill the lease.
+    let start = Instant::now();
+    let mut events = Vec::new();
+    while start.elapsed() < Duration::from_millis(3300) {
+        remote.check().unwrap();
+        if let Some(event) = remote.event() {
+            events.push(event);
+        }
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(events.iter().any(|event| event.kind == EventKind::Session));
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    drop(remote);
+    let end = Instant::now() + Duration::from_secs(5);
+    while claims.load(Ordering::SeqCst) != 0 {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(wire);
+    let (remote, mut wire) = open();
+    assert!(matches!(
+        exchange(
+            &mut wire,
+            &Message::ImportRequest(KEY.id.bus_id()),
+            Context::Management
+        )
+        .message(),
+        Message::ImportReply { status: 0, .. }
+    ));
+    host.revoke(importer_id).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while claims.load(Ordering::SeqCst) != 0 {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Re-enrollment never restores the revoked device grants.
+    host.pair(importer.certificate().to_vec(), importer_id)
+        .unwrap();
+    let Reply::Devices(devices) = host
+        .execute(
+            Caller {
+                administrator: false,
+                peer: importer_id,
+            },
+            Command::List,
+            u64::MAX,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(devices.is_empty());
+    drop(remote);
+    drop(wire);
+    let (ready, busy) = std::sync::mpsc::channel();
+    let busy_client = std::thread::spawn(move || {
+        let mut client = knightbus_transport::local::Client::connect(&management_path).unwrap();
+        client.call(Command::List, u64::MAX).unwrap();
+        ready.send(()).unwrap();
+        while client.call(Command::List, u64::MAX).is_ok() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    busy.recv_timeout(Duration::from_secs(5)).unwrap();
+    host.shutdown();
+    stopped
+        .recv_timeout(Duration::from_secs(5))
+        .expect("idle and busy management clients must not delay shutdown");
+    task.join().unwrap().unwrap();
+    busy_client.join().unwrap();
+    drop(idle);
+    drop(private);
+    std::fs::remove_dir_all(management_dir).unwrap();
+    drop(host);
+    assert_eq!(budget.usage().bytes, 0);
+    assert_eq!(budget.usage().requests, 0);
 }

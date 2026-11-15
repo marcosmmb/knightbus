@@ -6,6 +6,12 @@ mod standalone;
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use knightbus_macos_exporter::native;
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if let Some(result) = knightbus_transport::host::command(&args) {
+        return result;
+    }
+    if let Some(result) = knightbus_transport::security::command(&args) {
+        return result;
+    }
     match args.as_slice() {
         [] => list(),
         [command] if command == "list" => list(),

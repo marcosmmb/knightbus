@@ -215,10 +215,10 @@ impl Driver for Fake {
         if s.busy.contains(&id) {
             return Err((SubmitError::Busy, t));
         }
-        if let Some(bytes) = s.scratch_bytes.get(&id) {
-            if let Err(error) = t.reserve_native_memory(*bytes) {
-                return Err((SubmitError::Failed(error), t));
-            }
+        if let Some(bytes) = s.scratch_bytes.get(&id)
+            && let Err(error) = t.reserve_native_memory(*bytes)
+        {
+            return Err((SubmitError::Failed(error), t));
         }
         if t.layout().is_empty()
             && s.pending

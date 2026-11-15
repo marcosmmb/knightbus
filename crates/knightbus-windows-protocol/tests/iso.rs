@@ -75,7 +75,10 @@ fn packet_records_reject_mutated_layout_and_invalid_results() {
         },
     ];
     let mut encoded = [0; 32];
-    for (p, bytes) in original.iter().zip(encoded.chunks_exact_mut(16)) {
+    for (p, bytes) in original
+        .iter()
+        .zip(encoded.as_chunks_mut::<16>().0.iter_mut())
+    {
         p.write(bytes);
     }
     assert_eq!(Packets::decode(&encoded, 16, false).unwrap().len(), 2);
@@ -92,7 +95,7 @@ fn packet_records_reject_mutated_layout_and_invalid_results() {
             ..original[1]
         },
     ];
-    for (p, bytes) in reply.iter().zip(encoded.chunks_exact_mut(16)) {
+    for (p, bytes) in reply.iter().zip(encoded.as_chunks_mut::<16>().0.iter_mut()) {
         p.write(bytes);
     }
     assert!(Packets::decode(&encoded, 16, false).is_err());
@@ -212,10 +215,12 @@ fn failed_iso_results_complete_immediately_and_keep_packet_results() {
                 bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
             bytes[HEADER..HEADER + actual as usize].fill(0x5a);
-            for (packet, target) in records
-                .iter()
-                .zip(bytes[HEADER + actual as usize..].chunks_exact_mut(PACKET_BYTES))
-            {
+            for (packet, target) in records.iter().zip(
+                bytes[HEADER + actual as usize..]
+                    .as_chunks_mut::<PACKET_BYTES>()
+                    .0
+                    .iter_mut(),
+            ) {
                 packet.write(target);
             }
             let reply = Reply::decode(&bytes).unwrap();

@@ -18,7 +18,7 @@ fn pair(timeout: Duration) -> (Wire, TcpStream, Budget) {
     });
     (
         Wire::new(
-            receiver,
+            knightbus_transport::Stream::insecure_loopback(receiver).unwrap(),
             b.clone(),
             timeout,
             knightbus_core::Capabilities {

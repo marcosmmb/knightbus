@@ -87,12 +87,12 @@ pub(crate) fn reserve_capacity<T>(
         let extra = (v.capacity() - n)
             .checked_mul(size)
             .ok_or(Error::Allocation)?;
-        if extra != 0 {
-            if let Err(error) = admit(extra) {
-                // Do not retain an allocation whose excess capacity was denied.
-                *v = Vec::new();
-                return Err(error);
-            }
+        if extra != 0
+            && let Err(error) = admit(extra)
+        {
+            // Do not retain an allocation whose excess capacity was denied.
+            *v = Vec::new();
+            return Err(error);
         }
     }
     Ok(())
@@ -260,7 +260,7 @@ fn iso(
 ) -> Result<Vec<IsoPacket>, Error> {
     let mut sum = 0u32;
     // Validate every descriptor before allocating its representation.
-    for p in b.chunks_exact(16) {
+    for p in b.as_chunks::<16>().0 {
         let offset = u32_at(p, 0);
         let length = u32_at(p, 4);
         let actual = u32_at(p, 8);
@@ -275,7 +275,7 @@ fn iso(
         return Err(Error::Invalid("ISO actual sum"));
     }
     let mut packets = reserve(b.len() / 16, admit)?;
-    for p in b.chunks_exact(16) {
+    for p in b.as_chunks::<16>().0 {
         packets.push(IsoPacket {
             offset: u32_at(p, 0),
             length: u32_at(p, 4),
