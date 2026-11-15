@@ -25,3 +25,6 @@ pub const TIMED_OUT: i32 = -110;
 pub const CANCELLED: i32 = -125;
 /// Linux ECONNRESET; successful USB/IP unlink cancellation.
 pub const CONNECTION_RESET: i32 = -104;
+
+/// ISO packet was not serviced (Linux EXDEV).
+pub const NOT_ACCESSED: i32 = -18;

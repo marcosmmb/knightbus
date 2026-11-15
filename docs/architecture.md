@@ -75,11 +75,20 @@ the importer communicates with the KnightBus UdeCx driver, which presents a virt
 device to Windows USB class drivers. The driver validates its private channel
 independently using `knightbus-windows-protocol`; it does not parse USB/IP traffic.
 
-The current importer accepts one selected configuration and one outstanding
-request per endpoint address. Windows additionally limits descriptor trees to
-4 KiB and transfers to 1 MiB, and does not support remote wake or bulk streams.
-The forwarding path supports control, bulk and interrupt transfers. ISO structures
-in the codec do not imply end-to-end isochronous support.
+The importer accepts one selected configuration. Bulk and interrupt endpoints
+keep one outstanding request each; ISO endpoints can queue several requests within
+the same device-wide memory limit. Windows limits descriptor trees to 4 KiB and
+transfers to 1 MiB, and does not support remote wake or bulk streams.
+
+ISO packets keep their individual lengths and errors across USB/IP. The exporter
+queues physical transfers ASAP. Windows uses a local virtual frame clock and holds
+early replies until their scheduled frames finish; the two hosts do not share a
+USB clock. These timing buffers apply only to ISO transfers.
+
+Core also owns configuration changes, alternate-setting changes and halt recovery.
+It validates each target and drains only the affected requests. Native adapters
+implement explicit device/interface operations; each interface owns its own pipe
+handles, so unrelated interfaces can keep their outstanding transfers.
 
 To add an adapter, implement the core's native driver trait and reuse the workers
 and transport. See [Contributing](../CONTRIBUTING.md#adding-an-os-adapter).

@@ -5,7 +5,7 @@
 use crate::constants::limits;
 use crate::{SLOTS, descriptors};
 use block2::RcBlock;
-use knightbus_core::exporter::{Driver, SubmitError};
+use knightbus_core::exporter::{ControlError, Driver, SubmitError};
 use knightbus_core::usbip::status;
 use knightbus_core::{
     Budget, Completion, Device, DeviceId, DeviceKey, Error, MemoryReservation, Result, Transfer,
@@ -345,14 +345,79 @@ struct Operation {
     cancelled: bool,
     _credit: MemoryReservation,
 }
+/// OS handles owned by one interface, never by a neighbouring interface.
+pub struct NativeInterface {
+    handle: Retained<IOUSBHostInterface>,
+    alternate: u8,
+    pipes: BTreeMap<u8, Retained<IOUSBHostPipe>>,
+}
+impl NativeInterface {
+    fn rebuild(&mut self, setting: &knightbus_core::Interface) -> Result<()> {
+        self.pipes.clear();
+        for endpoint in &setting.endpoints {
+            let pipe = unsafe {
+                self.handle
+                    .copyPipeWithAddress_error(endpoint.address.into())
+            }
+            .map_err(|e| native_error(Some(&e)))?;
+            self.pipes.insert(endpoint.address, pipe);
+        }
+        self.alternate = setting.alternate;
+        Ok(())
+    }
+}
+impl knightbus_core::exporter::InterfaceDriver for NativeInterface {
+    fn select_alternate(
+        &mut self,
+        setting: &knightbus_core::Interface,
+    ) -> std::result::Result<(), ControlError> {
+        unsafe {
+            self.handle
+                .selectAlternateSetting_error(setting.alternate.into())
+        }
+        .map_err(|e| ControlError::from(usb_status(e.code() as u32)))?;
+        self.rebuild(setting).map_err(ControlError::from)
+    }
+    fn clear_halt(&mut self, address: u8) -> std::result::Result<(), ControlError> {
+        let pipe = self.pipes.get(&address).ok_or(Error::Invalid)?;
+        unsafe { pipe.clearStallWithError() }
+            .map_err(|e| ControlError::from(usb_status(e.code() as u32)))
+    }
+}
+impl Drop for NativeInterface {
+    fn drop(&mut self) {
+        self.pipes.clear();
+        unsafe { self.handle.destroy() };
+    }
+}
+fn pipe<'a>(
+    interfaces: &'a BTreeMap<u8, NativeInterface>,
+    routes: &[Option<u8>; usb::ENDPOINT_DIRECTION_SLOTS],
+    address: u8,
+) -> Option<&'a IOUSBHostPipe> {
+    let number = routes[pipe_index(address)]?;
+    interfaces
+        .get(&number)?
+        .pipes
+        .get(&address)
+        .map(|pipe| &**pipe)
+}
+fn pipe_index(address: u8) -> usize {
+    usize::from(address & usb::ENDPOINT_NUMBER_MASK)
+        + if address & usb::DIRECTION_IN != 0 {
+            usize::from(usb::IN_ENDPOINT_BIT_OFFSET)
+        } else {
+            0
+        }
+}
+
 /// Claimed physical device. Construct on the backend worker, never on a GUI
 /// thread. Root capture is explicit; normal opens never escalate themselves.
 pub struct Native {
     device: Retained<IOUSBHostDevice>,
     snapshot: Snapshot,
-    interfaces: BTreeMap<u8, Retained<IOUSBHostInterface>>,
-    alternates: BTreeMap<u8, u8>,
-    pipes: BTreeMap<u8, Retained<IOUSBHostPipe>>,
+    interfaces: BTreeMap<u8, NativeInterface>,
+    routes: [Option<u8>; usb::ENDPOINT_DIRECTION_SLOTS],
     operations: [Option<Operation>; SLOTS],
     _metadata: MemoryReservation,
     gone: Arc<AtomicBool>,
@@ -385,8 +450,7 @@ impl Native {
             active: snapshot.device.wire.configuration,
             snapshot,
             interfaces: BTreeMap::new(),
-            alternates: BTreeMap::new(),
-            pipes: BTreeMap::new(),
+            routes: [None; usb::ENDPOINT_DIRECTION_SLOTS],
             operations: std::array::from_fn(|_| None),
             _metadata: metadata,
             gone,
@@ -467,7 +531,14 @@ impl Native {
                             ptr::null_mut(),
                         );
                     let interface = interface.ok_or_else(|| native_error(error.as_deref()))?;
-                    self.interfaces.insert(number, interface);
+                    self.interfaces.insert(
+                        number,
+                        NativeInterface {
+                            handle: interface,
+                            alternate: 0,
+                            pipes: BTreeMap::new(),
+                        },
+                    );
                     let alt = control(
                         &self.device,
                         usb::setup(
@@ -481,7 +552,7 @@ impl Native {
                     if alt.len() != 1 {
                         return Err(Error::Invalid);
                     }
-                    self.alternates.insert(number, alt[0]);
+                    self.interfaces.get_mut(&number).unwrap().alternate = alt[0];
                 }
             }
             if Instant::now() >= deadline {
@@ -491,44 +562,30 @@ impl Native {
                 std::thread::sleep(limits::INTERFACE_CLAIM_RETRY);
             }
         }
-        self.rebuild_pipes()
-    }
-    fn rebuild_pipes(&mut self) -> Result<()> {
-        self.pipes.clear();
-        let config = self
-            .snapshot
-            .device
-            .configurations
-            .iter()
-            .find(|c| c.value == self.active)
-            .ok_or(Error::Invalid)?;
-        for (&number, &alternate) in &self.alternates {
+        // Addresses retain their interface owner across alternate settings.
+        // Build the lookup once, keeping ordinary transfers allocation-free.
+        for setting in &config.interfaces {
+            for endpoint in &setting.endpoints {
+                let route = &mut self.routes[pipe_index(endpoint.address)];
+                if route.is_some_and(|number| number != setting.number) {
+                    return Err(Error::Invalid);
+                }
+                *route = Some(setting.number);
+            }
+        }
+        for (&number, interface) in &mut self.interfaces {
             let setting = config
                 .interfaces
                 .iter()
-                .find(|i| i.number == number && i.alternate == alternate)
+                .find(|i| i.number == number && i.alternate == interface.alternate)
                 .ok_or(Error::Invalid)?;
-            for endpoint in &setting.endpoints {
-                let pipe = unsafe {
-                    self.interfaces[&number]
-                        .copyPipeWithAddress_error(usize::from(endpoint.address))
-                };
-                let pipe = pipe.map_err(|e| native_error(Some(&e)))?;
-                if self.pipes.insert(endpoint.address, pipe).is_some() {
-                    return Err(Error::Invalid);
-                }
-            }
+            interface.rebuild(setting)?;
         }
         Ok(())
     }
     fn close_interfaces(&mut self) {
-        self.pipes.clear();
-        for interface in std::mem::take(&mut self.interfaces).into_values() {
-            unsafe {
-                interface.destroy();
-            }
-        }
-        self.alternates.clear();
+        self.interfaces.clear();
+        self.routes.fill(None);
     }
     /// Physical reset terminates this generation. Re-enumeration requires a new
     /// inventory entry and authorization; never silently reconnect a stale lease.
@@ -549,7 +606,11 @@ impl Native {
             .find(|c| c.value == self.active)?
             .interfaces
             .iter()
-            .filter(|i| self.alternates.get(&i.number) == Some(&i.alternate))
+            .filter(|i| {
+                self.interfaces
+                    .get(&i.number)
+                    .is_some_and(|native| native.alternate == i.alternate)
+            })
             .flat_map(|i| &i.endpoints)
             .find(|e| e.address == address)
     }
@@ -567,83 +628,6 @@ impl Native {
             self.endpoint(address),
             Self::CAPABILITIES,
         )
-    }
-    fn special(&mut self, s: [u8; usb::SETUP_SIZE]) -> Option<Result<()>> {
-        if s[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK != 0 {
-            return None;
-        }
-        let value = u16::from_le_bytes([s[usb::SETUP_VALUE], s[usb::SETUP_VALUE + 1]]);
-        let index = u16::from_le_bytes([s[usb::SETUP_INDEX], s[usb::SETUP_INDEX + 1]]);
-        let mut changed = false;
-        let result = match s[usb::SETUP_REQUEST] {
-            usb::SET_CONFIGURATION => Some((|| {
-                if s[usb::SETUP_TYPE] != 0
-                    || value > u16::from(u8::MAX)
-                    || index != 0
-                    || s[usb::SETUP_LENGTH..] != [0, 0]
-                    || (value != 0
-                        && !self
-                            .snapshot
-                            .device
-                            .configurations
-                            .iter()
-                            .any(|c| u16::from(c.value) == value))
-                {
-                    return Err(Error::Invalid);
-                }
-                self.close_interfaces();
-                changed = true;
-                unsafe {
-                    self.device
-                        .configureWithValue_matchInterfaces_error(value as usize, false)
-                }
-                .map_err(|e| native_error(Some(&e)))?;
-                self.active = value as u8;
-                self.claim_interfaces()
-            })()),
-            usb::SET_INTERFACE => Some((|| {
-                if s[usb::SETUP_TYPE] != usb::RECIPIENT_INTERFACE
-                    || value > u16::from(u8::MAX)
-                    || index > u16::from(u8::MAX)
-                    || s[usb::SETUP_LENGTH..] != [0, 0]
-                {
-                    return Err(Error::Invalid);
-                }
-                if !self
-                    .snapshot
-                    .device
-                    .configurations
-                    .iter()
-                    .filter(|c| c.value == self.active)
-                    .flat_map(|c| &c.interfaces)
-                    .any(|i| u16::from(i.number) == index && u16::from(i.alternate) == value)
-                {
-                    return Err(Error::Invalid);
-                }
-                let interface = self.interfaces.get(&(index as u8)).ok_or(Error::Invalid)?;
-                changed = true;
-                unsafe { interface.selectAlternateSetting_error(value as usize) }
-                    .map_err(|e| native_error(Some(&e)))?;
-                self.alternates.insert(index as u8, value as u8);
-                self.rebuild_pipes()
-            })()),
-            usb::CLEAR_FEATURE
-                if s[usb::SETUP_TYPE] == usb::RECIPIENT_ENDPOINT && value == usb::ENDPOINT_HALT =>
-            {
-                Some((|| {
-                    if index > u16::from(u8::MAX) || s[usb::SETUP_LENGTH..] != [0, 0] {
-                        return Err(Error::Invalid);
-                    }
-                    let pipe = self.pipes.get(&(index as u8)).ok_or(Error::Invalid)?;
-                    unsafe { pipe.clearStallWithError() }.map_err(|e| native_error(Some(&e)))
-                })())
-            }
-            _ => None,
-        };
-        if changed && result.as_ref().is_some_and(|r| r.is_err()) {
-            self.gone.store(true, Ordering::Release);
-        }
-        result
     }
 }
 impl Native {
@@ -670,7 +654,8 @@ impl Native {
                         RcBlock::as_ptr(&callback),
                     )
             } else if op.transfer.layout().is_empty() {
-                self.pipes[&address]
+                pipe(&self.interfaces, &self.routes, address)
+                    .unwrap()
                     .enqueueIORequestWithData_completionTimeout_error_completionHandler(
                         Some(&op.data),
                         limits::PIPE_TIMEOUT_SECONDS,
@@ -700,7 +685,7 @@ impl Native {
                         wake.notify();
                     },
                 );
-                self.pipes[&address].enqueueIORequestWithData_transactionList_transactionListCount_firstFrameNumber_options_error_completionHandler(&op.data,NonNull::new(op.iso.as_mut_ptr()).unwrap(),op.iso.len(),0,IOUSBHostIsochronousTransferOptions::None,Some(&mut error),RcBlock::as_ptr(&iso_callback))
+                pipe(&self.interfaces, &self.routes, address).unwrap().enqueueIORequestWithData_transactionList_transactionListCount_firstFrameNumber_options_error_completionHandler(&op.data,NonNull::new(op.iso.as_mut_ptr()).unwrap(),op.iso.len(),0,IOUSBHostIsochronousTransferOptions::None,Some(&mut error),RcBlock::as_ptr(&iso_callback))
             }
         };
         (accepted, error)
@@ -708,14 +693,35 @@ impl Native {
 }
 
 impl Driver for Native {
+    type Interface = NativeInterface;
+    fn configuration(&self) -> u8 {
+        self.active
+    }
+    fn interface(&mut self, number: u8) -> Result<&mut NativeInterface> {
+        self.interfaces.get_mut(&number).ok_or(Error::Invalid)
+    }
+    fn configure(
+        &mut self,
+        configuration: Option<&knightbus_core::Configuration>,
+    ) -> std::result::Result<(), ControlError> {
+        let value = configuration.map_or(0, |c| c.value);
+        self.close_interfaces();
+        unsafe {
+            self.device
+                .configureWithValue_matchInterfaces_error(value.into(), false)
+        }
+        .map_err(|e| ControlError::from(usb_status(e.code() as u32)))?;
+        self.active = value;
+        self.claim_interfaces().map_err(ControlError::from)
+    }
     fn endpoint(&self, address: u8) -> Option<knightbus_core::Endpoint> {
         Native::endpoint(self, address).cloned()
     }
     const CAPABILITIES: knightbus_core::Capabilities = knightbus_core::Capabilities {
         transfer_bytes: 1024 * 1024,
-        requests: 64,
+        requests: SLOTS,
         iso_packets: 1024,
-        speeds: 0b1101110,
+        speeds: usb::Speed::ALL_MASK,
         descriptor_bytes: 65535,
         configurations: 16,
         remote_wakeup: true,
@@ -735,27 +741,29 @@ impl Driver for Native {
             Ok(a) => a,
             Err(e) => return Err((SubmitError::Failed(e), transfer)),
         };
-        if self
+        let depth = if transfer.layout().is_empty() {
+            1
+        } else {
+            knightbus_core::exporter::ISO_QUEUE_DEPTH
+        };
+        let mut active = 0;
+        for op in self
             .operations
             .iter()
             .flatten()
-            .any(|o| o.address == address)
+            .filter(|o| o.address == address)
         {
-            return Err((SubmitError::Busy, transfer));
+            if op.cancelled {
+                return Err((SubmitError::Busy, transfer));
+            }
+            active += 1;
+            if active >= depth {
+                return Err((SubmitError::Busy, transfer));
+            }
         }
         let Some(slot) = self.operations.iter().position(Option::is_none) else {
             return Err((SubmitError::Busy, transfer));
         };
-        let s = transfer.header().setup;
-        let special = address == 0
-            && s[usb::SETUP_TYPE] & usb::REQUEST_TYPE_MASK == 0
-            && matches!(
-                s[usb::SETUP_REQUEST],
-                usb::CLEAR_FEATURE | usb::SET_CONFIGURATION | usb::SET_INTERFACE
-            );
-        if special && self.operations.iter().any(Option::is_some) {
-            return Err((SubmitError::Busy, transfer));
-        }
         let charge = transfer.buffer().len()
             + transfer.layout().len() * std::mem::size_of::<IOUSBHostIsochronousTransaction>()
             + std::mem::size_of::<Operation>()
@@ -779,25 +787,6 @@ impl Driver for Native {
             cancelled: false,
             _credit: credit,
         };
-        if special {
-            LAST_ERROR.set(None);
-            if let Some(result) = self.special(s) {
-                // Once a topology API has run, an unsuccessful reclaim cannot
-                // leave the old topology usable. Drain the physical generation.
-                op.signal.status.store(
-                    result.err().map_or(0, |e| {
-                        LAST_ERROR
-                            .get()
-                            .unwrap_or(knightbus_core::exporter::status(e) as u32)
-                    }),
-                    Ordering::Relaxed,
-                );
-                // Distinguish normalized synthetic status from IOReturn below.
-                op.signal.done.store(true, Ordering::Release);
-                self.operations[slot] = Some(op);
-                return Ok(());
-            }
-        }
         let (accepted, error) = self.enqueue(&mut op);
         if !accepted {
             // A rejected enqueue schedules no callback. Preserve its exact USB
@@ -824,11 +813,27 @@ impl Driver for Native {
                 self.device
                     .abortDeviceRequestsWithOption_error(IOUSBHostAbortOption::Asynchronous)
             } else {
-                self.pipes[&op.address].abortWithOption_error(IOUSBHostAbortOption::Asynchronous)
+                pipe(&self.interfaces, &self.routes, op.address)
+                    .unwrap()
+                    .abortWithOption_error(IOUSBHostAbortOption::Asynchronous)
             }
         };
         // Retry failed aborts. Never manufacture retirement on an API error.
-        op.cancelled = result.is_ok();
+        if result.is_ok() {
+            let address = op.address;
+            // IOUSBHost aborts the entire pipe. Hold new work until all affected
+            // callbacks retire their buffers, including uncancelled siblings.
+            for op in self
+                .operations
+                .iter_mut()
+                .flatten()
+                .filter(|o| o.address == address)
+            {
+                if !op.signal.done.load(Ordering::Acquire) {
+                    op.cancelled = true;
+                }
+            }
+        }
         result.map_err(|error| native_error(Some(&error)))
     }
     fn completion(&mut self) -> Option<(TransferId, Completion)> {
@@ -839,7 +844,7 @@ impl Driver for Native {
         // Drain the serial callback queue before releasing any native storage.
         unsafe { self.device.queue() }.exec_sync(|| {});
         for interface in self.interfaces.values() {
-            unsafe { interface.queue() }.exec_sync(|| {});
+            unsafe { interface.handle.queue() }.exec_sync(|| {});
         }
         let mut op = self.operations[i].take().unwrap();
         let native = op.signal.status.load(Ordering::Relaxed);

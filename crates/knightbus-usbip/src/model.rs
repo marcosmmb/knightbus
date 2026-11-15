@@ -2,6 +2,8 @@ use std::fmt;
 
 /// USB/IP URB_ISO_ASAP transfer flag.
 pub const ISO_ASAP: u32 = 2;
+/// Linux URB_DIR_IN, redundant with the USB/IP direction field.
+pub const DIR_IN: u32 = 0x0200;
 /// Bus-number shift in the USB/IP device identifier.
 pub const DEVICE_BUS_SHIFT: u32 = 16;
 

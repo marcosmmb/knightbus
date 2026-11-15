@@ -9,7 +9,7 @@ if ($env:WindowsSDKVersion.TrimEnd('\') -ne '10.0.28000.0') { throw 'Revalidate 
 $env:WDKContentRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
 $env:LIBCLANG_PATH = Join-Path $env:ProgramFiles 'LLVM\bin'
 $env:KNIGHTBUS_UDE_STUB_DIRECTORY = Join-Path $env:WDKContentRoot 'Lib\10.0.28000.0\km\x64\ude\1.1'
-$env:CARGO_TARGET_DIR = Join-Path $PSScriptRoot 'target'
+if (!$env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $PSScriptRoot 'target' }
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 if ($env:CARGO_ENCODED_RUSTFLAGS) { throw 'Unexpected encoded Rust flags; review build environment' }
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'

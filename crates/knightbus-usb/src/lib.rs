@@ -51,6 +51,17 @@ pub mod endpoint {
     pub const MAX_PACKET: usize = 4;
     pub const INTERVAL: usize = 6;
 }
+/// SuperSpeed endpoint companion descriptor.
+pub mod companion {
+    pub const TYPE: u8 = 0x30;
+    pub const BYTES: usize = 6;
+    pub const MAX_BURST: usize = 2;
+    pub const ATTRIBUTES: usize = 3;
+    pub const BYTES_PER_INTERVAL: usize = 4;
+    pub const MAX_BURST_VALUE: u8 = 15;
+    pub const MAX_STREAMS_EXPONENT: u8 = 16;
+    pub const MAX_MULT: u8 = 2;
+}
 const ASSOCIATION_TYPE: u8 = 11;
 const ASSOCIATION_BYTES: usize = 8;
 const ASSOCIATION_FIRST_INTERFACE: usize = 2;
@@ -58,6 +69,8 @@ const ASSOCIATION_INTERFACE_COUNT: usize = 3;
 const USB_REVISION_3_0: u16 = 0x0300;
 /// Required configuration attribute bit.
 pub const CONFIG_REQUIRED_BIT: u8 = 0x80;
+/// Configuration advertises remote wakeup.
+pub const CONFIG_REMOTE_WAKEUP: u8 = 0x20;
 /// Required and reserved configuration attribute bits.
 pub const CONFIG_ATTRIBUTES_MASK: u8 = 0x9f;
 /// Reserved endpoint address bits.
@@ -72,10 +85,20 @@ const FULL_SPEED_MAX_PACKET: u16 = 64;
 const FULL_SPEED_PACKET_SIZES: [u16; 4] = [8, 16, 32, 64];
 const HIGH_SPEED_BULK_PACKET: u16 = 512;
 const HIGH_SPEED_INTERRUPT_MAX_PACKET: u16 = 1024;
-const HIGH_SPEED_MAX_INTERVAL: u8 = 16;
+/// Largest exponent allowed for periodic endpoint intervals.
+pub const MAX_PERIODIC_INTERVAL: u8 = 16;
+/// High-speed microframes in one millisecond USB frame.
+pub const MICROFRAMES_PER_FRAME: u32 = 8;
+const FULL_SPEED_ISO_MAX_PACKET: u16 = 1023;
+const SUPER_SPEED_MAX_PACKET: u16 = 1024;
+const ISO_RESERVED_ATTRIBUTES: u8 = 0xc0;
+const ISO_USAGE_MASK: u8 = 0x30;
+const ISO_RESERVED_USAGE: u8 = 0x30;
 
 /// Class/vendor request-type bits.
 pub const REQUEST_TYPE_MASK: u8 = 0x60;
+/// Recipient bits in bmRequestType.
+pub const RECIPIENT_MASK: u8 = 0x1f;
 /// Standard request to the device.
 pub const RECIPIENT_DEVICE: u8 = 0;
 /// Standard request to an interface.
@@ -201,6 +224,12 @@ impl TryFrom<u32> for Speed {
     }
 }
 impl Speed {
+    /// Capability bitmap containing every defined speed.
+    pub const ALL_MASK: u32 = (1 << Self::Low as u32)
+        | (1 << Self::Full as u32)
+        | (1 << Self::High as u32)
+        | (1 << Self::Super as u32)
+        | (1 << Self::SuperPlus as u32);
     /// Whether SuperSpeed descriptor rules apply.
     pub fn superspeed(self) -> bool {
         matches!(self, Self::Super | Self::SuperPlus)
@@ -212,7 +241,7 @@ impl Speed {
 pub struct Endpoint {
     /// USB address including direction bit.
     pub address: u8,
-    /// USB transfer type: bulk 2 or interrupt 3.
+    /// USB transfer type: isochronous 1, bulk 2 or interrupt 3.
     pub kind: u8,
     /// wMaxPacketSize, including high-bandwidth transaction bits.
     pub maximum_packet: u16,
@@ -246,14 +275,15 @@ pub struct Topology {
     pub interfaces: u8,
     /// Unique endpoint addresses across all alternate settings.
     pub endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
+    /// ISO endpoint addresses across all alternate settings.
+    pub iso_endpoints: u32,
     /// Allowed alternate settings.
     pub settings: [Option<Setting>; MAX_SETTINGS],
 }
 
 /// Validate a complete device/configuration descriptor before publication.
-/// One configuration is supported; composite interfaces and alternate settings
-/// are supported. ISO remains unsupported. Stream descriptors are preserved,
-/// but stream-bearing settings cannot be selected by the native backend.
+/// Validates one configuration, including composite interfaces and alternates.
+/// Backend capabilities determine which transfers and settings can be used.
 pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, &'static str> {
     if device.len() != device::BYTES
         || device[..DESCRIPTOR_HEADER_BYTES] != [device::BYTES as u8, device::TYPE]
@@ -287,6 +317,7 @@ pub fn validate(device: &[u8], config: &[u8], speed: Speed) -> Result<Topology, 
         interfaces: config[configuration::INTERFACES],
         endpoints: [None; MAX_ENDPOINTS],
         settings: [None; MAX_SETTINGS],
+        iso_endpoints: 0,
     };
     ConfigurationParser::new(topology, speed).parse(&config[configuration::BYTES..])
 }
@@ -322,13 +353,13 @@ impl ConfigurationParser {
                 return Err("invalid descriptor length");
             }
             let (d, remaining) = bytes.split_at(length);
-            if self.companion.is_some() && d[DESCRIPTOR_TYPE] != 0x30 {
+            if self.companion.is_some() && d[DESCRIPTOR_TYPE] != companion::TYPE {
                 return Err("missing SuperSpeed endpoint companion");
             }
             match d[DESCRIPTOR_TYPE] {
                 interface::TYPE => self.interface(d)?,
                 endpoint::TYPE => self.endpoint(d)?,
-                0x30 => self.companion(d)?,
+                companion::TYPE => self.companion(d)?,
                 ASSOCIATION_TYPE => self.association(d)?,
                 device::TYPE | configuration::TYPE => return Err("nested device or configuration"),
                 _ if self.settings == 0 => return Err("class descriptor before interface"),
@@ -370,7 +401,7 @@ impl ConfigurationParser {
             || length < endpoint::MIN_BYTES
             || d[endpoint::ADDRESS] & ENDPOINT_RESERVED_MASK != 0
             || d[endpoint::ADDRESS] & ENDPOINT_NUMBER_MASK == 0
-            || !matches!(d[endpoint::ATTRIBUTES], TRANSFER_BULK | TRANSFER_INTERRUPT)
+            || !valid_attributes(d[endpoint::ATTRIBUTES])
             || self.seen >= self.expected
         {
             return Err("invalid endpoint or unsupported transfer type");
@@ -378,7 +409,7 @@ impl ConfigurationParser {
         let packet = u16_at(d, endpoint::MAX_PACKET);
         validate_packet(
             self.speed,
-            d[endpoint::ATTRIBUTES],
+            d[endpoint::ATTRIBUTES] & TRANSFER_TYPE_MASK,
             packet,
             d[endpoint::INTERVAL],
         )?;
@@ -394,6 +425,9 @@ impl ConfigurationParser {
             return Err("duplicate endpoint in setting");
         }
         setting.endpoints |= bit;
+        if d[endpoint::ATTRIBUTES] & TRANSFER_TYPE_MASK == TRANSFER_ISOCHRONOUS {
+            self.topology.iso_endpoints |= bit;
+        }
         if let Some(old) = self
             .topology
             .endpoints
@@ -410,7 +444,7 @@ impl ConfigurationParser {
             }
             self.topology.endpoints[self.endpoints] = Some(Endpoint {
                 address: d[endpoint::ADDRESS],
-                kind: d[endpoint::ATTRIBUTES],
+                kind: d[endpoint::ATTRIBUTES] & TRANSFER_TYPE_MASK,
                 maximum_packet: packet,
                 interval: d[endpoint::INTERVAL],
                 interface: setting.interface,
@@ -419,22 +453,27 @@ impl ConfigurationParser {
         }
         self.seen += 1;
         if self.speed.superspeed() {
-            self.companion = Some((d[endpoint::ADDRESS], d[endpoint::ATTRIBUTES], packet));
+            self.companion = Some((
+                d[endpoint::ADDRESS],
+                d[endpoint::ATTRIBUTES] & TRANSFER_TYPE_MASK,
+                packet,
+            ));
         }
         Ok(())
     }
     fn companion(&mut self, d: &[u8]) -> Result<(), &'static str> {
         let length = d.len();
         let (address, kind, packet) = self.companion.take().ok_or("unexpected companion")?;
-        if length != 6 || d[2] > 15 {
+        if length != companion::BYTES || d[companion::MAX_BURST] > companion::MAX_BURST_VALUE {
             return Err("invalid endpoint companion");
         }
-        let bytes_per_interval = u16_at(d, 4);
+        let bytes_per_interval = u16_at(d, companion::BYTES_PER_INTERVAL);
         if kind == TRANSFER_BULK {
-            if d[3] > 16 || bytes_per_interval != 0 {
+            if d[companion::ATTRIBUTES] > companion::MAX_STREAMS_EXPONENT || bytes_per_interval != 0
+            {
                 return Err("invalid bulk companion");
             }
-            if d[3] != 0 {
+            if d[companion::ATTRIBUTES] != 0 {
                 let bit = (address & ENDPOINT_NUMBER_MASK)
                     + if address & DIRECTION_IN != 0 {
                         IN_ENDPOINT_BIT_OFFSET
@@ -446,11 +485,22 @@ impl ConfigurationParser {
                     .unwrap()
                     .stream_endpoints |= 1 << bit;
             }
-        } else if d[3] != 0
-            || bytes_per_interval == 0
-            || u32::from(bytes_per_interval) > u32::from(packet) * (u32::from(d[2]) + 1)
-        {
-            return Err("invalid interrupt companion");
+        } else {
+            let mult = if kind == TRANSFER_ISOCHRONOUS {
+                d[companion::ATTRIBUTES]
+            } else {
+                0
+            };
+            if mult > companion::MAX_MULT
+                || (kind == TRANSFER_INTERRUPT && d[companion::ATTRIBUTES] != 0)
+                || bytes_per_interval == 0
+                || u32::from(bytes_per_interval)
+                    > u32::from(packet)
+                        * (u32::from(d[companion::MAX_BURST]) + 1)
+                        * (u32::from(mult) + 1)
+            {
+                return Err("invalid periodic endpoint companion");
+            }
         }
         Ok(())
     }
@@ -522,21 +572,35 @@ pub fn validate_bos(bytes: &[u8], speed: Speed) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn valid_attributes(attributes: u8) -> bool {
+    match attributes & TRANSFER_TYPE_MASK {
+        TRANSFER_ISOCHRONOUS => {
+            attributes & ISO_RESERVED_ATTRIBUTES == 0
+                && attributes & ISO_USAGE_MASK != ISO_RESERVED_USAGE
+        }
+        TRANSFER_BULK | TRANSFER_INTERRUPT => attributes & !TRANSFER_TYPE_MASK == 0,
+        _ => false,
+    }
+}
+
 fn validate_packet(speed: Speed, kind: u8, packet: u16, interval: u8) -> Result<(), &'static str> {
     let size = packet & PACKET_SIZE_MASK;
     let valid = match (speed, kind) {
         (Speed::Low, TRANSFER_INTERRUPT) => packet <= LOW_SPEED_MAX_PACKET && interval > 0,
         (Speed::Full, TRANSFER_BULK) => FULL_SPEED_PACKET_SIZES.contains(&packet),
         (Speed::Full, TRANSFER_INTERRUPT) => packet <= FULL_SPEED_MAX_PACKET && interval > 0,
+        (Speed::Full, TRANSFER_ISOCHRONOUS) => {
+            packet <= FULL_SPEED_ISO_MAX_PACKET && (1..=MAX_PERIODIC_INTERVAL).contains(&interval)
+        }
         (Speed::High, TRANSFER_BULK) => packet == HIGH_SPEED_BULK_PACKET,
-        (Speed::High, TRANSFER_INTERRUPT) => {
+        (Speed::High, TRANSFER_INTERRUPT | TRANSFER_ISOCHRONOUS) => {
             size <= HIGH_SPEED_INTERRUPT_MAX_PACKET
                 && (packet >> TRANSACTIONS_SHIFT) <= MAX_EXTRA_TRANSACTIONS
-                && (1..=HIGH_SPEED_MAX_INTERVAL).contains(&interval)
+                && (1..=MAX_PERIODIC_INTERVAL).contains(&interval)
         }
-        (Speed::Super | Speed::SuperPlus, TRANSFER_BULK) => packet == 1024,
-        (Speed::Super | Speed::SuperPlus, TRANSFER_INTERRUPT) => {
-            packet <= 1024 && (1..=16).contains(&interval)
+        (Speed::Super | Speed::SuperPlus, TRANSFER_BULK) => packet == SUPER_SPEED_MAX_PACKET,
+        (Speed::Super | Speed::SuperPlus, TRANSFER_INTERRUPT | TRANSFER_ISOCHRONOUS) => {
+            packet <= SUPER_SPEED_MAX_PACKET && (1..=MAX_PERIODIC_INTERVAL).contains(&interval)
         }
         _ => false,
     };
@@ -548,7 +612,9 @@ fn validate_packet(speed: Speed, kind: u8, packet: u16, interval: u8) -> Result<
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::vec;
 
     #[test]
     fn setup_packets_preserve_little_endian_fields() {
@@ -559,5 +625,43 @@ mod tests {
         assert_eq!(u16_at(&packet, SETUP_LENGTH), 0x5678);
         assert_eq!(READ_DEVICE_DESCRIPTOR, [0x80, 6, 0, 1, 0, 0, 18, 0]);
         assert_eq!(READ_CONFIGURATION, [0x80, 8, 0, 0, 0, 0, 1, 0]);
+    }
+    #[test]
+    fn iso_descriptor_speed_attributes_and_burst_limits() {
+        let mut device = [18, 1, 0, 2, 0, 0, 0, 64, 9, 0x12, 1, 0, 0, 1, 0, 0, 0, 1];
+        let mut config = vec![
+            9, 2, 25, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 5, 0, 4, 1,
+        ];
+        assert!(validate(&device, &config, Speed::Full).is_err());
+        config[22..24].copy_from_slice(&1023u16.to_le_bytes());
+        assert!(validate(&device, &config, Speed::Full).is_ok());
+        assert!(validate(&device, &config, Speed::Low).is_err());
+        for attributes in [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45] {
+            config[21] = attributes;
+            assert!(validate(&device, &config, Speed::High).is_ok());
+        }
+        for attributes in [49, 53, 57, 61, 65, 129] {
+            config[21] = attributes;
+            assert!(validate(&device, &config, Speed::High).is_err());
+        }
+        config[21] = 5;
+        config[22..24].copy_from_slice(&0x1400u16.to_le_bytes());
+        assert!(validate(&device, &config, Speed::High).is_ok());
+        config[23] = 0x1c;
+        assert!(validate(&device, &config, Speed::High).is_err());
+        config[23] = 4;
+        device[2..4].copy_from_slice(&0x300u16.to_le_bytes());
+        device[7] = 9;
+        config.extend_from_slice(&[6, 0x30, 1, 2, 0, 24]);
+        config[2] = 31;
+        assert!(validate(&device, &config, Speed::Super).is_ok());
+        config[30] = 25;
+        assert!(validate(&device, &config, Speed::Super).is_err());
+        config[30] = 24;
+        config[28] = 3;
+        assert!(validate(&device, &config, Speed::Super).is_err());
+        config[28] = 2;
+        config[24] = 0;
+        assert!(validate(&device, &config, Speed::Super).is_err());
     }
 }

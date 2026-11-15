@@ -10,10 +10,10 @@ use std::{
 };
 
 const LIMITS: Limits = Limits {
-    frame_bytes: 1024 * 1024 + TRANSFER_HEADER_LEN,
+    frame_bytes: 1024 * 1024 + TRANSFER_HEADER_LEN + 1024 * 16,
     transfer_bytes: 1024 * 1024,
     devices: 1,
-    iso_packets: 0,
+    iso_packets: 1024,
 };
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(1);
@@ -58,11 +58,15 @@ impl Wire {
             );
         }
         // The native owner stays charged while encoding its borrowed payload.
-        if !done.transfer.layout().is_empty() {
-            return Err(Error::Unsupported);
-        }
+        let mut packed;
         let payload = if done.transfer.header().direction == Direction::In {
-            &done.transfer.buffer()[..done.actual_length as usize]
+            if done.transfer.layout().is_empty() {
+                &done.transfer.buffer()[..done.actual_length as usize]
+            } else {
+                packed = self.connection.budget.buffer(done.actual_length as usize)?;
+                done.copy_payload(packed.as_mut_slice())?;
+                packed.as_slice()
+            }
         } else {
             &[]
         };
@@ -73,10 +77,15 @@ impl Wire {
                 actual_length: done.actual_length,
                 start_frame: done.start_frame,
                 number_of_packets: done.transfer.header().number_of_packets,
-                error_count: 0,
+                error_count: done
+                    .transfer
+                    .packets()
+                    .iter()
+                    .filter(|p| p.status != 0)
+                    .count() as u32,
             },
             data: payload,
-            packets: &[],
+            packets: done.transfer.packets(),
         })
     }
 }

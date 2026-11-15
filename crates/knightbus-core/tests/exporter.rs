@@ -1,7 +1,7 @@
 //! Fault-injected ownership, admission, ordering and retirement regressions.
 use knightbus_core::{
     descriptors,
-    exporter::{Backend, Driver, SubmitError},
+    exporter::{Backend, ControlError, Driver, InterfaceDriver, SubmitError},
 };
 use knightbus_core::{
     usbip::{Direction, SubmitHeader},
@@ -88,6 +88,7 @@ struct State {
     submitted: Vec<u32>,
     attempted: Vec<u32>,
     busy: BTreeSet<TransferId>,
+    iso: bool,
     scratch_bytes: BTreeMap<TransferId, usize>,
     polls: usize,
     removed: bool,
@@ -98,8 +99,49 @@ struct State {
     fail_cancel_count: usize,
     complete_on_cancel: bool,
     waker: Option<Waker>,
+    configuration: u8,
+    changes: Vec<(NativeChange, Vec<u32>)>,
+    change_error: Option<Error>,
+    control_status: Option<i32>,
 }
-struct Fake(Arc<Mutex<State>>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeChange {
+    Configure(u8),
+    Alternate(u8, u8),
+    ClearHalt(u8),
+}
+fn record_change(
+    state: &Arc<Mutex<State>>,
+    change: NativeChange,
+) -> std::result::Result<(), ControlError> {
+    let mut s = state.lock().unwrap();
+    let pending = s.pending.keys().map(|id| id.sequence).collect();
+    s.changes.push((change, pending));
+    if let Some(status) = s.control_status {
+        return Err(status.into());
+    }
+    s.change_error.map_or(Ok(()), |error| Err(error.into()))
+}
+struct FakeInterface {
+    number: u8,
+    state: Arc<Mutex<State>>,
+}
+impl InterfaceDriver for FakeInterface {
+    fn select_alternate(
+        &mut self,
+        setting: &knightbus_core::Interface,
+    ) -> std::result::Result<(), ControlError> {
+        assert_eq!(self.number, setting.number);
+        record_change(
+            &self.state,
+            NativeChange::Alternate(self.number, setting.alternate),
+        )
+    }
+    fn clear_halt(&mut self, address: u8) -> std::result::Result<(), ControlError> {
+        record_change(&self.state, NativeChange::ClearHalt(address))
+    }
+}
+struct Fake(Arc<Mutex<State>>, Vec<FakeInterface>);
 impl Drop for Fake {
     fn drop(&mut self) {
         loop {
@@ -114,16 +156,41 @@ impl Drop for Fake {
     }
 }
 impl Driver for Fake {
+    type Interface = FakeInterface;
+    fn configuration(&self) -> u8 {
+        self.0.lock().unwrap().configuration
+    }
+    fn interface(&mut self, number: u8) -> Result<&mut FakeInterface> {
+        self.1
+            .iter_mut()
+            .find(|i| i.number == number)
+            .ok_or(Error::Invalid)
+    }
+    fn configure(
+        &mut self,
+        configuration: Option<&Configuration>,
+    ) -> std::result::Result<(), ControlError> {
+        let value = configuration.map_or(0, |c| c.value);
+        record_change(&self.0, NativeChange::Configure(value))?;
+        self.0.lock().unwrap().configuration = value;
+        Ok(())
+    }
     fn endpoint(&self, address: u8) -> Option<knightbus_core::Endpoint> {
         if !matches!(address, 0x81 | 0x82) {
             return None;
         }
+        let iso = self.0.lock().unwrap().iso && address == 0x81;
         Some(knightbus_core::Endpoint {
             address,
-            kind: knightbus_core::TransferKind::Bulk,
+            kind: if iso {
+                TransferKind::Isochronous
+            } else {
+                TransferKind::Bulk
+            },
             max_packet_size: 64,
-            interval: 0,
-            allowed_flags: 0,
+            service_bytes: 64,
+            interval: if iso { 1 } else { 0 },
+            allowed_flags: if iso { usbip::ISO_ASAP } else { 0 },
         })
     }
     const CAPABILITIES: knightbus_core::Capabilities = knightbus_core::Capabilities {
@@ -153,9 +220,10 @@ impl Driver for Fake {
                 return Err((SubmitError::Failed(error), t));
             }
         }
-        if s.pending
-            .values()
-            .any(|v| v.header().endpoint == t.header().endpoint)
+        if t.layout().is_empty()
+            && s.pending
+                .values()
+                .any(|v| v.header().endpoint == t.header().endpoint)
         {
             return Err((SubmitError::Busy, t));
         }
@@ -209,11 +277,28 @@ impl Driver for Fake {
 type Factory = Box<dyn FnOnce() -> Result<Fake> + Send>;
 type Fixture = (Backend<Factory>, Arc<Mutex<State>>, Budget, Device);
 fn fixture() -> Fixture {
-    let state = Arc::new(Mutex::new(State::default()));
+    fixture_for(model())
+}
+fn fixture_for(device: Device) -> Fixture {
+    let state = Arc::new(Mutex::new(State {
+        configuration: 1,
+        ..State::default()
+    }));
     let copied = state.clone();
     let b = budget();
-    let device = model();
-    let factory: Factory = Box::new(move || Ok(Fake(copied)));
+    let interfaces = device
+        .configurations
+        .iter()
+        .flat_map(|c| &c.interfaces)
+        .map(|i| i.number)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|number| FakeInterface {
+            number,
+            state: state.clone(),
+        })
+        .collect();
+    let factory: Factory = Box::new(move || Ok(Fake(copied, interfaces)));
     let mut backend = Backend::new(device.clone(), &b, factory).unwrap();
     wait(|| matches!(backend.claim(SESSION, &device), Poll::Ready(Ok(()))));
     (backend, state, b, device)
@@ -393,16 +478,11 @@ fn topology_change_waits_for_prior_pipes_and_blocks_later_submissions() {
         s.ready.insert(token(1));
         s.waker.as_ref().unwrap().wake_by_ref();
     }
-    wait(|| state.lock().unwrap().submitted.len() >= 2);
-    std::thread::sleep(Duration::from_millis(10));
-    // The barrier itself must retire before later traffic may be offered.
-    assert_eq!(state.lock().unwrap().submitted, [1, 2]);
-    {
-        let mut s = state.lock().unwrap();
-        s.ready.insert(token(2));
-        s.waker.as_ref().unwrap().wake_by_ref();
-    }
-    wait(|| state.lock().unwrap().submitted == [1, 2, 3]);
+    wait(|| state.lock().unwrap().submitted == [1, 3]);
+    assert_eq!(
+        state.lock().unwrap().changes,
+        [(NativeChange::Configure(1), vec![])]
+    );
     {
         let mut s = state.lock().unwrap();
         s.ready.insert(token(3));
@@ -588,9 +668,11 @@ fn topology_barrier_cannot_overtake_an_earlier_busy_queued_request() {
     }
     wait(|| state.lock().unwrap().submitted == [1]);
     complete(&state, &[1]);
-    wait(|| state.lock().unwrap().submitted == [1, 2]);
-    complete(&state, &[2]);
-    wait(|| state.lock().unwrap().submitted == [1, 2, 3]);
+    wait(|| state.lock().unwrap().submitted == [1, 3]);
+    assert_eq!(
+        state.lock().unwrap().changes,
+        [(NativeChange::Configure(1), vec![])]
+    );
     finish(&mut backend, &state, &device);
 }
 
@@ -621,5 +703,496 @@ fn shared_worker_rejects_invalid_requests_before_native_submission() {
         assert_eq!(done.actual_length, 0);
         assert!(state.lock().unwrap().attempted.is_empty());
     }
+    finish(&mut backend, &state, &device);
+}
+
+#[test]
+fn cancellation_behind_a_waiting_topology_change_does_not_wait_for_usb_data() {
+    let (mut backend, state, b, device) = fixture();
+    backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    let mut header = *transfer(&b, 2, 0).header();
+    header.direction = Direction::Out;
+    header.transfer_buffer_length = 0;
+    header.setup = [0, 9, 1, 0, 0, 0, 0, 0];
+    backend
+        .submit(token(2), Transfer::new(&b, header, &[]).unwrap())
+        .unwrap();
+    for sequence in 3..=SLOTS as u32 {
+        backend
+            .submit(token(sequence), transfer(&b, sequence, 2))
+            .unwrap();
+    }
+    let peak = b.usage().bytes;
+    for sequence in 3..=SLOTS as u32 {
+        backend.cancel(token(sequence));
+    }
+    let mut retired = BTreeSet::new();
+    wait(|| {
+        assert!(b.usage().bytes <= peak);
+        while let Some((id, done)) = backend.poll_completion() {
+            assert!((3..=SLOTS as u32).contains(&id.sequence));
+            assert!(retired.insert(id.sequence), "duplicate retirement");
+            assert_eq!(done.status, usbip::status::CANCELLED);
+        }
+        retired.len() == SLOTS - 2
+    });
+    assert_eq!(state.lock().unwrap().submitted, [1]);
+    complete(&state, &[1]);
+    wait(|| state.lock().unwrap().changes.len() == 1);
+    assert_eq!(
+        state.lock().unwrap().changes,
+        [(NativeChange::Configure(1), vec![])]
+    );
+    finish(&mut backend, &state, &device);
+}
+
+#[test]
+fn native_admission_accepts_direction_hint_but_rejects_mismatches_and_unknown_flags() {
+    for endpoint in [0, 1] {
+        for flags in [0, usbip::DIR_IN] {
+            let b = budget();
+            let original = transfer(&b, 1, endpoint);
+            let mut h = *original.header();
+            h.transfer_flags = flags;
+            if endpoint == 0 {
+                h.setup = [0xc0, 0x50, 0, 0, 0, 0, 8, 0];
+            }
+            let t = Transfer::new(&b, h, &[]).unwrap();
+            let e = Endpoint {
+                address: 0x81,
+                kind: TransferKind::Bulk,
+                max_packet_size: 64,
+                service_bytes: 64,
+                interval: 0,
+                allowed_flags: 0,
+            };
+            assert_eq!(
+                t.validate_native(h.device_id, Some(&e), Fake::CAPABILITIES),
+                Ok(if endpoint == 0 { 0 } else { 0x81 })
+            );
+            h.transfer_flags |= 0x8000_0000;
+            let bad = Transfer::new(&b, h, &[]).unwrap();
+            assert!(
+                bad.validate_native(h.device_id, Some(&e), Fake::CAPABILITIES)
+                    .is_err()
+            );
+            h.transfer_flags = usbip::DIR_IN;
+            h.direction = Direction::Out;
+            assert!(matches!(Transfer::new(&b, h, &[]), Err(Error::Invalid)));
+        }
+    }
+}
+
+#[test]
+fn iso_in_an_inactive_alternate_cannot_bypass_importer_publication_checks() {
+    use knightbus_core::topology::Speed;
+    let device = [18, 1, 0, 2, 0, 0, 0, 64, 9, 0x12, 1, 0, 0, 1, 0, 0, 0, 1];
+    let configuration = [
+        9, 2, 34, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 0, 0xff, 0, 0, 0, 9, 4, 0, 1, 1, 0xff, 0, 0, 0,
+        7, 5, 0x81, 5, 64, 0, 1,
+    ];
+    let topology = descriptors::configuration(&configuration).unwrap();
+    assert!(topology.interfaces[0].endpoints.is_empty());
+    assert_eq!(
+        topology.interfaces[1].endpoints[0].kind,
+        TransferKind::Isochronous
+    );
+    let b = budget();
+    let descriptors = DescriptorSet::new(&b, &device, &configuration, &[], Speed::High).unwrap();
+    let mut capabilities = Fake::CAPABILITIES;
+    capabilities.iso_packets = 0;
+    assert_eq!(
+        capabilities.descriptors(&descriptors),
+        Err(Error::Unsupported)
+    );
+    capabilities.iso_packets = 1024;
+    assert_eq!(capabilities.descriptors(&descriptors), Ok(()));
+    drop(descriptors);
+    assert_eq!(b.usage().bytes, 0);
+}
+
+#[test]
+fn iso_pipeline_is_bounded_ordered_and_does_not_block_bulk() {
+    let (mut backend, state, b, device) = fixture();
+    state.lock().unwrap().iso = true;
+    for sequence in 1..=10 {
+        let mut header = *transfer(&b, sequence, 1).header();
+        header.number_of_packets = 1;
+        header.transfer_flags = usbip::ISO_ASAP;
+        header.interval = 1;
+        let t = Transfer::new(
+            &b,
+            header,
+            &[usbip::IsoPacket {
+                offset: 0,
+                length: 8,
+                actual_length: 0,
+                status: 0,
+            }],
+        )
+        .unwrap();
+        backend.submit(token(sequence), t).unwrap();
+    }
+    backend.submit(token(11), transfer(&b, 11, 2)).unwrap();
+    wait(|| state.lock().unwrap().pending.len() == 9);
+    {
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.submitted, [1, 2, 3, 4, 5, 6, 7, 8, 11]);
+        s.busy.insert(token(9));
+        s.ready.insert(token(2));
+        s.waker.as_ref().unwrap().wake_by_ref();
+    }
+    wait(|| state.lock().unwrap().attempted.contains(&9));
+    assert!(!state.lock().unwrap().attempted.contains(&10));
+    {
+        let mut s = state.lock().unwrap();
+        s.busy.remove(&token(9));
+        s.waker.as_ref().unwrap().wake_by_ref();
+    }
+    wait(|| state.lock().unwrap().submitted.contains(&9));
+    {
+        let mut s = state.lock().unwrap();
+        assert!(!s.submitted.contains(&10));
+        s.complete_on_cancel = true;
+    }
+    wait(|| matches!(backend.release(SESSION, device.key), Poll::Ready(Ok(()))));
+    drop(backend);
+    wait(|| b.usage().bytes == 0);
+}
+
+#[test]
+fn cancel_before_iso_admission_marks_every_packet_failed() {
+    let (mut backend, state, b, device) = fixture();
+    {
+        let mut s = state.lock().unwrap();
+        s.iso = true;
+        s.busy.insert(token(1));
+    }
+    let mut header = *transfer(&b, 1, 1).header();
+    header.number_of_packets = 2;
+    header.transfer_flags = usbip::ISO_ASAP;
+    header.interval = 1;
+    let packets = [
+        usbip::IsoPacket {
+            offset: 0,
+            length: 4,
+            actual_length: 0,
+            status: 0,
+        },
+        usbip::IsoPacket {
+            offset: 4,
+            length: 4,
+            actual_length: 0,
+            status: 0,
+        },
+    ];
+    backend
+        .submit(token(1), Transfer::new(&b, header, &packets).unwrap())
+        .unwrap();
+    wait(|| state.lock().unwrap().attempted.contains(&1));
+    backend.cancel(token(1));
+    let mut result = None;
+    wait(|| {
+        result = backend.poll_completion();
+        result.is_some()
+    });
+    let (_, done) = result.unwrap();
+    assert_eq!(done.status, usbip::status::CANCELLED);
+    assert_eq!(done.actual_length, 0);
+    assert!(
+        done.transfer
+            .packets()
+            .iter()
+            .all(|p| p.status == usbip::status::CANCELLED && p.actual_length == 0)
+    );
+    drop(done);
+    wait(|| matches!(backend.release(SESSION, device.key), Poll::Ready(Ok(()))));
+    drop(backend);
+    wait(|| b.usage().bytes == 0);
+}
+
+fn composite() -> Device {
+    let mut device = model();
+    let interface = &mut device.configurations[0].interfaces[0];
+    let mut other = interface.clone();
+    other.number = 1;
+    other.endpoints = vec![interface.endpoints.pop().unwrap()];
+    other.endpoints[0].address = 0x82;
+    device.configurations[0].interfaces.push(other.clone());
+    other.alternate = 1;
+    device.configurations[0].interfaces.push(other);
+    device.wire.interfaces = 2;
+    device
+}
+fn control(b: &Budget, sequence: u32, setup: [u8; 8]) -> Transfer {
+    let mut header = *transfer(b, sequence, 0).header();
+    header.direction = Direction::Out;
+    header.transfer_buffer_length = 0;
+    header.setup = setup;
+    Transfer::new(b, header, &[]).unwrap()
+}
+#[test]
+fn interface_change_and_clear_halt_do_not_wait_for_another_interfaces_idle_read() {
+    for (setup, expected) in [
+        ([1, 11, 1, 0, 1, 0, 0, 0], NativeChange::Alternate(1, 1)),
+        ([2, 1, 0, 0, 0x82, 0, 0, 0], NativeChange::ClearHalt(0x82)),
+    ] {
+        let (mut backend, state, b, device) = fixture_for(composite());
+        backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+        wait(|| state.lock().unwrap().submitted == [1]);
+        backend.submit(token(2), control(&b, 2, setup)).unwrap();
+        wait(|| !state.lock().unwrap().changes.is_empty());
+        assert_eq!(state.lock().unwrap().changes, [(expected, vec![1])]);
+        // New traffic on the changed interface proceeds while the unrelated read lives.
+        backend.submit(token(3), transfer(&b, 3, 2)).unwrap();
+        wait(|| state.lock().unwrap().submitted == [1, 3]);
+        finish(&mut backend, &state, &device);
+    }
+}
+#[test]
+fn interface_change_drains_its_own_busy_requests_but_keeps_other_interfaces_running() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    state.lock().unwrap().busy.insert(token(1));
+    backend.submit(token(1), transfer(&b, 1, 2)).unwrap();
+    backend
+        .submit(token(2), control(&b, 2, [1, 11, 1, 0, 1, 0, 0, 0]))
+        .unwrap();
+    backend.submit(token(3), transfer(&b, 3, 1)).unwrap();
+    backend.submit(token(4), transfer(&b, 4, 2)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [3]);
+    assert!(state.lock().unwrap().changes.is_empty());
+    {
+        let mut s = state.lock().unwrap();
+        s.busy.remove(&token(1));
+        s.waker.as_ref().unwrap().wake_by_ref();
+    }
+    wait(|| state.lock().unwrap().submitted == [3, 1]);
+    assert!(state.lock().unwrap().changes.is_empty());
+    complete(&state, &[1]);
+    wait(|| state.lock().unwrap().submitted == [3, 1, 4]);
+    assert_eq!(
+        state.lock().unwrap().changes,
+        [(NativeChange::Alternate(1, 1), vec![3])]
+    );
+    finish(&mut backend, &state, &device);
+}
+
+#[test]
+fn invalid_management_requests_never_reach_native_operations() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    for (i, setup) in [
+        [0, 9, 2, 0, 0, 0, 0, 0],    // Unknown configuration.
+        [0, 9, 1, 1, 0, 0, 0, 0],    // Configuration wider than u8.
+        [0, 9, 1, 0, 1, 0, 0, 0],    // Reserved index.
+        [1, 11, 2, 0, 1, 0, 0, 0],   // Unknown alternate.
+        [1, 11, 0, 0, 9, 0, 0, 0],   // Unknown interface.
+        [2, 11, 0, 0, 1, 0, 0, 0],   // Wrong recipient.
+        [2, 1, 0, 0, 0x83, 0, 0, 0], // Unknown endpoint.
+        [2, 1, 0, 0, 0x82, 1, 0, 0], // Endpoint wider than u8.
+        [2, 1, 0, 0, 0x92, 0, 0, 0], // Reserved endpoint bits.
+        [2, 1, 0, 0, 0, 0, 0, 0],    // Control pipe cannot halt.
+        [2, 1, 1, 0, 0x82, 0, 0, 0], // Unknown endpoint feature.
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sequence = i as u32 + 1;
+        backend
+            .submit(token(sequence), control(&b, sequence, setup))
+            .unwrap();
+        let mut result = None;
+        wait(|| {
+            result = backend.poll_completion();
+            result.is_some()
+        });
+        assert_eq!(result.unwrap().1.status, usbip::status::INVALID);
+        assert!(state.lock().unwrap().changes.is_empty());
+        assert!(state.lock().unwrap().attempted.is_empty());
+    }
+    finish(&mut backend, &state, &device);
+}
+#[test]
+fn class_and_vendor_requests_with_management_opcodes_stay_ordinary_control() {
+    let (mut backend, state, b, device) = fixture();
+    for (i, kind) in [0x21, 0x41].into_iter().enumerate() {
+        let sequence = i as u32 + 1;
+        backend
+            .submit(
+                token(sequence),
+                control(&b, sequence, [kind, 11, 1, 0, 0, 0, 0, 0]),
+            )
+            .unwrap();
+        wait(|| state.lock().unwrap().pending.contains_key(&token(sequence)));
+        assert!(state.lock().unwrap().changes.is_empty());
+        complete(&state, &[sequence]);
+        wait(|| backend.poll_completion().is_some());
+    }
+    finish(&mut backend, &state, &device);
+}
+#[test]
+fn failed_native_topology_changes_retire_unrelated_io_before_releasing_handles() {
+    for setup in [[1, 11, 1, 0, 1, 0, 0, 0], [0, 9, 1, 0, 0, 0, 0, 0]] {
+        let (mut backend, state, b, device) = fixture_for(composite());
+        {
+            let mut s = state.lock().unwrap();
+            s.change_error = Some(Error::Unavailable);
+            s.complete_on_cancel = true;
+        }
+        if setup[1] == 11 {
+            backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+            wait(|| state.lock().unwrap().pending.contains_key(&token(1)));
+        }
+        backend.submit(token(2), control(&b, 2, setup)).unwrap();
+        wait(|| state.lock().unwrap().released);
+        assert_eq!(backend.poll_removed(), Some(device.key));
+        if setup[1] == 11 {
+            assert!(state.lock().unwrap().cancelled.contains(&token(1)));
+        }
+        while backend.poll_completion().is_some() {}
+        drop(backend);
+        wait(|| b.usage().bytes == 0);
+    }
+}
+#[test]
+fn failed_clear_halt_preserves_the_device_and_unrelated_transfers() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    state.lock().unwrap().change_error = Some(Error::Internal);
+    backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    backend
+        .submit(token(2), control(&b, 2, [2, 1, 0, 0, 0x82, 0, 0, 0]))
+        .unwrap();
+    let mut result = None;
+    wait(|| {
+        result = backend.poll_completion();
+        result.is_some()
+    });
+    assert_eq!(result.unwrap().1.status, usbip::status::IO);
+    assert_eq!(backend.poll_removed(), None);
+    assert!(state.lock().unwrap().pending.contains_key(&token(1)));
+    assert!(!state.lock().unwrap().released);
+    finish(&mut backend, &state, &device);
+}
+#[test]
+fn clear_halt_reporting_removal_retires_other_interfaces() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    {
+        let mut s = state.lock().unwrap();
+        s.control_status = Some(usbip::status::NO_DEVICE);
+        s.complete_on_cancel = true;
+    }
+    backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    backend
+        .submit(token(2), control(&b, 2, [2, 1, 0, 0, 0x82, 0, 0, 0]))
+        .unwrap();
+    wait(|| state.lock().unwrap().released);
+    assert_eq!(backend.poll_removed(), Some(device.key));
+    assert!(state.lock().unwrap().cancelled.contains(&token(1)));
+    let mut results = BTreeMap::new();
+    while let Some((id, done)) = backend.poll_completion() {
+        results.insert(id.sequence, done.status);
+    }
+    assert_eq!(results[&2], usbip::status::NO_DEVICE);
+    drop(backend);
+    wait(|| b.usage().bytes == 0);
+}
+#[test]
+fn cancellation_of_a_queued_change_does_not_touch_native_interface_state() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    backend.submit(token(1), transfer(&b, 1, 2)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    backend
+        .submit(token(2), control(&b, 2, [1, 11, 1, 0, 1, 0, 0, 0]))
+        .unwrap();
+    backend.cancel(token(2));
+    let mut result = None;
+    wait(|| {
+        result = backend.poll_completion();
+        result.is_some()
+    });
+    assert_eq!(result.unwrap().1.status, usbip::status::CANCELLED);
+    assert!(state.lock().unwrap().changes.is_empty());
+    finish(&mut backend, &state, &device);
+}
+#[test]
+fn unconfigure_is_explicit_and_inactive_configurations_do_not_expand_interface_scope() {
+    let mut device = composite();
+    let mut unused = device.configurations[0].clone();
+    unused.value = 2;
+    // This address belongs to interface 0 in configuration 1, but 1 in configuration 2.
+    unused.interfaces[1].endpoints[0].address = 0x81;
+    device.configurations.push(unused);
+    let (mut backend, state, b, device) = fixture_for(device);
+    backend.submit(token(1), transfer(&b, 1, 1)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    backend
+        .submit(token(2), control(&b, 2, [1, 11, 1, 0, 1, 0, 0, 0]))
+        .unwrap();
+    wait(|| state.lock().unwrap().changes.len() == 1);
+    complete(&state, &[1]);
+    wait(|| !state.lock().unwrap().pending.contains_key(&token(1)));
+    backend
+        .submit(token(3), control(&b, 3, [0, 9, 0, 0, 0, 0, 0, 0]))
+        .unwrap();
+    wait(|| state.lock().unwrap().configuration == 0);
+    backend
+        .submit(token(4), control(&b, 4, [1, 11, 1, 0, 1, 0, 0, 0]))
+        .unwrap();
+    let mut results = BTreeMap::new();
+    wait(|| {
+        while let Some((id, done)) = backend.poll_completion() {
+            results.insert(id.sequence, done.status);
+        }
+        results.len() == 4
+    });
+    assert_eq!(results[&4], usbip::status::INVALID);
+    assert_eq!(state.lock().unwrap().changes.len(), 2);
+    finish(&mut backend, &state, &device);
+}
+
+#[test]
+fn native_clear_halt_status_is_preserved_and_invalid_statuses_fail_closed() {
+    let (mut backend, state, b, device) = fixture_for(composite());
+    for (i, (native, expected)) in [(-32, -32), (-75, -75), (0, -5), (42, -5)]
+        .into_iter()
+        .enumerate()
+    {
+        state.lock().unwrap().control_status = Some(native);
+        let sequence = i as u32 + 1;
+        backend
+            .submit(
+                token(sequence),
+                control(&b, sequence, [2, 1, 0, 0, 0x82, 0, 0, 0]),
+            )
+            .unwrap();
+        let mut result = None;
+        wait(|| {
+            result = backend.poll_completion();
+            result.is_some()
+        });
+        assert_eq!(result.unwrap().1.status, expected);
+        assert_eq!(backend.poll_removed(), None);
+    }
+    finish(&mut backend, &state, &device);
+}
+#[test]
+fn alternate_change_drains_pipes_from_the_old_setting() {
+    let mut device = composite();
+    device.configurations[0].interfaces[2].endpoints.clear();
+    let (mut backend, state, b, device) = fixture_for(device);
+    backend.submit(token(1), transfer(&b, 1, 2)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1]);
+    backend
+        .submit(token(2), control(&b, 2, [1, 11, 1, 0, 1, 0, 0, 0]))
+        .unwrap();
+    // A request on the old setting must retire even though the new setting has no pipes.
+    backend.submit(token(3), transfer(&b, 3, 1)).unwrap();
+    wait(|| state.lock().unwrap().submitted == [1, 3]);
+    assert!(state.lock().unwrap().changes.is_empty());
+    complete(&state, &[1]);
+    wait(|| state.lock().unwrap().changes.len() == 1);
+    assert_eq!(state.lock().unwrap().changes[0].1, [3]);
     finish(&mut backend, &state, &device);
 }

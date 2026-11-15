@@ -88,15 +88,16 @@ impl Wire {
         capabilities: knightbus_core::Capabilities,
     ) -> Result<Self> {
         capabilities.validate()?;
-        if capabilities.requests > SLOTS || capabilities.iso_packets != 0 {
+        if capabilities.requests > SLOTS {
             return Err(Error::Unsupported);
         }
         let limits = Limits {
             transfer_bytes: capabilities.transfer_bytes,
             frame_bytes: capabilities
                 .transfer_bytes
-                .checked_add(USBIP_TRANSFER_HEADER_BYTES)
+                .checked_add(USBIP_TRANSFER_HEADER_BYTES + capabilities.iso_packets * 16)
                 .ok_or(Error::Exhausted)?,
+            iso_packets: capabilities.iso_packets,
             ..LIMITS
         };
         Ok(Self {
@@ -596,23 +597,9 @@ impl<B: ImporterBackend> Forwarder<B> {
             })
             .ok_or(Error::Invalid)?;
         let p = self.pending[index].as_mut().unwrap();
-        let mut transfer = p.transfer.take().ok_or(Error::Invalid)?;
-        if reply.actual_length > transfer.header().transfer_buffer_length
-            || reply.number_of_packets > 0
-            || reply.status > 0
-        {
-            return Err(Error::Invalid);
-        }
-        if transfer.header().direction == Direction::In {
-            transfer.buffer_mut()[..reply.data.len()].copy_from_slice(&reply.data);
-        }
+        let transfer = p.transfer.take().ok_or(Error::Invalid)?;
         self.backend
-            .complete(Completion {
-                transfer,
-                status: reply.status,
-                actual_length: reply.actual_length,
-                start_frame: reply.start_frame,
-            })
+            .complete(Completion::from_reply(transfer, reply)?)
             .map_err(|_| Error::Internal)?;
         if p.unlink.is_none() {
             self.pending[index] = None;
@@ -628,7 +615,11 @@ impl<B: ImporterBackend> Forwarder<B> {
         let p = self.pending[index].as_mut().unwrap();
         p.unlink = None;
         if status == usbip::status::CONNECTION_RESET {
-            let transfer = p.transfer.take().ok_or(Error::Invalid)?;
+            let mut transfer = p.transfer.take().ok_or(Error::Invalid)?;
+            for packet in transfer.packets_mut() {
+                packet.status = usbip::status::CONNECTION_RESET;
+                packet.actual_length = 0;
+            }
             self.backend
                 .complete(Completion {
                     transfer,
@@ -719,6 +710,7 @@ mod tests {
                                 address: 0x81,
                                 kind: knightbus_core::TransferKind::Interrupt,
                                 max_packet_size: 64,
+                                service_bytes: 64,
                                 interval: 8,
                                 allowed_flags: 0,
                             },
@@ -726,6 +718,7 @@ mod tests {
                                 address: 1,
                                 kind: knightbus_core::TransferKind::Bulk,
                                 max_packet_size: 64,
+                                service_bytes: 64,
                                 interval: 0,
                                 allowed_flags: 0,
                             },

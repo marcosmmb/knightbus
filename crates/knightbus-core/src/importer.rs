@@ -32,6 +32,8 @@ pub trait Signal: Send + Sync + 'static {
 }
 /// One native request, borrowing scratch storage until the next native call.
 pub struct Request<'a> {
+    /// Snapshot slot. ISO may use its endpoint slot or an unused descriptor slot.
+    pub slot: usize,
     /// Native identity, never reused while outstanding.
     pub token: u64,
     /// Endpoint address including direction.
@@ -42,6 +44,12 @@ pub struct Request<'a> {
     pub setup: [u8; 8],
     /// Initialized OUT bytes; empty for IN.
     pub payload: &'a [u8],
+    /// Original ISO packet ranges; empty for other transfer types.
+    pub packets: &'a [crate::usbip::IsoPacket],
+    /// USB/IP transfer behavior flags.
+    pub flags: u32,
+    /// USB/IP frame metadata; ASAP requests use zero.
+    pub start_frame: i32,
 }
 /// Native request liveness indexed by the validated descriptor slots.
 pub struct Snapshot {
@@ -64,7 +72,7 @@ pub trait Driver: Send + 'static {
     fn attach(&mut self, descriptors: &Descriptors, budget: &Budget) -> Result<()>;
     /// Return one request from the admitted slot mask, without blocking.
     fn fetch<'a>(
-        &mut self,
+        &'a mut self,
         mask: u32,
         topology: &Topology,
         scratch: &'a mut [u8],
@@ -124,7 +132,7 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> Backend<D, F> {
     /// thread, allowing the same backend in embedded and service hosts.
     pub fn new(factory: F, descriptors: Descriptors, budget: Budget) -> Result<Self> {
         D::CAPABILITIES.descriptors(&descriptors)?;
-        if D::CAPABILITIES.requests > SLOTS || D::CAPABILITIES.iso_packets != 0 {
+        if D::CAPABILITIES.requests > SLOTS {
             return Err(Error::Unsupported);
         }
         let reservation = budget.reserve_memory(
@@ -219,6 +227,17 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ImporterBackend for B
         }
         for offset in 0..SLOTS {
             let index = (m.next_request + offset) % SLOTS;
+            if let Some(t) = &m.requests[index] {
+                if !t.layout().is_empty()
+                    && m.requests.iter().flatten().any(|earlier| {
+                        earlier.header().endpoint == t.header().endpoint
+                            && earlier.header().direction == t.header().direction
+                            && earlier.header().seqnum < t.header().seqnum
+                    })
+                {
+                    continue;
+                }
+            }
             if let Some(transfer) = m.requests[index].take() {
                 m.next_request = (index + 1) % SLOTS;
                 return Some(Ok(transfer));
@@ -260,7 +279,7 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ImporterBackend for B
         if m.completing[index]
             || m.requests[index].is_some()
             || completion.actual_length > completion.transfer.header().transfer_buffer_length
-            || !completion.transfer.layout().is_empty()
+            || completion.validate().is_err()
             || completion.status > 0
             || completion.transfer.buffer().len()
                 != completion.transfer.header().transfer_buffer_length as usize
@@ -534,7 +553,7 @@ impl<'a, D: Driver> Pump<'a, D> {
     fn fetch(&mut self, live: u64) -> Result<bool> {
         let mut progressed = false;
         // Do not fetch a replacement on a pipe until its previous remote
-        // request retires; this preserves endpoint ordering after cancellation.
+        // request retires; this prevents slot reuse while cancellation is in flight.
         let mut mask = self
             .tokens
             .iter()
@@ -543,7 +562,7 @@ impl<'a, D: Driver> Pump<'a, D> {
             & self.active_slots
             & live as u32;
         // An idle device needs only its small liveness snapshot.
-        // At most one request per eligible pipe per turn. Drain a bounded
+        // At most one request per eligible slot per turn. Drain a bounded
         // batch so a continuously busy low slot cannot
         // consume every turn. Never refetch a pipe pending remote retirement.
         for _ in 0..SLOTS {
@@ -569,6 +588,7 @@ impl<'a, D: Driver> Pump<'a, D> {
                 != 0;
             if request.token == 0
                 || request.length as usize > D::CAPABILITIES.transfer_bytes
+                || request.packets.len() > D::CAPABILITIES.iso_packets
                 || request.payload.len() != if input { 0 } else { request.length as usize }
                 || (request.endpoint != 0 && request.setup != [0; 8])
                 || (request.endpoint == 0
@@ -576,7 +596,13 @@ impl<'a, D: Driver> Pump<'a, D> {
             {
                 return Err(Error::Invalid);
             }
-            let index = slot(&self.descriptors.topology, request.endpoint)?;
+            let index = request.slot;
+            let endpoint_slot = slot(&self.descriptors.topology, request.endpoint)?;
+            let spare = index > self.descriptors.topology.endpoints.iter().flatten().count();
+            if index >= SLOTS || (index != endpoint_slot && (request.packets.is_empty() || !spare))
+            {
+                return Err(Error::Invalid);
+            }
             if self.tokens[index] != 0 || mask & (1 << index) == 0 {
                 return Err(Error::State);
             }
@@ -599,16 +625,25 @@ impl<'a, D: Driver> Pump<'a, D> {
                 device_id: self.device_id,
                 direction,
                 endpoint: (request.endpoint & usb::ENDPOINT_NUMBER_MASK) as u32,
-                transfer_flags: 0,
+                transfer_flags: request.flags,
                 transfer_buffer_length: request.length,
-                start_frame: 0,
-                number_of_packets: 0,
+                start_frame: request.start_frame,
+                number_of_packets: request.packets.len() as i32,
                 interval: self
                     .descriptors
                     .interval(request.endpoint, &self.alternates)?,
                 setup: request.setup,
             };
-            let mut transfer = Transfer::new(self.budget, header, &[])?;
+            let mut transfer = Transfer::new(self.budget, header, request.packets)?;
+            let endpoint = if request.endpoint == 0 {
+                None
+            } else {
+                Some(
+                    self.descriptors
+                        .endpoint(request.endpoint, &self.alternates)?,
+                )
+            };
+            transfer.validate_native(self.device_id, endpoint.as_ref(), D::CAPABILITIES)?;
             if direction == Direction::Out {
                 transfer.buffer_mut().copy_from_slice(request.payload);
             }
