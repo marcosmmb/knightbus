@@ -1,110 +1,135 @@
-//! Windows handle adapter for the unmodified, Microsoft-signed usbip-win UDE driver.
+//! Signed usbip-win2 controller and a bounded, private loopback USB/IP adapter.
 use crate::{
     DriverWake,
     backend::Driver,
-    channel::{self, *},
+    channel::{MAX_MESSAGE, ReadFrame},
+    driver_abi as abi,
 };
-use knightbus_core::{Budget, Buffer, DescriptorSet, Error, Result};
-use std::{ptr, sync::Arc};
+use knightbus_core::{Budget, Buffer, DescriptorSet, Error, Result, topology as usb, usbip};
+use std::{
+    io::{Read, Write},
+    net::{Shutdown, TcpListener, TcpStream},
+    os::windows::io::AsRawSocket,
+    ptr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use windows_sys::{
     Win32::{
         Devices::DeviceAndDriverInstallation::*,
         Foundation::*,
+        Networking::WinSock::*,
+        Security::Cryptography::*,
         Storage::FileSystem::*,
-        System::{IO::*, Threading::*},
+        System::{IO::*, Registry::*, Threading::*},
     },
-    core::GUID,
+    core::{GUID, w},
 };
 
 const INTERFACE: GUID = GUID {
-    data1: 0xd35f7840,
-    data2: 0x6a0c,
-    data3: 0x11d2,
-    data4: [0xb8, 0x41, 0x00, 0xc0, 0x4f, 0xad, 0x51, 0x71],
+    data1: 0xb4030c06,
+    data2: 0xdc5f,
+    data3: 0x4fcc,
+    data4: [0x87, 0xeb, 0xe5, 0x51, 0x5a, 0x09, 0x35, 0xc0],
 };
 const MAX_INTERFACE_UNITS: u32 = 16384;
 const HARDWARE_ID_UNITS: usize = 512;
 const IO_TIMEOUT_MS: u32 = 5000;
 const CANCEL_TIMEOUT_MS: u32 = 1000;
-const PORT_STATUS_BYTES: usize = 128;
-const IOCTL_DEVICE_SHIFT: u32 = 16;
-const IOCTL_ACCESS_SHIFT: u32 = 14;
-const IOCTL_FUNCTION_SHIFT: u32 = 2;
-const BUS_EXTENDER: u32 = 0x2a;
-const READ_ACCESS: u32 = 1;
-const fn ioctl(function: u32) -> u32 {
-    (BUS_EXTENDER << IOCTL_DEVICE_SHIFT)
-        | (READ_ACCESS << IOCTL_ACCESS_SHIFT)
-        | (function << IOCTL_FUNCTION_SHIFT)
-}
-const PLUGIN: u32 = ioctl(0);
-const SHUTDOWN: u32 = ioctl(2); // Scoped to this handle; never unplug every port.
-const PORT_STATUS: u32 = ioctl(3);
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+const NONCE_BYTES: usize = 15; // 120 random bits, hex fits the driver's bus ID.
+const TIMEOUT: Duration = Duration::from_millis(IO_TIMEOUT_MS as u64);
 
-struct Event(HANDLE);
-// SAFETY: owned event handles can be moved and signaled across threads.
-unsafe impl Send for Event {}
-impl Drop for Event {
+struct Handle(HANDLE);
+// SAFETY: Windows handles are movable; each operation retains its own storage.
+unsafe impl Send for Handle {}
+impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
             CloseHandle(self.0);
         }
     }
 }
-enum EventOwner {
-    Owned(Event),
-    Wake(Arc<DriverWake>),
+struct Admission(Handle);
+impl Admission {
+    fn acquire() -> Result<Self> {
+        // Serialize admission across KnightBus processes; the driver also bounds
+        // allocation under its own lock, including callers outside KnightBus.
+        let handle =
+            unsafe { CreateMutexW(ptr::null(), 0, w!("Global\\KnightBusUsbipWin2Admission")) };
+        if handle.is_null() {
+            return Err(last_error());
+        }
+        let handle = Handle(handle);
+        match unsafe { WaitForSingleObject(handle.0, IO_TIMEOUT_MS) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+            WAIT_TIMEOUT => Err(Error::Deadline),
+            _ => Err(last_error()),
+        }
+    }
 }
-impl EventOwner {
-    fn handle(&self) -> HANDLE {
-        match self {
-            Self::Owned(e) => e.0,
-            Self::Wake(w) => w.handle(),
+impl Drop for Admission {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0.0);
         }
     }
 }
 struct Io {
     overlapped: Box<OVERLAPPED>,
     buffer: Buffer,
-    _event: EventOwner,
+    _event: Handle,
     pending: bool,
     ready: Option<usize>,
 }
-// SAFETY: heap addresses remain stable; one worker owns each I/O operation.
-unsafe impl Send for Io {}
 impl Io {
-    fn new(budget: &Budget, size: usize, wake: Option<Arc<DriverWake>>) -> Result<Self> {
-        let event = if let Some(wake) = wake {
-            EventOwner::Wake(wake)
-        } else {
-            // SAFETY: unnamed, non-inherited manual-reset completion event.
-            let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
-            if event.is_null() {
-                return Err(last_error());
-            }
-            EventOwner::Owned(Event(event))
-        };
-        Ok(Self {
+    fn start(
+        handle: HANDLE,
+        budget: &Budget,
+        code: u32,
+        input: &[u8],
+        output: usize,
+    ) -> Result<Self> {
+        let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+        if event.is_null() {
+            return Err(last_error());
+        }
+        let event = Handle(event);
+        let mut io = Self {
             overlapped: Box::new(OVERLAPPED {
-                hEvent: event.handle(),
+                hEvent: event.0,
                 ..Default::default()
             }),
-            buffer: budget.buffer(size)?,
+            buffer: budget.buffer(input.len().max(output))?,
             _event: event,
             pending: false,
             ready: None,
-        })
-    }
-    fn started(&mut self, success: i32, count: u32) -> Result<()> {
+        };
+        io.buffer.as_mut_slice()[..input.len()].copy_from_slice(input);
+        let mut count = 0;
+        let bytes = io.buffer.as_mut_slice();
+        // SAFETY: METHOD_BUFFERED accepts shared input/output; storage is retained
+        // until the overlapped request completes or cancellation is acknowledged.
+        let success = unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                bytes.as_ptr().cast(),
+                input.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                output as u32,
+                &mut count,
+                &mut *io.overlapped,
+            )
+        };
         if success != 0 {
-            self.ready = Some(count as usize);
-            Ok(())
+            io.ready = Some(count as usize);
         } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-            self.pending = true;
-            Ok(())
+            io.pending = true;
         } else {
-            Err(last_error())
+            return Err(last_error());
         }
+        Ok(io)
     }
     fn poll(&mut self, handle: HANDLE, timeout: u32) -> Result<Option<usize>> {
         if let Some(count) = self.ready.take() {
@@ -114,7 +139,6 @@ impl Io {
             return Ok(None);
         }
         let mut count = 0;
-        // SAFETY: the handle, pinned OVERLAPPED and buffer outlive completion.
         let success =
             unsafe { GetOverlappedResultEx(handle, &*self.overlapped, &mut count, timeout, 0) };
         if success != 0 {
@@ -134,90 +158,59 @@ impl Io {
         if !self.pending {
             return Ok(());
         }
-        // SAFETY: cancel exactly this operation, then retain storage until terminal.
         unsafe {
             CancelIoEx(handle, &*self.overlapped);
         }
-        match self.poll(handle, CANCEL_TIMEOUT_MS) {
-            Ok(Some(_)) | Err(Error::Cancelled | Error::NotFound) => Ok(()),
-            Err(_) if !self.pending => Ok(()),
-            _ => Err(Error::Cleanup),
+        let result = self.poll(handle, CANCEL_TIMEOUT_MS);
+        if self.pending {
+            Err(Error::Cleanup)
+        } else {
+            result.map(|_| ()).or(Ok(()))
         }
     }
 }
 
-/// One upstream device handle, owned by a single attachment worker.
+/// One attachment's private listener, stream and controller handle.
 pub struct Controller {
-    handle: HANDLE,
+    handle: Option<Handle>,
     budget: Option<Budget>,
-    reader: Option<Io>,
-    read_frame: ReadFrame,
+    stream: Option<TcpStream>,
+    listener: Option<TcpListener>,
+    reader: Option<Buffer>,
+    frame: ReadFrame,
     wake: Option<Arc<DriverWake>>,
+    location: Option<[u8; abi::LOCATION_BYTES]>,
     failed: bool,
-    attached: bool,
 }
-// SAFETY: unique handle and pinned buffers move together to one worker.
-unsafe impl Send for Controller {}
 impl Controller {
-    /// Defer native access until descriptor validation and resource admission.
+    /// Native access starts only after core descriptor and budget admission.
     pub fn owned() -> Self {
         Self {
-            handle: INVALID_HANDLE_VALUE,
+            handle: None,
             budget: None,
+            stream: None,
+            listener: None,
             reader: None,
-            read_frame: ReadFrame::default(),
+            frame: ReadFrame::default(),
             wake: None,
+            location: None,
             failed: false,
-            attached: false,
         }
     }
-    fn transaction(&mut self, code: Option<u32>, input: &[u8], output: usize) -> Result<Vec<u8>> {
-        if self.failed {
-            return Err(Error::Cleanup);
-        }
-        let mut io = Io::new(
-            self.budget.as_ref().ok_or(Error::State)?,
-            input.len().max(output),
-            None,
-        )?;
-        io.buffer.as_mut_slice()[..input.len()].copy_from_slice(input);
-        let mut count = 0;
-        let bytes = io.buffer.as_mut_slice();
-        // SAFETY: private stable storage. METHOD_BUFFERED permits aliased input/output.
-        let success = unsafe {
-            if let Some(code) = code {
-                DeviceIoControl(
-                    self.handle,
-                    code,
-                    bytes.as_ptr().cast(),
-                    input.len() as u32,
-                    bytes.as_mut_ptr().cast(),
-                    output as u32,
-                    &mut count,
-                    &mut *io.overlapped,
-                )
-            } else {
-                WriteFile(
-                    self.handle,
-                    bytes.as_ptr(),
-                    input.len() as u32,
-                    &mut count,
-                    &mut *io.overlapped,
-                )
-            }
-        };
-        io.started(success, count)?;
-        let result = io.poll(self.handle, IO_TIMEOUT_MS);
-        match result {
-            Ok(Some(count)) => {
-                if (code.is_none() && count != input.len()) || (code.is_some() && count > output) {
-                    return Err(Error::Invalid);
-                }
-                Ok(io.buffer.as_slice()[..output.min(count)].to_vec())
+    fn finish(&mut self, mut io: Io, deadline: Instant) -> Result<Vec<u8>> {
+        let handle = self.handle.as_ref().ok_or(Error::State)?.0;
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(IO_TIMEOUT_MS as u128) as u32;
+        match io.poll(handle, wait) {
+            Ok(Some(count)) if count <= io.buffer.as_slice().len() => {
+                Ok(io.buffer.as_slice()[..count].to_vec())
             }
             result => {
-                if io.cancel(self.handle).is_err() {
-                    // An uncooperative driver must not retain a freed user buffer/event.
+                if io.cancel(handle).is_err() {
+                    // The OS still owns these addresses. Retain them on a broken
+                    // cancellation path and prevent reporting successful cleanup.
                     std::mem::forget(io);
                     self.failed = true;
                     return Err(Error::Cleanup);
@@ -226,115 +219,330 @@ impl Controller {
             }
         }
     }
-    fn start_read(&mut self) -> Result<()> {
-        let io = self.reader.as_mut().ok_or(Error::State)?;
-        if io.pending || io.ready.is_some() {
-            return Ok(());
+    fn transaction(&mut self, code: u32, input: &[u8], output: usize) -> Result<Vec<u8>> {
+        if self.failed {
+            return Err(Error::Cleanup);
         }
-        let mut count = 0;
-        let remaining = self.read_frame.remaining();
-        // SAFETY: buffer and OVERLAPPED are heap-owned until completion/cancel.
-        let success = unsafe {
-            ReadFile(
-                self.handle,
-                io.buffer.as_mut_slice()[remaining.clone()].as_mut_ptr(),
-                remaining.len() as u32,
-                &mut count,
-                &mut *io.overlapped,
-            )
+        let io = Io::start(
+            self.handle.as_ref().ok_or(Error::State)?.0,
+            self.budget.as_ref().ok_or(Error::State)?,
+            code,
+            input,
+            output,
+        )?;
+        self.finish(io, Instant::now() + TIMEOUT)
+    }
+    fn devices(&mut self) -> Result<Vec<u8>> {
+        let mut input = [0; abi::LIST_HEADER_BYTES];
+        abi::put(&mut input, abi::SIZE_OFFSET, abi::LIST_REQUEST_BYTES as u32);
+        let bytes = self.transaction(abi::LIST, &input, abi::LIST_BYTES)?;
+        let _ = abi::devices(&bytes)?;
+        Ok(bytes)
+    }
+    fn bootstrap(
+        &mut self,
+        listener: &TcpListener,
+        bus: &str,
+        descriptors: &DescriptorSet,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((s, peer)) if peer.ip().is_loopback() => break s,
+                Ok(_) => return Err(Error::Denied),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => pause(deadline)?,
+                Err(_) => return Err(Error::Unavailable),
+            }
         };
-        io.started(success, count)?;
-        if io.ready.is_some() {
-            self.wake.as_ref().unwrap().notify();
+        stream
+            .set_nonblocking(true)
+            .map_err(|_| Error::Unavailable)?;
+        stream.set_nodelay(true).map_err(|_| Error::Unavailable)?;
+        let mut request = [0; usbip::IMPORT_REQUEST_BYTES];
+        read_exact_until(&mut stream, &mut request, deadline)?;
+        let expected = usbip::Message::ImportRequest(
+            usbip::WireString::new(bus.as_bytes()).map_err(|_| Error::Invalid)?,
+        );
+        let (message, used) = usbip::decode(
+            &request,
+            usbip::Context::Management,
+            usbip::Limits::default(),
+            &mut |_| Ok(()),
+        )
+        .map_err(|_| Error::Invalid)?;
+        if message != expected || used != request.len() {
+            return Err(Error::Denied);
         }
+        let device = descriptors.device();
+        let config = descriptors.configuration();
+        let reply = usbip::Message::ImportReply {
+            status: 0,
+            device: Some(Box::new(usbip::Device {
+                path: usbip::WireString::new(b"knightbus").map_err(|_| Error::Invalid)?,
+                bus_id: usbip::WireString::new(bus.as_bytes()).map_err(|_| Error::Invalid)?,
+                bus_number: 0,
+                device_number: crate::channel::LOCAL_DEVICE_ID,
+                speed: descriptors.speed() as u32,
+                vendor_id: usb::u16_at(device, usb::device::VENDOR),
+                product_id: usb::u16_at(device, usb::device::PRODUCT),
+                device_bcd: usb::u16_at(device, usb::device::BCD),
+                class: device[usb::device::CLASS],
+                subclass: device[usb::device::SUBCLASS],
+                protocol: device[usb::device::PROTOCOL],
+                configuration: config[usb::configuration::VALUE],
+                configurations: device[usb::device::CONFIGURATIONS],
+                interfaces: config[usb::configuration::INTERFACES],
+            })),
+        };
+        let reply = self
+            .budget
+            .as_ref()
+            .unwrap()
+            .encode(&reply, usbip::Limits::default())
+            .map_err(|_| Error::Exhausted)?;
+        write_all_until(&mut stream, reply.as_slice(), deadline)?;
+        self.stream = Some(stream);
         Ok(())
     }
 }
 impl Driver for Controller {
     fn attach(&mut self, descriptors: &DescriptorSet, budget: &Budget) -> Result<()> {
-        if self.handle != INVALID_HANDLE_VALUE {
+        if self.handle.is_some() {
             return Err(Error::State);
         }
-        self.read_frame = ReadFrame::default();
-        let plug = channel::plugin(descriptors, budget)?;
+        crate::backend::CAPABILITIES.descriptors(descriptors)?;
+        let _admission = Admission::acquire()?;
+        self.handle = Some(Handle(open()?));
         self.budget = Some(budget.clone());
-        self.handle = open()?;
-        let ports = self.transaction(Some(PORT_STATUS), &[], PORT_STATUS_BYTES)?;
-        if ports.len() != PORT_STATUS_BYTES
-            || ports[0] == 0
-            || usize::from(ports[0]) >= PORT_STATUS_BYTES
+        let devices = self.devices()?;
+        abi::admit(
+            &devices,
+            descriptors.speed(),
+            port_capacity(descriptors.speed())?,
+        )?;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|_| Error::Unavailable)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| Error::Unavailable)?;
+        let mut nonce = [0; NONCE_BYTES];
+        if unsafe {
+            BCryptGenRandom(
+                ptr::null_mut(),
+                nonce.as_mut_ptr(),
+                nonce.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        } < 0
         {
-            return Err(Error::Version);
+            return Err(Error::Unavailable);
         }
-        // SHUTDOWN is safe even if plugin fails after allocating a child.
-        self.attached = true;
-        let reply = self.transaction(Some(PLUGIN), plug.as_slice(), PLUG_SIZE)?;
-        if reply.len() != PLUG_SIZE || reply[PLUG_PORT] >= ports[0] {
+        let bus: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let service = listener
+            .local_addr()
+            .map_err(|_| Error::Unavailable)?
+            .port()
+            .to_string();
+        let location = abi::location(&bus, &service)?;
+        let request = abi::request(&location, abi::PLUGIN_BYTES);
+        self.location = Some(location);
+        let deadline = Instant::now() + TIMEOUT;
+        let io = Io::start(
+            self.handle.as_ref().unwrap().0,
+            budget,
+            abi::PLUGIN,
+            &request,
+            abi::PLUGIN_BYTES,
+        )?;
+        let bootstrap = self.bootstrap(&listener, &bus, descriptors, deadline);
+        // Keep the ephemeral port reserved until native cleanup finishes.
+        self.listener = Some(listener);
+        // Always retire the IOCTL, even if the local handshake failed.
+        let result = self.finish(io, deadline);
+        bootstrap?;
+        let reply = result?;
+        if reply.len() != abi::PLUGIN_REPLY_BYTES
+            || abi::word(&reply, abi::REQUEST_PORT_OFFSET) == 0
+            || abi::word(&reply, abi::REQUEST_PORT_OFFSET) as usize > abi::MAX_PORTS
+        {
             return Err(Error::Invalid);
         }
         Ok(())
     }
     fn notifications(&mut self, wake: Arc<DriverWake>) -> Result<()> {
-        self.reader = Some(Io::new(
-            self.budget.as_ref().ok_or(Error::State)?,
-            MAX_MESSAGE,
-            Some(wake.clone()),
-        )?);
+        self.reader = Some(
+            self.budget
+                .as_ref()
+                .ok_or(Error::State)?
+                .buffer(MAX_MESSAGE)?,
+        );
+        let socket = self.stream.as_ref().ok_or(Error::State)?.as_raw_socket() as SOCKET;
+        // WSAEventSelect keeps this socket nonblocking; the worker owns reads.
+        if unsafe {
+            WSAEventSelect(
+                socket,
+                wake.handle() as WSAEVENT,
+                (FD_READ | FD_CLOSE) as i32,
+            )
+        } != 0
+        {
+            return Err(Error::Unavailable);
+        }
         self.wake = Some(wake);
-        self.start_read()
+        Ok(())
     }
     fn read(&mut self, output: &mut [u8]) -> Result<usize> {
-        self.start_read()?;
-        let io = self.reader.as_mut().unwrap();
-        let Some(count) = io.poll(self.handle, 0)? else {
-            return Ok(0);
-        };
-        let complete = self.read_frame.advance(io.buffer.as_slice(), count)?;
-        if let Some(length) = complete {
-            output
-                .get_mut(..length)
-                .ok_or(Error::Invalid)?
-                .copy_from_slice(&io.buffer.as_slice()[..length]);
+        let stream = self.stream.as_mut().ok_or(Error::State)?;
+        let mut events = WSANETWORKEVENTS::default();
+        if unsafe {
+            WSAEnumNetworkEvents(
+                stream.as_raw_socket() as SOCKET,
+                self.wake.as_ref().ok_or(Error::State)?.handle() as WSAEVENT,
+                &mut events,
+            )
+        } != 0
+        {
+            return Err(Error::Unavailable);
         }
-        self.start_read()?;
-        Ok(complete.unwrap_or(0))
+        let buffer = self.reader.as_mut().ok_or(Error::State)?;
+        loop {
+            match stream.read(&mut buffer.as_mut_slice()[self.frame.remaining()]) {
+                Ok(0) => return Err(Error::NotFound),
+                Ok(count) => {
+                    if let Some(length) = self.frame.advance(buffer.as_slice(), count)? {
+                        output
+                            .get_mut(..length)
+                            .ok_or(Error::Invalid)?
+                            .copy_from_slice(&buffer.as_slice()[..length]);
+                        return Ok(length);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Error::Unavailable),
+            }
+        }
     }
     fn write(&mut self, input: &[u8]) -> Result<()> {
-        self.transaction(None, input, 0).map(|_| ())
+        write_all_until(
+            self.stream.as_mut().ok_or(Error::State)?,
+            input,
+            Instant::now() + TIMEOUT,
+        )
     }
     fn detach(&mut self) -> Result<()> {
-        if self.handle == INVALID_HANDLE_VALUE {
-            return if self.failed {
-                Err(Error::Cleanup)
-            } else {
-                Ok(())
-            };
-        }
-        // Cancel the read before shutdown: the upstream shutdown path also retires
-        // pending reads, so these operations must not race one another.
-        if let Some(mut io) = self.reader.take()
-            && io.cancel(self.handle).is_err()
-        {
-            std::mem::forget(io);
-            self.failed = true;
-        }
-        if self.attached && self.transaction(Some(SHUTDOWN), &[], 0).is_err() {
-            self.failed = true;
-        }
-        unsafe {
-            CloseHandle(self.handle);
-        }
-        self.handle = INVALID_HANDLE_VALUE;
         if self.failed {
-            Err(Error::Cleanup)
-        } else {
-            Ok(())
+            return Err(Error::Cleanup);
         }
+        if let Some(location) = self.location {
+            let _admission = Admission::acquire()?;
+            let devices = self.devices()?;
+            // Match the whole private location before using a global port number.
+            if let Some(device) = abi::devices(&devices)?.find(|d| abi::same_location(d, &location))
+            {
+                let mut request = [0; abi::PLUGOUT_BYTES];
+                abi::put(&mut request, abi::SIZE_OFFSET, abi::PLUGOUT_BYTES as u32);
+                abi::put(
+                    &mut request,
+                    abi::REQUEST_PORT_OFFSET,
+                    abi::word(device, abi::PORT_OFFSET),
+                );
+                self.transaction(abi::PLUGOUT, &request, 0)?;
+            }
+            if let Some(stream) = self.stream.take() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            let stop = abi::request(&location, abi::STOP_BYTES);
+            self.transaction(abi::STOP, &stop, abi::STOP_BYTES)?;
+            let devices = self.devices()?;
+            if abi::devices(&devices)?.any(|d| abi::same_location(d, &location)) {
+                return Err(Error::Cleanup);
+            }
+            self.location = None;
+        }
+        self.listener = None;
+        self.reader = None;
+        self.wake = None;
+        self.handle = None;
+        self.budget = None;
+        Ok(())
     }
 }
 impl Drop for Controller {
     fn drop(&mut self) {
         let _ = self.detach();
+    }
+}
+fn pause(deadline: Instant) -> Result<()> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(Error::Deadline)?;
+    std::thread::sleep(POLL_INTERVAL.min(remaining));
+    Ok(())
+}
+fn read_exact_until(
+    stream: &mut TcpStream,
+    mut output: &mut [u8],
+    deadline: Instant,
+) -> Result<()> {
+    while !output.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
+        match stream.read(output) {
+            Ok(0) => return Err(Error::NotFound),
+            Ok(n) => output = &mut output[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => pause(deadline)?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(Error::Unavailable),
+        }
+    }
+    Ok(())
+}
+fn write_all_until(stream: &mut TcpStream, mut input: &[u8], deadline: Instant) -> Result<()> {
+    while !input.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
+        match stream.write(input) {
+            Ok(0) => return Err(Error::NotFound),
+            Ok(n) => input = &input[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => pause(deadline)?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(Error::Unavailable),
+        }
+    }
+    Ok(())
+}
+fn port_capacity(speed: usb::Speed) -> Result<usize> {
+    fn configured(name: *const u16) -> Result<usize> {
+        let mut value = abi::DEFAULT_CLASS_PORTS as u32;
+        let mut size = size_of_val(&value) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!("SYSTEM\\CurrentControlSet\\Services\\usbip2_ude\\Parameters"),
+                name,
+                RRF_RT_REG_DWORD,
+                ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        if !matches!(
+            status,
+            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND
+        ) {
+            return Err(Error::Unavailable);
+        }
+        // Upstream clamps signed registry values and assigns USB 3 ports first.
+        Ok((value as i32).clamp(abi::MIN_CLASS_PORTS as i32, abi::MAX_CLASS_PORTS as i32) as usize)
+    }
+    let superspeed = configured(w!("NumberOfUsb30Ports"))?;
+    if speed as u32 >= usb::Speed::Super as u32 {
+        Ok(superspeed)
+    } else {
+        Ok(configured(w!("NumberOfUsb20Ports"))?.min(abi::MAX_PORTS - superspeed))
     }
 }
 
@@ -424,10 +632,9 @@ fn path() -> Result<Vec<u16>> {
             {
                 return Err(last_error());
             }
-            if !hardware
-                .split(|c| *c == 0)
-                .any(|id| String::from_utf16_lossy(id).eq_ignore_ascii_case("ROOT\\VHCI_ude"))
-            {
+            if !hardware.split(|c| *c == 0).any(|id| {
+                String::from_utf16_lossy(id).eq_ignore_ascii_case("ROOT\\USBIP_WIN2\\UDE")
+            }) {
                 continue;
             }
             let path_offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
@@ -444,12 +651,12 @@ fn path() -> Result<Vec<u16>> {
 }
 fn open() -> Result<HANDLE> {
     let path = path()?;
-    // SAFETY: validated terminated PnP path; exclusive per-attachment overlapped file.
+    // SAFETY: validated terminated PnP path; shared controller with per-operation overlapped storage.
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
-            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED,

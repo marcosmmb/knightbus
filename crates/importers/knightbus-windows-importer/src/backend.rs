@@ -1,4 +1,4 @@
-//! Bounded adapter from usbip-win requests to the shared importer worker.
+//! Bounded adapter from usbip-win2 requests to the shared importer worker.
 use crate::{
     channel::{self, *},
     notification::Notification,
@@ -65,7 +65,6 @@ pub fn new<D: Driver>(
 ) -> Result<impl ImporterBackend> {
     // Reject unsupported native descriptors before starting any worker.
     CAPABILITIES.descriptors(&descriptors)?;
-    drop(channel::plugin(&descriptors, &budget)?);
     importer::Backend::new(move || Ok(Channel::new(factory()?)), descriptors, budget)
 }
 /// Limits of the adapter and pinned upstream UDE package.
@@ -96,8 +95,6 @@ struct Channel<D> {
     waiting: VecDeque<Queued>,
     slots: [Option<Slot>; SLOTS],
     packets: [knightbus_core::usbip::IsoPacket; MAX_PACKETS],
-    sequence: u32,
-    virtual_revision: u16,
     wake: Option<Arc<Notification>>,
 }
 impl<D> Channel<D> {
@@ -115,8 +112,6 @@ impl<D> Channel<D> {
                 actual_length: 0,
                 status: 0,
             }),
-            sequence: 0,
-            virtual_revision: 0,
             wake: None,
         }
     }
@@ -124,6 +119,10 @@ impl<D> Channel<D> {
 impl<D: Driver> Channel<D> {
     fn receive(&mut self) -> Result<()> {
         for _ in 0..SLOTS {
+            // Leave excess requests in the native driver until replies free space.
+            if self.waiting.len() == MAX_QUEUED {
+                break;
+            }
             let buffer = self.input.as_mut().ok_or(Error::State)?;
             let count = self.driver.read(buffer.as_mut_slice())?;
             if count == 0 {
@@ -135,15 +134,17 @@ impl<D: Driver> Channel<D> {
                 Frame::Submit(h) => h.sequence,
                 Frame::Unlink { sequence, .. } => sequence,
             };
-            if sequence <= self.sequence {
+            if self.waiting.iter().any(|q| q.header.sequence == sequence)
+                || self
+                    .slots
+                    .iter()
+                    .flatten()
+                    .any(|s| s.header.sequence == sequence)
+            {
                 return Err(Error::Invalid);
             }
-            self.sequence = sequence;
             match frame {
                 Frame::Submit(header) => {
-                    if self.waiting.len() == MAX_QUEUED {
-                        return Err(Error::Exhausted);
-                    }
                     let mut owned = self.budget.as_ref().unwrap().buffer(count)?;
                     owned.as_mut_slice().copy_from_slice(bytes);
                     self.waiting.push_back(Queued {
@@ -222,11 +223,10 @@ impl<D: Driver> importer::Driver for Channel<D> {
     const NATIVE_BYTES: usize = size_of::<Self>() + MAX_QUEUED * size_of::<Queued>();
     const SCRATCH_BYTES: usize = MAX_MESSAGE;
     fn attach(&mut self, descriptors: &DescriptorSet, budget: &Budget) -> Result<()> {
-        drop(channel::plugin(descriptors, budget)?);
+        CAPABILITIES.descriptors(descriptors)?;
         self.input = Some(budget.buffer(MAX_MESSAGE)?);
         self.budget = Some(budget.clone());
         self.topology = Some(*descriptors.topology());
-        self.virtual_revision = channel::virtual_revision(descriptors.speed())?;
         self.driver.attach(descriptors, budget)
     }
     fn fetch<'a>(
@@ -253,10 +253,10 @@ impl<D: Driver> importer::Driver for Channel<D> {
             .zip(layout.as_chunks::<PACKET_BYTES>().0.iter())
         {
             *p = knightbus_core::usbip::IsoPacket {
-                offset: word(bytes, 0),
-                length: word(bytes, WORD),
-                actual_length: word(bytes, WORD * 2),
-                status: word(bytes, WORD * 3) as i32,
+                offset: word(bytes, packet::OFFSET),
+                length: word(bytes, packet::LENGTH),
+                actual_length: word(bytes, packet::ACTUAL_LENGTH),
+                status: word(bytes, packet::STATUS) as i32,
             };
         }
         Ok(Some(importer::Request {
@@ -291,13 +291,16 @@ impl<D: Driver> importer::Driver for Channel<D> {
             let size = HEADER + payload + h.packets * PACKET_BYTES;
             let bytes = scratch.get_mut(..size).ok_or(Error::Invalid)?;
             bytes[..HEADER].fill(0);
-            let status =
-                if done.status == 0 && h.flags & SHORT_NOT_OK != 0 && done.actual_length < h.length
-                {
-                    SHORT_TRANSFER
-                } else {
-                    done.status
-                };
+            // Short packets are normal for ISO; their individual statuses apply.
+            let status = if h.packets == 0
+                && done.status == 0
+                && h.flags & SHORT_NOT_OK != 0
+                && done.actual_length < h.length
+            {
+                SHORT_TRANSFER
+            } else {
+                done.status
+            };
             for (offset, value) in [
                 (field::COMMAND, RET_SUBMIT),
                 (field::SEQUENCE, h.sequence),
@@ -323,20 +326,6 @@ impl<D: Driver> importer::Driver for Channel<D> {
                 put(bytes, offset, value);
             }
             done.copy_payload(&mut bytes[HEADER..HEADER + payload])?;
-            // Keep enumeration replies consistent with the descriptor published to UDE.
-            use knightbus_core::topology as usb;
-            if done.status == 0
-                && h.endpoint == 0
-                && h.input
-                && h.setup[usb::SETUP_TYPE] == usb::DIRECTION_IN
-                && h.setup[usb::SETUP_REQUEST] == usb::GET_DESCRIPTOR
-                && usb::u16_at(&h.setup, usb::SETUP_VALUE)
-                    == u16::from(usb::device::TYPE) << u8::BITS
-                && usb::u16_at(&h.setup, usb::SETUP_INDEX) == 0
-            {
-                patch_revision(&mut bytes[HEADER..HEADER + payload], self.virtual_revision);
-            }
-
             for (bytes, p) in bytes[HEADER + payload..]
                 .as_chunks_mut::<PACKET_BYTES>()
                 .0
@@ -344,10 +333,10 @@ impl<D: Driver> importer::Driver for Channel<D> {
                 .zip(done.transfer.packets())
             {
                 for (offset, value) in [
-                    (0, p.offset),
-                    (WORD, p.length),
-                    (WORD * 2, p.actual_length),
-                    (WORD * 3, p.status as u32),
+                    (packet::OFFSET, p.offset),
+                    (packet::LENGTH, p.length),
+                    (packet::ACTUAL_LENGTH, p.actual_length),
+                    (packet::STATUS, p.status as u32),
                 ] {
                     put(bytes, offset, value);
                 }
@@ -400,7 +389,12 @@ impl importer::Signal for Notification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use knightbus_core::{ResourceLimits, importer::Driver as _, topology::Speed, usbip};
+    use knightbus_core::{
+        ResourceLimits,
+        importer::Driver as _,
+        topology::{self as usb, Speed},
+        usbip,
+    };
     const DEVICE: [u8; 18] = [18, 1, 0, 2, 0, 0, 0, 64, 9, 18, 1, 0, 0, 1, 0, 0, 0, 1];
     const CONFIG: [u8; 32] = [
         9, 2, 32, 0, 1, 1, 0, 128, 50, 9, 4, 0, 0, 2, 255, 0, 0, 0, 7, 5, 2, 2, 0, 2, 0, 7, 5, 130,
@@ -448,14 +442,17 @@ mod tests {
         (channel, descriptors, budget)
     }
     fn submit(sequence: u32, endpoint: u8, length: u32) -> Vec<u8> {
-        let input = endpoint & 128 != 0;
+        let input = endpoint & usb::DIRECTION_IN != 0;
         let mut bytes = vec![0; HEADER + if input { 0 } else { length as usize }];
         for (offset, value) in [
             (field::COMMAND, CMD_SUBMIT),
             (field::SEQUENCE, sequence),
             (field::DEVICE, LOCAL_DEVICE_ID),
             (field::DIRECTION, u32::from(input)),
-            (field::ENDPOINT, u32::from(endpoint & 15)),
+            (
+                field::ENDPOINT,
+                u32::from(endpoint & usb::ENDPOINT_NUMBER_MASK),
+            ),
             (field::LENGTH, length),
         ] {
             put(&mut bytes, offset, value);
@@ -485,7 +482,7 @@ mod tests {
                 } else {
                     usbip::Direction::Out
                 },
-                endpoint: u32::from(header.endpoint & 15),
+                endpoint: u32::from(header.endpoint & usb::ENDPOINT_NUMBER_MASK),
                 transfer_flags: 0,
                 transfer_buffer_length: header.length,
                 start_frame: 0,
@@ -591,43 +588,68 @@ mod tests {
         assert!(matches!(channel.snapshot(), Err(Error::Invalid)));
         let mut bytes = submit(2, 130, 4);
         put(&mut bytes, field::PACKETS, u32::MAX);
+        assert!(decode(&bytes).is_ok());
+        put(&mut bytes, field::PACKETS, MAX_PACKETS as u32 + 1);
         assert!(decode(&bytes).is_err());
         bytes.truncate(HEADER - 1);
         assert!(decode(&bytes).is_err());
     }
     #[test]
-    fn queue_is_bounded_even_when_an_endpoint_never_completes() {
+    fn out_of_order_native_sequences_are_accepted_but_live_duplicates_are_not() {
         let (mut channel, _, _) = setup();
         channel
             .driver
             .incoming
-            .extend((1..=SLOTS as u32 * 3).map(|seq| submit(seq, 130, 4)));
+            .extend([submit(9, 130, 4), submit(3, 130, 4)]);
         channel.snapshot().unwrap();
-        assert!(matches!(channel.snapshot(), Err(Error::Exhausted)));
-        assert!(channel.waiting.len() <= MAX_QUEUED);
+        assert_eq!(
+            channel.slots.iter().flatten().count() + channel.waiting.len(),
+            2
+        );
+        channel.driver.incoming.push_back(submit(3, 130, 4));
+        assert!(matches!(channel.snapshot(), Err(Error::Invalid)));
     }
     #[test]
-    fn plugin_layout_matches_the_upstream_c_abi_and_encodes_negotiated_speed() {
-        let (_, descriptors, budget) = setup();
-        let bytes = plugin(&descriptors, &budget).unwrap();
-        assert_eq!(word(bytes.as_slice(), 0), 319);
-        assert_eq!(&bytes.as_slice()[266..284], &DEVICE);
-        assert_eq!(&bytes.as_slice()[284..316], &CONFIG);
-        let mut config = CONFIG;
-        config[22] = 64;
-        config[23] = 0;
-        config[24] = 0;
-        // Build a valid full-speed tree while keeping a USB 2.0 revision.
-        config[29] = 64;
-        config[30] = 0;
-        config[31] = 0;
-        let full = DescriptorSet::new(&budget, &DEVICE, &config, &[], Speed::Full).unwrap();
-        let published = plugin(&full, &budget).unwrap();
-        let mut expected = DEVICE;
-        expected[knightbus_core::topology::device::USB_REVISION..][..size_of::<u16>()]
-            .copy_from_slice(&0x0110u16.to_le_bytes());
-        assert_eq!(&published.as_slice()[266..284], &expected);
-        assert_eq!(full.device(), &DEVICE); // Physical descriptors remain unchanged.
+    fn backlog_pauses_native_reads_and_resumes_after_completions() {
+        const BACKLOG: usize = SLOTS * 3;
+        const DELAYED_POLLS: usize = 20;
+        let (mut channel, descriptors, budget) = setup();
+        channel
+            .driver
+            .incoming
+            .extend((1..=BACKLOG as u32).map(|seq| submit(seq, 130, 4)));
+        channel.snapshot().unwrap();
+        channel.snapshot().unwrap();
+        assert_eq!(channel.waiting.len(), MAX_QUEUED);
+        let retained = channel.driver.incoming.len();
+        for _ in 0..DELAYED_POLLS {
+            channel.snapshot().unwrap();
+            assert_eq!(channel.driver.incoming.len(), retained);
+            assert!(!channel.driver.detached);
+        }
+        let mut scratch = vec![0; MAX_MESSAGE];
+        for sequence in 1..=BACKLOG as u32 {
+            channel.snapshot().unwrap();
+            let request = channel
+                .fetch(u32::MAX, descriptors.topology(), &mut scratch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.token, u64::from(sequence));
+            let header = channel.slots[request.slot].as_ref().unwrap().header;
+            channel
+                .complete(
+                    u64::from(sequence),
+                    &completion(&budget, header, &[1, 2, 3, 4]),
+                    &mut scratch,
+                )
+                .unwrap();
+        }
+        assert!(channel.driver.incoming.is_empty());
+        assert!(channel.waiting.is_empty());
+        assert_eq!(channel.driver.outgoing.len(), BACKLOG);
+        drop(channel);
+        drop(descriptors);
+        assert_eq!(budget.usage().bytes, 0);
     }
     const SUPER_DEVICE: [u8; 18] = [18, 1, 0x20, 3, 0, 0, 0, 9, 9, 18, 1, 0, 0, 1, 0, 0, 0, 1];
     const SUPER_CONFIG: [u8; 44] = [
@@ -648,24 +670,13 @@ mod tests {
                     DescriptorSet::new(&budget, &SUPER_DEVICE, &SUPER_CONFIG, &SUPER_BOS, speed)
                         .unwrap();
                 CAPABILITIES.descriptors(&descriptors).unwrap();
-                let bytes = plugin(&descriptors, &budget).unwrap();
-                let mut virtual_device = SUPER_DEVICE;
-                patch_revision(&mut virtual_device, 0x0300);
-                assert_eq!(
-                    &bytes.as_slice()[PLUG_DESCRIPTOR..PLUG_CONFIGURATION],
-                    &virtual_device
-                );
-                assert_eq!(
-                    &bytes.as_slice()[PLUG_CONFIGURATION..PLUG_CONFIGURATION + SUPER_CONFIG.len()],
-                    &SUPER_CONFIG
-                );
                 assert_eq!(descriptors.device(), &SUPER_DEVICE);
                 assert_eq!(descriptors.speed(), speed);
                 let mut channel = Channel::new(Mock::default());
                 channel.attach(&descriptors, &budget).unwrap();
                 let mut scratch = vec![0; MAX_MESSAGE];
                 for (index, (kind, physical, expected)) in [
-                    (usb::device::TYPE, &SUPER_DEVICE[..], &virtual_device[..]),
+                    (usb::device::TYPE, &SUPER_DEVICE[..], &SUPER_DEVICE[..]),
                     (
                         usb::configuration::TYPE,
                         &SUPER_CONFIG[..],
@@ -736,12 +747,19 @@ mod tests {
             Err(Error::Unsupported)
         ));
         assert!(ReadFrame::default().advance(&header, 0).is_err());
-        assert!(ReadFrame::default().advance(&header, HEADER - 1).is_err());
+        assert_eq!(
+            ReadFrame::default().advance(&header, HEADER - 1).unwrap(),
+            None
+        );
         assert!(ReadFrame::default().advance(&header, HEADER + 1).is_err());
         let bytes = submit(1, 2, STORAGE_COMMAND_BYTES as u32);
         let mut frame = ReadFrame::default();
         assert_eq!(frame.advance(&bytes, HEADER).unwrap(), None);
-        assert!(frame.advance(&bytes, STORAGE_COMMAND_BYTES - 1).is_err());
+        assert_eq!(
+            frame.advance(&bytes, STORAGE_COMMAND_BYTES - 1).unwrap(),
+            None
+        );
+        assert_eq!(frame.advance(&bytes, 1).unwrap(), Some(bytes.len()));
     }
 
     #[test]
@@ -766,9 +784,9 @@ mod tests {
         put(&mut bytes, field::FLAGS_STATUS_TARGET, usbip::ISO_ASAP);
         put(&mut bytes, field::PACKETS, 2);
         bytes.resize(HEADER + 2 * PACKET_BYTES, 0);
-        put(&mut bytes, HEADER + WORD, 4);
+        put(&mut bytes, HEADER + packet::LENGTH, 4);
         put(&mut bytes, HEADER + PACKET_BYTES, 4);
-        put(&mut bytes, HEADER + PACKET_BYTES + WORD, 4);
+        put(&mut bytes, HEADER + PACKET_BYTES + packet::LENGTH, 4);
         let Frame::Submit(header) = decode(&bytes).unwrap() else {
             panic!()
         };
@@ -779,73 +797,113 @@ mod tests {
 
     #[test]
     fn iso_completion_packs_sparse_data_and_keeps_per_packet_results() {
-        let (_, _, budget) = setup();
-        let mut config = CONFIG;
-        config[21] = 1; // Isochronous OUT endpoint.
-        config[22] = 64;
-        config[23] = 0;
-        config[24] = 1;
-        config[28] = 1; // Isochronous IN endpoint.
-        config[29] = 64;
-        config[30] = 0;
-        config[31] = 1;
-        let descriptors = DescriptorSet::new(&budget, &DEVICE, &config, &[], Speed::High).unwrap();
-        let mut channel = Channel::new(Mock::default());
-        channel.attach(&descriptors, &budget).unwrap();
-        let mut bytes = submit(9, 130, 8);
-        put(&mut bytes, field::FLAGS_STATUS_TARGET, usbip::ISO_ASAP);
-        put(&mut bytes, field::PACKETS, 2);
-        bytes.resize(HEADER + 2 * PACKET_BYTES, 0);
-        put(&mut bytes, HEADER + WORD, 4);
-        put(&mut bytes, HEADER + PACKET_BYTES, 4);
-        put(&mut bytes, HEADER + PACKET_BYTES + WORD, 4);
-        channel.driver.incoming.push_back(bytes);
-        channel.snapshot().unwrap();
-        let mut scratch = vec![0; MAX_MESSAGE];
-        let request = channel
-            .fetch(u32::MAX, descriptors.topology(), &mut scratch)
-            .unwrap()
-            .unwrap();
-        let mut transfer = knightbus_core::Transfer::new(
-            &budget,
-            usbip::SubmitHeader {
-                seqnum: 1,
-                device_id: 0x10002,
-                direction: usbip::Direction::In,
-                endpoint: 2,
-                transfer_flags: usbip::ISO_ASAP,
-                transfer_buffer_length: 8,
-                start_frame: 0,
-                number_of_packets: 2,
-                interval: 1,
-                setup: [0; 8],
-            },
-            request.packets,
-        )
-        .unwrap();
-        transfer
-            .buffer_mut()
-            .copy_from_slice(&[1, 2, 0, 0, 3, 4, 5, 0]);
-        transfer.packets_mut()[0].actual_length = 2;
-        transfer.packets_mut()[1].actual_length = 3;
-        channel
-            .complete(
-                9,
-                &Completion {
-                    transfer,
-                    status: 0,
-                    actual_length: 5,
-                    start_frame: 0,
-                },
-                &mut scratch,
-            )
-            .unwrap();
-        let reply = &channel.driver.outgoing[0];
-        assert_eq!(&reply[HEADER..HEADER + 5], &[1, 2, 3, 4, 5]);
-        let layout = &reply[HEADER + 5..];
-        assert_eq!(word(layout, WORD * 2), 2);
-        assert_eq!(word(layout, PACKET_BYTES), 4);
-        assert_eq!(word(layout, PACKET_BYTES + WORD * 2), 3);
+        const OUT_DESCRIPTOR: usize = usb::configuration::BYTES + usb::interface::BYTES;
+        const IN_DESCRIPTOR: usize = OUT_DESCRIPTOR + usb::endpoint::MIN_BYTES;
+        const MAX_PACKET: u16 = 64;
+        const INTERVAL: u8 = 1;
+        const NATIVE_SEQUENCE: u32 = 9;
+        const ENDPOINT: u8 = 2;
+        const PACKET_COUNT: usize = 2;
+        const PACKET_CAPACITY: u32 = 4;
+        const TRANSFER_BYTES: u32 = PACKET_COUNT as u32 * PACKET_CAPACITY;
+        const PACKED_DATA: &[u8] = &[1, 2, 3, 4, 5];
+        for flags in [usbip::ISO_ASAP, usbip::ISO_ASAP | SHORT_NOT_OK] {
+            for packet_status in [0, usbip::status::PIPE] {
+                let (_, _, budget) = setup();
+                let mut config = CONFIG;
+                for offset in [OUT_DESCRIPTOR, IN_DESCRIPTOR] {
+                    config[offset + usb::endpoint::ATTRIBUTES] = usb::TRANSFER_ISOCHRONOUS;
+                    let max_packet = offset + usb::endpoint::MAX_PACKET;
+                    config[max_packet..max_packet + size_of::<u16>()]
+                        .copy_from_slice(&MAX_PACKET.to_le_bytes());
+                    config[offset + usb::endpoint::INTERVAL] = INTERVAL;
+                }
+                let descriptors =
+                    DescriptorSet::new(&budget, &DEVICE, &config, &[], Speed::High).unwrap();
+                let mut channel = Channel::new(Mock::default());
+                channel.attach(&descriptors, &budget).unwrap();
+                let mut bytes = submit(
+                    NATIVE_SEQUENCE,
+                    usb::DIRECTION_IN | ENDPOINT,
+                    TRANSFER_BYTES,
+                );
+                put(&mut bytes, field::FLAGS_STATUS_TARGET, flags);
+                put(&mut bytes, field::PACKETS, PACKET_COUNT as u32);
+                bytes.resize(HEADER + PACKET_COUNT * PACKET_BYTES, 0);
+                put(&mut bytes, HEADER + packet::LENGTH, PACKET_CAPACITY);
+                put(
+                    &mut bytes,
+                    HEADER + PACKET_BYTES + packet::OFFSET,
+                    PACKET_CAPACITY,
+                );
+                put(
+                    &mut bytes,
+                    HEADER + PACKET_BYTES + packet::LENGTH,
+                    PACKET_CAPACITY,
+                );
+                channel.driver.incoming.push_back(bytes);
+                channel.snapshot().unwrap();
+                let mut scratch = vec![0; MAX_MESSAGE];
+                let request = channel
+                    .fetch(u32::MAX, descriptors.topology(), &mut scratch)
+                    .unwrap()
+                    .unwrap();
+                let mut transfer = knightbus_core::Transfer::new(
+                    &budget,
+                    usbip::SubmitHeader {
+                        seqnum: 1,
+                        device_id: 0x10002,
+                        direction: usbip::Direction::In,
+                        endpoint: u32::from(ENDPOINT),
+                        transfer_flags: usbip::ISO_ASAP,
+                        transfer_buffer_length: TRANSFER_BYTES,
+                        start_frame: 0,
+                        number_of_packets: PACKET_COUNT as i32,
+                        interval: i32::from(INTERVAL),
+                        setup: [0; usb::SETUP_SIZE],
+                    },
+                    request.packets,
+                )
+                .unwrap();
+                transfer
+                    .buffer_mut()
+                    .copy_from_slice(&[1, 2, 0, 0, 3, 4, 5, 0]);
+                transfer.packets_mut()[0].actual_length = 2;
+                transfer.packets_mut()[1].actual_length = 3;
+                transfer.packets_mut()[1].status = packet_status;
+                channel
+                    .complete(
+                        u64::from(NATIVE_SEQUENCE),
+                        &Completion {
+                            transfer,
+                            status: 0,
+                            actual_length: PACKED_DATA.len() as u32,
+                            start_frame: 0,
+                        },
+                        &mut scratch,
+                    )
+                    .unwrap();
+                let reply = &channel.driver.outgoing[0];
+                assert_eq!(
+                    word(reply, field::FLAGS_STATUS_TARGET),
+                    0,
+                    "short ISO packets must not fail the transfer"
+                );
+                assert_eq!(
+                    word(reply, field::INTERVAL_ERRORS),
+                    u32::from(packet_status != 0)
+                );
+                assert_eq!(&reply[HEADER..HEADER + PACKED_DATA.len()], PACKED_DATA);
+                let layout = &reply[HEADER + PACKED_DATA.len()..];
+                assert_eq!(word(layout, packet::ACTUAL_LENGTH), 2);
+                assert_eq!(word(layout, PACKET_BYTES + packet::OFFSET), PACKET_CAPACITY);
+                assert_eq!(word(layout, PACKET_BYTES + packet::ACTUAL_LENGTH), 3);
+                assert_eq!(
+                    word(layout, PACKET_BYTES + packet::STATUS) as i32,
+                    packet_status
+                );
+            }
+        }
     }
 
     #[test]
@@ -872,10 +930,9 @@ mod tests {
     }
 
     #[test]
-    fn virtual_revision_changes_only_device_descriptor_replies_including_short_reads() {
+    fn descriptor_replies_preserve_physical_revision_including_short_reads() {
         use knightbus_core::topology as usb;
         let (mut channel, descriptors, budget) = setup();
-        channel.virtual_revision = 0x0110;
         let mut scratch = vec![0; MAX_MESSAGE];
         let mut sequence = 0;
         for request_type in [
@@ -904,10 +961,7 @@ mod tests {
                 channel
                     .complete(u64::from(sequence), &done, &mut scratch)
                     .unwrap();
-                let mut expected = DEVICE;
-                if request_type == usb::DIRECTION_IN {
-                    patch_revision(&mut expected, 0x0110);
-                }
+                let expected = DEVICE;
                 assert_eq!(
                     &channel.driver.outgoing.last().unwrap()[HEADER..],
                     &expected[..length]

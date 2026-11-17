@@ -68,11 +68,13 @@ instead of freeing memory the OS may still access.
 ## Native adapters
 
 On macOS, the exporter uses IOUSBHost to access the physical device. On Windows,
-the importer opens the upstream usbip-win UDE controller. An attachment owns one
-handle. The adapter translates its little-endian USB/IP request frames into the
-shared worker contract, preserving native sequence IDs, cancellation and replies.
-The encrypted network connection and access policy remain entirely in KnightBus.
-Shutdown targets only the device associated with that handle.
+the importer opens the signed usbip-win2 UDE controller. Each attachment owns a
+private loopback socket with a random, one-use bus identifier. The adapter translates
+USB/IP requests into the shared worker contract, preserving sequence IDs,
+cancellation and replies. The LAN connection and access policy remain in KnightBus:
+the driver's unencrypted TCP connection never leaves the local machine.
+Admission checks USB 2 and USB 3 capacity separately and is serialized across
+KnightBus processes. The pinned driver also checks exhaustion under its kernel lock.
 
 The macOS desktop app requests removable-drive consent before sending a share
 request to its root helper. The permission check uses the selected USB drive's
@@ -91,24 +93,22 @@ helper from the app. Administrator authorization is needed for installation or r
 The importer accepts one configuration, descriptor trees up to 4 KiB, transfers
 up to 1 MiB, and up to 1,024 ISO packets. Bulk and interrupt endpoints have one
 forwarded request per endpoint; ISO may use spare slots. Requests awaiting a slot
-have a separate bounded queue. Exhaustion terminates the attachment rather than
-growing the queue indefinitely. These budgets cover KnightBus userspace, not the
-upstream kernel driver’s allocations.
+have a separate bounded queue. When that queue fills, the adapter stops reading
+until completions free space, applying backpressure without detaching the device.
+These budgets cover KnightBus userspace, not the upstream kernel driver's allocations.
 
-The pinned driver selects its virtual port from exact bcdUSB revisions. KnightBus
-publishes SuperSpeed and physical SuperSpeedPlus devices on its USB 3 port using
-revision 3.0, including forwarded device-descriptor replies. The physical link,
-identity, endpoint companions and BOS remain intact; Windows fetches BOS through
-forwarded control requests. This does not imply a 10 Gbit/s virtual link or network
-throughput. Native reads collect the header and payload separately to accommodate
-the driver's OUT-transfer length reporting. Remote wake, bulk streams and scheduled
-ISO are not supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
+The driver selects a virtual USB 2 or USB 3 port from the negotiated speed.
+SuperSpeed and physical SuperSpeedPlus use USB 3 ports; KnightBus preserves physical
+device descriptors, endpoint companions and BOS. This does not imply a 10 Gbit/s
+virtual link or network throughput. Remote wake, bulk streams and scheduled ISO are
+not supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
 Frame scheduling is handled by the upstream driver.
 
-A clean detach issues the upstream handle-scoped shutdown command and drains
-pending Windows I/O before releasing buffers. If retirement cannot be confirmed,
-the session is quarantined. The upstream driver does not automatically detach a
-child on process death; after a daemon crash a Windows restart may be required.
+A clean detach verifies the attachment's private location, removes its virtual
+device and stops reconnect attempts for that location. Pending control I/O retains
+its storage until completion or acknowledged cancellation. If retirement cannot
+be confirmed, the session is quarantined. Socket loss makes the driver retire the
+virtual device; KnightBus does not persist attachments in the driver's registry.
 
 Core also owns configuration changes, alternate-setting changes and halt recovery.
 It validates each target and drains only the affected requests. Native adapters

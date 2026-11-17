@@ -11,8 +11,8 @@
    window. Do not run the GUI as administrator.
 
 Programs and this guide are installed in `C:\Program Files\KnightBus`.
-The background service runs with administrator access at this account's login
-because the current USB driver requires it. Closing the app leaves forwarding
+The installer configures the background service to run with administrator access
+at this account's login. Closing the app leaves forwarding
 running; signing out ends it. Installation starts no USB sharing or attachment.
 Pairing state stays in `%LOCALAPPDATA%\KnightBus`.
 
@@ -20,7 +20,7 @@ Requires Windows 11 x64, [Microsoft Edge WebView2 Runtime](https://developer.mic
 and the [Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/).
 If setup reports a missing runtime, install it from Microsoft and run setup again.
 
-The ZIP includes the Microsoft-signed usbip-win UDE driver. Setup installs it
+The ZIP includes the Microsoft-signed usbip-win2 UDE driver. Setup installs it
 with the app and service; no separate driver download or test mode is needed.
 Restart Windows if setup requests it. The driver license and matching source are
 in `driver/`. The KnightBus installer itself is not yet publisher-signed.

@@ -33,8 +33,8 @@ individual types and methods; keep those comments beside the code.
   for each bug fix, including failure and cancellation cases where relevant.
 - Implement forwarding logic independently from specifications and OS contracts.
   Do not copy or translate another project’s forwarding implementation. The
-  Windows package uses the pinned, unmodified usbip-win UDE driver through its
-  public device interface, with its license and corresponding source included.
+  Windows package uses the pinned, unmodified usbip-win2 UDE driver through its
+  public device interface and private loopback USB/IP, with its license and corresponding source included.
   Review new dependencies, their licenses and build scripts.
 
 ## Adding an OS adapter

@@ -77,10 +77,10 @@ class PackageTests(unittest.TestCase):
                 from unittest.mock import Mock
                 command = Mock()
                 driver.verify(source, command)
-                self.assertEqual(command.call_count, 3)
+                self.assertEqual(command.call_count, len(("cat", "inf", "sys")) * len(driver.DRIVER_PACKAGES))
                 self.assertTrue(all("/kp" in call.args[0] for call in command.call_args_list))
                 with self.assertRaises(RuntimeError): driver.verify(source, Mock(side_effect=RuntimeError("untrusted")))
-                (source / "usbip_vhci_ude.sys").write_bytes(b"modified")
+                (source / "usbip2_ude.sys").write_bytes(b"modified")
                 with self.assertRaises(ValueError): driver.verify(source, command)
 
     def test_preparation_excludes_upstream_executables_and_test_certificates(self):
@@ -88,18 +88,32 @@ class PackageTests(unittest.TestCase):
             root = Path(temporary)
             cache = root / "cache"
             cache.mkdir()
-            archive = cache / f"usbip-win-{driver.VERSION}.zip"
-            with zipfile.ZipFile(archive, "w") as package_file:
-                for name in (*driver.DRIVER_HASHES, "usbip.exe", "usbip_test.pfx", "usbip_stub.sys"):
-                    package_file.writestr(name, name.encode())
+            archive = cache / driver.ARCHIVE_NAME
+            archive.write_bytes(b"fixture installer")
             source = cache / driver.SOURCE_NAME
             with tarfile.open(source, "w:gz") as source_file:
-                member = tarfile.TarInfo(f"usbip-win-{driver.COMMIT}/LICENSE")
+                member = tarfile.TarInfo(f"usbip-win2-{driver.COMMIT}/LICENSE.txt")
                 contents = b"fixture license"
                 member.size = len(contents)
                 source_file.addfile(member, io.BytesIO(contents))
             destination = root / "driver"
-            with patch.object(driver, "ARCHIVE_SHA256", hashlib.sha256(archive.read_bytes()).hexdigest()), patch.object(driver, "SOURCE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest()), patch.object(driver, "verify"):
+            unpacker = cache / "innounp-2.zip"
+            with zipfile.ZipFile(unpacker, "w") as package_file:
+                package_file.writestr("innounp.exe", b"fixture unpacker")
+            hashes = {name: hashlib.sha256(name.encode()).hexdigest() for name in driver.DRIVER_HASHES}
+            def unpack(command, **kwargs):
+                self.assertEqual(Path(command[0]).name, "innounp.exe")
+                self.assertIn(str(archive.resolve()), command)
+                extracted = Path(next(arg.removeprefix("-d") for arg in command if arg.startswith("-d"))) / "{tmp}"
+                extracted.mkdir(parents=True)
+                for name in (*driver.DRIVER_HASHES, "usbip.exe", "usbip_test.pfx", "usbip_stub.sys"):
+                    (extracted / name).write_bytes(name.encode())
+            with (patch.object(driver.subprocess, "run", side_effect=unpack),
+                  patch.object(driver, "DRIVER_HASHES", hashes),
+                  patch.object(driver, "UNPACKER_SHA256", hashlib.sha256(unpacker.read_bytes()).hexdigest()),
+                  patch.object(driver, "ARCHIVE_SHA256", hashlib.sha256(archive.read_bytes()).hexdigest()),
+                  patch.object(driver, "SOURCE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest()),
+                  patch.object(driver, "verify")):
                 driver.prepare(destination, cache)
             self.assertEqual({p.name for p in destination.iterdir()}, {*driver.DRIVER_HASHES, driver.SOURCE_NAME, "COPYING", "NOTICE.txt"})
 

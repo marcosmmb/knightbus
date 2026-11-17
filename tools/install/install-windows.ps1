@@ -17,7 +17,7 @@ $ownerFile=Join-Path $install 'owner-sid.txt'
 $cli=Join-Path $install 'knightbus.exe'
 $daemonPath=Join-Path $install 'knightbusd.exe'
 $daemonArguments="--desktop `"$state\identity`" $endpoint"
-$files=@('knightbus-desktop.exe','knightbus.exe','knightbusd.exe','LICENSE','INSTALL.md','standalone.md','architecture.md','uninstall-windows.ps1')
+$files=@(Get-KnightBusApplicationFiles)
 
 function Invoke-Control([string[]]$Arguments) {
  $result=& $cli manage $endpoint @Arguments
@@ -57,10 +57,7 @@ if ((Test-Path $ownerFile) -and (Get-Content $ownerFile -Raw).Trim() -ne $identi
  throw 'Run this upgrade using the Windows account that originally installed KnightBus.'
 }
 if ($task) {
- $taskUser=Get-KnightBusTaskOwnerSid -TaskName $task.TaskName -TaskPath $task.TaskPath
- if ($taskUser -ne $identity.User.Value -or @($task.Actions).Count -ne 1 -or $task.Actions[0].Execute -ne $daemonPath -or $task.Actions[0].Arguments -ne $daemonArguments) {
-  throw 'The existing KnightBus task belongs to another account or installation. It was not changed.'
- }
+ Assert-KnightBusTask $task $identity.User.Value $daemonPath $daemonArguments
 }
 $gui=Get-Process knightbus-desktop -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq "$install\knightbus-desktop.exe"}
 if ($gui) {throw 'Choose Quit UI from the KnightBus tray menu, then run this installer again. You do not need to uninstall.'}

@@ -42,3 +42,20 @@ function Test-RetainedDriverDirectory([string]$Install, [string]$PackageDriver) 
  }
  return $true
 }
+
+# Shared allowlist: setup owns these files, never arbitrary user-added files.
+function Get-KnightBusApplicationFiles {
+ @('knightbus-desktop.exe','knightbus.exe','knightbusd.exe','LICENSE','INSTALL.md','standalone.md','architecture.md','windows-installation.ps1','uninstall-windows.ps1')
+}
+function Remove-KnightBusApplicationFiles([string]$Install) {
+ foreach ($name in Get-KnightBusApplicationFiles) {
+  $path=Join-Path $Install $name
+  if (Test-Path -LiteralPath $path -PathType Leaf) {Remove-Item -LiteralPath $path}
+ }
+}
+function Assert-KnightBusTask($Task,[string]$OwnerSid,[string]$DaemonPath,[string]$DaemonArguments) {
+ $owner=Get-KnightBusTaskOwnerSid -TaskName $Task.TaskName -TaskPath $Task.TaskPath
+ if ($owner -ne $OwnerSid -or @($Task.Actions).Count -ne 1 -or $Task.Actions[0].Execute -ne $DaemonPath -or $Task.Actions[0].Arguments -ne $DaemonArguments) {
+  throw 'The existing KnightBus task belongs to another account or installation. It was not changed.'
+ }
+}

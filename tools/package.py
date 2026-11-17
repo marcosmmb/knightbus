@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--target-dir", required=True, type=Path)
     parser.add_argument("--skip-build", action="store_true")
-    parser.add_argument("--driver-package", type=Path, help="Prepared pinned usbip-win package with source/notices (otherwise downloaded automatically); requires SignTool")
+    parser.add_argument("--driver-package", type=Path, help="Prepared pinned usbip-win2 package with source/notices (otherwise downloaded automatically); requires SignTool")
     args = parser.parse_args()
     output, target = args.output.resolve(), args.target_dir.resolve()
     if output.exists():

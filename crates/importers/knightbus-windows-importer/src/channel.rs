@@ -1,18 +1,27 @@
-//! usbip-win 0.3.6 UDE ABI. Integers on the device handle are little-endian.
-//! Network framing remains the responsibility of knightbus-transport.
-use knightbus_core::{Budget, Buffer, DescriptorSet, Error, Result, topology as usb, usbip};
+//! USB/IP framing for the signed usbip-win2 driver on a private loopback socket.
+use knightbus_core::{Error, Result, topology as usb, usbip};
 
 pub(crate) const WORD: usize = size_of::<u32>();
 pub(crate) const HEADER: usize = usbip::TRANSFER_HEADER_LEN;
-pub(crate) const PACKET_BYTES: usize = 4 * WORD;
+pub(crate) const PACKET_BYTES: usize = packet::BYTES;
+// usbip_iso_packet_descriptor fields, in network byte order.
+pub(crate) mod packet {
+    use super::WORD;
+    pub const OFFSET: usize = 0;
+    pub const LENGTH: usize = OFFSET + WORD;
+    pub const ACTUAL_LENGTH: usize = LENGTH + WORD;
+    pub const STATUS: usize = ACTUAL_LENGTH + WORD;
+    pub const BYTES: usize = STATUS + WORD;
+}
 pub(crate) const MAX_TRANSFER: usize = 1024 * 1024;
 pub(crate) const MAX_PACKETS: usize = 1024;
 pub(crate) const SLOTS: usize = 31; // EP0 plus fifteen endpoints in each direction.
 pub(crate) const MAX_MESSAGE: usize = HEADER + MAX_TRANSFER + MAX_PACKETS * PACKET_BYTES;
 pub(crate) const MAX_QUEUED: usize = SLOTS;
-pub(crate) const LOCAL_DEVICE_ID: u32 = 1; // Private to this driver handle; never sent remotely.
+pub(crate) const LOCAL_DEVICE_ID: u32 = 1; // Private to this loopback connection; never sent remotely.
 pub(crate) const SHORT_NOT_OK: u32 = 1;
-pub(crate) const SHORT_TRANSFER: i32 = -121; // Linux EREMOTEIO, understood by usbip-win.
+pub(crate) const SHORT_TRANSFER: i32 = -121; // Linux EREMOTEIO, understood by usbip-win2.
+const NON_ISO_PACKETS: u32 = (-1i32) as u32; // usbip-win2 non-ISO sentinel.
 pub(crate) const CMD_SUBMIT: u32 = 1;
 pub(crate) const CMD_UNLINK: u32 = 2;
 pub(crate) const RET_SUBMIT: u32 = 3;
@@ -31,55 +40,11 @@ pub(crate) mod field {
     pub const INTERVAL_ERRORS: usize = 36;
     pub const SETUP: usize = 40;
 }
-// Layout of vhci_pluginfo_t in upstream include/usbip_vhci_api.h (Windows ABI).
-pub(crate) const PLUG_SIZE: usize = 296;
-pub(crate) const PLUG_DEVICE: usize = 4;
-#[cfg(windows)]
-pub(crate) const PLUG_PORT: usize = 8;
-pub(crate) const PLUG_DESCRIPTOR: usize = 266;
-pub(crate) const PLUG_CONFIGURATION: usize = PLUG_DESCRIPTOR + usb::device::BYTES;
-const USB_1_0: u16 = 0x0100;
-const USB_1_1: u16 = 0x0110;
-const USB_2_0: u16 = 0x0200;
-const USB_3_0: u16 = 0x0300;
-// The UDE ABI recognizes exact bcdUSB revisions, including 3.0 for its USB 3 port.
-// SuperPlus uses that virtual port; the physical link and descriptors stay intact.
-pub(crate) fn virtual_revision(speed: usb::Speed) -> Result<u16> {
-    match speed {
-        usb::Speed::Low => Ok(USB_1_0),
-        usb::Speed::Full => Ok(USB_1_1),
-        usb::Speed::High => Ok(USB_2_0),
-        usb::Speed::Super | usb::Speed::SuperPlus => Ok(USB_3_0),
-    }
-}
-pub(crate) fn patch_revision(bytes: &mut [u8], revision: u16) {
-    for (offset, byte) in revision.to_le_bytes().into_iter().enumerate() {
-        if let Some(out) = bytes.get_mut(usb::device::USB_REVISION + offset) {
-            *out = byte;
-        }
-    }
-}
-
-pub(crate) fn plugin(descriptors: &DescriptorSet, budget: &Budget) -> Result<Buffer> {
-    let revision = virtual_revision(descriptors.speed())?;
-    let size = PLUG_SIZE + descriptors.configuration().len() - usb::configuration::BYTES;
-    let mut bytes = budget.buffer(size)?;
-    let out = bytes.as_mut_slice();
-    out.fill(0);
-    put(out, 0, size as u32);
-    put(out, PLUG_DEVICE, LOCAL_DEVICE_ID);
-    out[PLUG_DESCRIPTOR..PLUG_CONFIGURATION].copy_from_slice(descriptors.device());
-    patch_revision(&mut out[PLUG_DESCRIPTOR..PLUG_CONFIGURATION], revision);
-    out[PLUG_CONFIGURATION..PLUG_CONFIGURATION + descriptors.configuration().len()]
-        .copy_from_slice(descriptors.configuration());
-    // BOS is fetched through forwarded EP0 requests, outside the plugin ABI.
-    Ok(bytes)
-}
 pub(crate) fn word(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + WORD].try_into().unwrap())
+    u32::from_be_bytes(bytes[offset..offset + WORD].try_into().unwrap())
 }
 pub(crate) fn put(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + WORD].copy_from_slice(&value.to_le_bytes());
+    bytes[offset..offset + WORD].copy_from_slice(&value.to_be_bytes());
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Header {
@@ -138,7 +103,11 @@ fn decode_header(bytes: &[u8]) -> Result<Frame> {
                     0
                 };
             let length = word(bytes, LENGTH);
-            let packets = word(bytes, PACKETS) as usize;
+            // usbip-win2 uses -1 for a non-isochronous request.
+            let packets = match word(bytes, PACKETS) {
+                NON_ISO_PACKETS => 0,
+                count => count as usize,
+            };
             let flags = word(bytes, FLAGS_STATUS_TARGET);
             let payload = if input { 0 } else { length as usize };
             if length as usize > MAX_TRANSFER
@@ -176,8 +145,7 @@ fn decode_header(bytes: &[u8]) -> Result<Frame> {
     }
 }
 
-/// Read the header first so usbip-win reports OUT payload bytes on a separate read.
-/// Some upstream handlers copy a combined payload but report only HEADER bytes.
+/// Accumulate fragmented TCP headers and bounded payloads.
 #[cfg(any(windows, test))]
 pub(crate) struct ReadFrame {
     filled: usize,
@@ -198,13 +166,11 @@ impl ReadFrame {
         self.filled..self.length
     }
     pub fn advance(&mut self, buffer: &[u8], count: usize) -> Result<Option<usize>> {
-        // Each upstream handler returns the whole requested header or body.
-        // A short read must not consume bytes from a later, unrelated request.
-        if count == 0 || count != self.length - self.filled || self.length > buffer.len() {
+        if count == 0 || count > self.length - self.filled || self.length > buffer.len() {
             return Err(Error::Invalid);
         }
         self.filled += count;
-        if self.length == HEADER {
+        if self.length == HEADER && self.filled == HEADER {
             self.length = frame_length(&decode_header(&buffer[..HEADER])?);
             if self.length > buffer.len() {
                 return Err(Error::Invalid);

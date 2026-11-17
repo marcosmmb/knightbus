@@ -10,7 +10,7 @@ lifecycle in shared crates. OS adapters supply native USB access.
 ## Supported path
 
 The current adapters are a **macOS exporter** and a **Windows x64 importer**.
-Windows uses the bundled, Microsoft-signed usbip-win UDE driver. Other OS directions are not implemented.
+Windows uses the bundled, Microsoft-signed usbip-win2 UDE driver. Other OS directions are not implemented.
 
 Control, bulk, interrupt and isochronous transfers are implemented, within the Windows adapter’s USB 1.x, USB 2 and SuperSpeed limits. Device support also depends
 on the adapter's descriptor and feature limits; see the

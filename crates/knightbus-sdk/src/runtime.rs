@@ -288,14 +288,20 @@ impl Managed for MacExporter {
             native::request_storage_access(id.registry_id)?;
         }
         // Capture generations advance even when the physical device was not replugged.
-        let generation = self
-            .generation
-            .fetch_update(
+        // compare_exchange works on both the minimum Rust version and current stable.
+        let mut generation = self.generation.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = generation.checked_add(1).ok_or(Error::Exhausted)?;
+            match self.generation.compare_exchange_weak(
+                generation,
+                next,
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |n| n.checked_add(1),
-            )
-            .map_err(|_| Error::Exhausted)?;
+            ) {
+                Ok(_) => break,
+                Err(current) => generation = current,
+            }
+        }
         let snapshot = native::inspect(
             id,
             DeviceKey {

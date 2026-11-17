@@ -126,6 +126,17 @@ mod native {
         events: BTreeMap<u64, (u64, VecDeque<Event>)>,
         jobs: VecDeque<(SessionId, DeviceKey, u64)>,
     }
+    impl State {
+        fn remove_session(&mut self, id: SessionId) {
+            self.sessions.remove(&id);
+            // A descriptor may still belong to another retained or active session.
+            self.descriptions.retain(|key, _| {
+                self.sessions
+                    .values()
+                    .any(|session| session.devices.contains(key))
+            });
+        }
+    }
     struct Host {
         config: Configuration,
         epoch: u64,
@@ -458,10 +469,7 @@ mod native {
                             .find(|(_, v)| v.state == SessionState::Closed)
                             .ok_or(Error::Exhausted)?
                             .0;
-                        let retired = s.sessions.remove(&oldest).unwrap();
-                        for key in retired.devices {
-                            s.descriptions.remove(&key);
-                        }
+                        s.remove_session(oldest);
                     }
                     s.next = s.next.checked_add(1).ok_or(Error::Exhausted)?;
                     let id = SessionId {
@@ -507,7 +515,7 @@ mod native {
                     if s.sessions.get(&id).ok_or(Error::NotFound)?.state != SessionState::Closed {
                         return Err(Error::State);
                     }
-                    s.sessions.remove(&id);
+                    s.remove_session(id);
                     Ok(Reply::Done)
                 }
                 Command::Subscribe => {
@@ -652,6 +660,72 @@ mod native {
                 panic!()
             };
             session.id
+        }
+        #[test]
+        fn forgetting_closed_sessions_releases_unreferenced_descriptors() {
+            const CYCLES: usize = MAX_RETAINED_SESSIONS * 2;
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            for number in 1..=CYCLES as u64 {
+                let id = admit(&host, number);
+                let key;
+                {
+                    let mut state = host.state.lock().unwrap();
+                    key = state.sessions[&id].devices[0];
+                    let device = Device {
+                        key,
+                        wire: state.inventory[&key].device.clone(),
+                        configurations: vec![knightbus_core::Configuration {
+                            value: 1,
+                            interfaces: vec![],
+                        }],
+                    };
+                    state.descriptions.insert(key, device);
+                    state.jobs.clear();
+                }
+                host.update(id, SessionState::Closed, None);
+                host.execute(crate::runtime::ADMIN, Command::Forget(id), u64::MAX)
+                    .unwrap();
+                assert_eq!(
+                    host.execute(crate::runtime::ADMIN, Command::Inspect(key), u64::MAX),
+                    Err(Error::Unavailable)
+                );
+                assert!(host.state.lock().unwrap().descriptions.is_empty());
+            }
+        }
+        #[test]
+        fn session_removal_preserves_descriptors_referenced_by_another_session() {
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            let id = admit(&host, 1);
+            let retained = SessionId {
+                serial: id.serial + 1,
+                ..id
+            };
+            let key;
+            {
+                let mut state = host.state.lock().unwrap();
+                key = state.sessions[&id].devices[0];
+                let device = Device {
+                    key,
+                    wire: state.inventory[&key].device.clone(),
+                    configurations: vec![],
+                };
+                state.descriptions.insert(key, device);
+                let mut session = state.sessions[&id].clone();
+                session.id = retained;
+                state.sessions.insert(retained, session);
+            }
+            host.update(id, SessionState::Closed, None);
+            host.execute(crate::runtime::ADMIN, Command::Forget(id), u64::MAX)
+                .unwrap();
+            assert!(matches!(
+                host.execute(crate::runtime::ADMIN, Command::Inspect(key), u64::MAX),
+                Ok(Reply::Inspection(_))
+            ));
+            // Automatic eviction uses the same cleanup as explicit dismissal.
+            host.state.lock().unwrap().remove_session(retained);
+            assert!(host.state.lock().unwrap().descriptions.is_empty());
         }
         #[test]
         fn independent_imports_detach_and_shutdown_without_blocking_each_other() {

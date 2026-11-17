@@ -6,7 +6,7 @@ $install=Join-Path $root 'install'
 $package=Join-Path $root 'package'
 try {
  New-Item -ItemType Directory -Path "$install\driver",$package -Force | Out-Null
- foreach ($name in @('usbip_vhci_ude.sys','usbip_vhci_ude.inf','usbip_vhci_ude.cat','COPYING','NOTICE.txt','usbip-win-source.tar.gz')) {
+ foreach ($name in @('usbip2_ude.sys','usbip2_ude.inf','usbip2_ude.cat','usbip2_filter.sys','usbip2_filter.inf','usbip2_filter.cat','COPYING','NOTICE.txt','usbip-win2-source.tar.gz')) {
   [IO.File]::WriteAllText((Join-Path $package $name),"fixture $name")
   Copy-Item (Join-Path $package $name) "$install\driver"
  }
@@ -14,9 +14,9 @@ try {
  [IO.File]::WriteAllText("$install\notes.txt",'Keep this file')
  if (Test-RetainedDriverDirectory $install $package) {throw 'Unknown folder contents were accepted'}
  Remove-Item "$install\notes.txt"
- [IO.File]::WriteAllText("$install\driver\usbip_vhci_ude.sys",'modified')
+ [IO.File]::WriteAllText("$install\driver\usbip2_ude.sys",'modified')
  if (Test-RetainedDriverDirectory $install $package) {throw 'Modified driver was accepted'}
- Copy-Item "$package\usbip_vhci_ude.sys" "$install\driver" -Force
+ Copy-Item "$package\usbip2_ude.sys" "$install\driver" -Force
  Remove-Item "$install\driver\NOTICE.txt"
  if (Test-RetainedDriverDirectory $install $package) {throw 'Incomplete driver package was accepted'}
  Copy-Item "$package\NOTICE.txt" "$install\driver"
@@ -69,6 +69,28 @@ try {
   try {Get-FixtureOwner | Out-Null} catch {$rejected=$true}
   if (!$rejected) {throw 'Unverifiable task owner was accepted'}
  }
+ Set-TaskFixture "<Principal><UserId>$($identity.User.Value)</UserId></Principal>"
+ $daemonPath='C:\Program Files\KnightBus\knightbusd.exe'
+ $arguments='--desktop "C:\Users\fixture\identity" \\.\pipe\knightbus-control'
+ $validAction=[pscustomobject]@{Execute=$daemonPath;Arguments=$arguments}
+ $task | Add-Member Actions @($validAction)
+ Assert-KnightBusTask $task $identity.User.Value $daemonPath $arguments
+ foreach ($actions in @(
+  @([pscustomobject]@{Execute='C:\another.exe';Arguments=$arguments}),
+  @([pscustomobject]@{Execute=$daemonPath;Arguments='--another-installation'}),
+  @($validAction,$validAction)
+ )) {
+  $task.Actions=$actions
+  $rejected=$false
+  try {Assert-KnightBusTask $task $identity.User.Value $daemonPath $arguments} catch {$rejected=$true}
+  if (!$rejected) {throw 'Reassigned task payload was accepted'}
+ }
+ $task.Actions=@($validAction)
+ Set-TaskFixture '<Principal><UserId>S-1-5-18</UserId></Principal>'
+ $rejected=$false
+ try {Assert-KnightBusTask $task $identity.User.Value $daemonPath $arguments} catch {$rejected=$true}
+ if (!$rejected) {throw 'Reassigned task owner was accepted'}
+ 'PASS task owner, executable, arguments and action count verified before removal.'
  'PASS canonical SID with unresolvable display name, foreign SID, missing/group/invalid/ambiguous owners.'
 } finally {Remove-Item Function:\Export-ScheduledTask}
 
@@ -80,3 +102,16 @@ if ($principal.LogonType -ne 'Interactive' -or $principal.RunLevel -ne 'Highest'
  throw 'Task principal changed the service logon policy'
 }
 'PASS task registration preserves the SID and interactive elevated logon policy.'
+
+$root=Join-Path ([IO.Path]::GetTempPath()) ('knightbus-uninstall-test-'+[Guid]::NewGuid().ToString('N'))
+try {
+ New-Item -ItemType Directory -Path $root | Out-Null
+ foreach ($name in @(Get-KnightBusApplicationFiles)+@('custom.conf','diagnostics.json','owner-sid.txt','Uninstall.exe')) {
+  [IO.File]::WriteAllText((Join-Path $root $name),"fixture $name")
+ }
+ Remove-KnightBusApplicationFiles $root
+ $retained=@(Get-ChildItem -LiteralPath $root -File | Select-Object -ExpandProperty Name | Sort-Object)
+ $expected=@('custom.conf','diagnostics.json','owner-sid.txt','Uninstall.exe') | Sort-Object
+ if (Compare-Object $retained $expected) {throw 'Uninstall did not preserve unrelated files and ownership records'}
+ 'PASS uninstall deletes only installed application files.'
+} finally {Remove-Item -LiteralPath $root -Recurse -Force}
