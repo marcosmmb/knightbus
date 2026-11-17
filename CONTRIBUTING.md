@@ -6,21 +6,62 @@ Bug reports should include the OS, device and steps to reproduce the problem.
 
 ## Build and check
 
-The workspace pins Rust 1.88.0. From the repository root:
+Install Rust and native build tools: Xcode Command Line Tools on macOS, Visual
+Studio C++ Build Tools on Windows, or a C/C++ toolchain on Linux. The repository
+pins Rust 1.88.0. The desktop app uses macOS's system webview or WebView2 on
+Windows; native desktop builds are checked on those two platforms.
+
+The Makefile needs GNU Make and a POSIX shell. On Windows, use Git Bash with GNU
+Make installed, or run the Cargo commands directly. From the repository root:
 
 ```sh
-cargo fetch --locked
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-cargo test --workspace --all-targets --locked --offline
-cargo test --workspace --release --locked --offline
-cargo doc --workspace --no-deps --locked --offline
+make help             # List commands
+make check            # Workspace formatting, lint, tests and API docs
+make desktop-check    # Desktop formatting, lint, tests and release build
+make ui-setup         # Install UI test dependencies and Chromium
+make ui-test          # Node and browser tests
+make package-test     # Python packaging tests
 ```
 
-CI runs these checks on Linux, macOS and Windows with the pinned and stable Rust
-toolchains, and treats documentation warnings as errors. Ordinary workspace tests
-need no USB hardware or administrator access. Generated API docs describe the
-individual types and methods; keep those comments beside the code.
+UI tests use Node.js 22 and npm; packaging tests use Python 3. On Linux, install
+Chromium's system dependencies with
+`make ui-setup PLAYWRIGHT_INSTALL_ARGS="--with-deps chromium"` (this may need
+administrator access). Windows installer recovery checks run with
+`make windows-install-test`.
+
+Use `make fmt` and `make desktop-fmt` to apply Rust formatting. Commands can be
+overridden, for example `make check CARGO="cargo +stable"` or
+`make package-test PYTHON=python`. Cargo honors `CARGO_TARGET_DIR`; the desktop
+targets keep the app and its companion daemon in the same build directory.
+
+CI runs workspace checks on Linux, macOS and Windows with the pinned and stable
+Rust toolchains, and treats documentation warnings as errors. `make check` covers
+one local toolchain and OS; desktop, UI, installer and fuzz checks are separate.
+Ordinary workspace tests need no USB hardware or administrator access. Generated
+API docs describe individual types and methods; keep those comments beside the code.
+
+## Packaging
+
+On macOS or Windows, `make package` builds the real app and daemon, then creates
+a native package and ZIP under `lab/packages/`. It does not install them. Choose
+a new destination for each build; the packager refuses to overwrite an existing
+directory:
+
+```sh
+make package PACKAGE_OUTPUT=lab/packages/KnightBus-test
+```
+
+Packaging needs Python 3 and the platform's native build tools. Windows also needs
+NSIS (`makensis`) and Windows SDK SignTool on PATH. Its signed usbip-win2 driver
+is downloaded and verified automatically, with its license and matching source.
+To use an already prepared driver package, pass
+`PACKAGE_ARGS="--driver-package /path/to/driver"`.
+
+macOS packages receive a local integrity signature; public distribution still
+needs Developer ID signing and notarization. The Windows driver is signed, but
+the generated KnightBus installer is not publisher-signed. Use a packaged app
+and the [installation guide](tools/install/INSTALL.md) for native USB setup;
+`make desktop` runs the development executable without installing it.
 
 ## Implementation rules
 
