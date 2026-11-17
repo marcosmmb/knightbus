@@ -41,3 +41,6 @@ pub use capabilities::Capabilities;
 
 mod signal;
 pub use signal::ThreadSignal;
+
+/// Administrator-only host setup contract shared by every management client.
+pub mod host;

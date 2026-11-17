@@ -43,13 +43,10 @@ Paths below are relative to the repository root. Crates live under `crates/`.
 | [`knightbus-ipc`](../crates/knightbus-ipc/src/lib.rs) | OS-authenticated local management, protected host storage and the core control framing |
 | [`exporters/knightbus-macos-exporter`](../crates/exporters/knightbus-macos-exporter/src/lib.rs) | IOUSBHost discovery, capture, transfers and native callbacks |
 | [`importers/knightbus-windows-importer`](../crates/importers/knightbus-windows-importer/src/lib.rs) | Virtual controller ownership, driver channel encoding and Windows notifications |
-| [`knightbus-windows-protocol`](../crates/knightbus-windows-protocol/src/lib.rs) | Allocation-free messages and validation shared by the Windows importer and kernel driver |
-| [`drivers/windows`](../drivers/windows/src/lib.rs) | UdeCx virtual USB controller, native requests and kernel resource ownership |
 
 The core has no sockets or OS USB bindings. The transport uses the core and wire
 codec. Native adapters implement core traits; the shared crates do not depend on
-an OS adapter. The Windows kernel driver builds separately because it needs the
-WDK and a different Rust toolchain and build profile.
+an OS adapter. The upstream Windows driver ships as a separate signed binary dependency.
 
 ## Shared workers and native ownership
 
@@ -71,19 +68,30 @@ instead of freeing memory the OS may still access.
 ## Native adapters
 
 On macOS, the exporter uses IOUSBHost to access the physical device. On Windows,
-the importer communicates with the KnightBus UdeCx driver, which presents a virtual
-device to Windows USB class drivers. The driver validates its private channel
-independently using `knightbus-windows-protocol`; it does not parse USB/IP traffic.
+the importer opens the upstream usbip-win UDE controller. An attachment owns one
+handle. The adapter translates its little-endian USB/IP request frames into the
+shared worker contract, preserving native sequence IDs, cancellation and replies.
+The encrypted network connection and access policy remain entirely in KnightBus.
+Shutdown targets only the device associated with that handle.
 
-The importer accepts one selected configuration. Bulk and interrupt endpoints
-keep one outstanding request each; ISO endpoints can queue several requests within
-the same device-wide memory limit. Windows limits descriptor trees to 4 KiB and
-transfers to 1 MiB, and does not support remote wake or bulk streams.
+The importer accepts one configuration, descriptor trees up to 4 KiB, transfers
+up to 1 MiB, and up to 1,024 ISO packets. Bulk and interrupt endpoints have one
+forwarded request per endpoint; ISO may use spare slots. Requests awaiting a slot
+have a separate bounded queue. Exhaustion terminates the attachment rather than
+growing the queue indefinitely. These budgets cover KnightBus userspace, not the
+upstream kernel driver’s allocations.
 
-ISO packets keep their individual lengths and errors across USB/IP. The exporter
-queues physical transfers ASAP. Windows uses a local virtual frame clock and holds
-early replies until their scheduled frames finish; the two hosts do not share a
-USB clock. These timing buffers apply only to ISO transfers.
+The pinned package cannot accept BOS descriptors, so the Windows path currently
+excludes SuperSpeed. It also infers speed from bcdUSB. KnightBus adapts only the
+virtual descriptor revision to the negotiated link speed, including forwarded
+device-descriptor replies; the physical descriptors and device identity stay intact. Remote wake, bulk streams and scheduled ISO are not
+supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
+Frame scheduling is handled by the upstream driver.
+
+A clean detach issues the upstream handle-scoped shutdown command and drains
+pending Windows I/O before releasing buffers. If retirement cannot be confirmed,
+the session is quarantined. The upstream driver does not automatically detach a
+child on process death; after a daemon crash a Windows restart may be required.
 
 Core also owns configuration changes, alternate-setting changes and halt recovery.
 It validates each target and drains only the affected requests. Native adapters

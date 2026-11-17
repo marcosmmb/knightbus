@@ -539,7 +539,9 @@ fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
         })
     })
     .unwrap();
-    engine.register(device()).unwrap();
+    engine
+        .register_backend(device(), Some("Anker PowerConf C200".into()), |_| Ok(()))
+        .unwrap();
     let budget = engine.budget();
     let host = Arc::new(Host::new(engine, exporter, peers.clone()));
     let usb = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -614,6 +616,10 @@ fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
     };
     let (remote, mut wire) = open();
     assert!(
+        remote.inventory().is_empty(),
+        "ungranted product names stay private"
+    );
+    assert!(
         matches!(exchange(&mut wire,&Message::DevListRequest,Context::Management).message(),Message::DevListReply {devices,..} if devices.is_empty())
     );
     drop(wire);
@@ -635,6 +641,11 @@ fn secure_host_requires_grants_and_control_liveness_and_releases_on_revoke() {
     .unwrap();
     // A control-link loss must retire native ownership even while USB TCP remains open.
     let (remote, mut wire) = open();
+    assert_eq!(
+        remote.inventory()[0].name.as_deref(),
+        Some("Anker PowerConf C200")
+    );
+    assert_eq!(remote.inventory()[0].key, KEY);
     assert!(matches!(
         exchange(
             &mut wire,

@@ -14,6 +14,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::{Builder, Runtime},
 };
+#[cfg(unix)]
+const ROOT_UID: u32 = 0;
+#[cfg(unix)]
+const GROUP_OTHER_WRITE: u32 = 0o022;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(100);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 const REQUESTS_PER_WINDOW: u32 = 32;
@@ -62,6 +66,18 @@ impl Listener {
     /// Bind without replacing an existing endpoint. On Unix the parent must be
     /// a private directory owned by the current user. Windows requires a local pipe path.
     pub fn bind(path: &Path) -> Result<Self> {
+        Self::bind_account(path, None)
+    }
+    /// A root-owned macOS service delegates management to exactly one installed UID.
+    /// The endpoint parent must remain root-owned and unwritable by other users.
+    #[cfg(target_os = "macos")]
+    pub fn bind_for_user(path: &Path, uid: u32) -> Result<Self> {
+        if !rustix::process::geteuid().is_root() {
+            return Err(Error::Denied);
+        }
+        Self::bind_account(path, Some(uid))
+    }
+    fn bind_account(path: &Path, delegated: Option<u32>) -> Result<Self> {
         let name = path
             .to_fs_name::<GenericFilePath>()
             .map_err(|_| Error::Invalid)?;
@@ -75,7 +91,13 @@ impl Listener {
             if !path.is_absolute()
                 || !metadata.is_dir()
                 || metadata.uid() != owner
-                || metadata.mode() & crate::private::NON_OWNER_ACCESS != 0
+                || metadata.mode()
+                    & if delegated.is_some() {
+                        GROUP_OTHER_WRITE
+                    } else {
+                        crate::private::NON_OWNER_ACCESS
+                    }
+                    != 0
             {
                 return Err(Error::Denied);
             }
@@ -86,7 +108,7 @@ impl Listener {
                 use interprocess::os::unix::local_socket::ListenerOptionsExt;
                 options.mode(crate::private::FILE_MODE)
             };
-            (options, owner)
+            (options, delegated.unwrap_or(owner))
         };
         #[cfg(windows)]
         let options = {
@@ -102,11 +124,26 @@ impl Listener {
                 SecurityDescriptor::deserialize(&sddl).map_err(|_| Error::Denied)?,
             )
         };
+        #[cfg(windows)]
+        let _ = delegated;
         let runtime = runtime()?;
         let listener = {
             let _guard = runtime.enter();
             options.create_tokio().map_err(|_| Error::Unavailable)?
         };
+        #[cfg(target_os = "macos")]
+        if let Some(uid) = delegated {
+            use std::os::unix::fs::PermissionsExt;
+            // The root-owned parent prevents replacement. Only the delegated user
+            // may open the socket; peer credentials remain the authority check.
+            rustix::fs::chown(path, Some(rustix::process::Uid::from_raw(uid)), None)
+                .map_err(|_| Error::Denied)?;
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(crate::private::FILE_MODE),
+            )
+            .map_err(|_| Error::Denied)?;
+        }
         Ok(Self {
             listener,
             runtime,
@@ -263,8 +300,17 @@ pub struct Client {
 impl Client {
     /// Connect to an explicitly selected local management endpoint.
     pub fn connect(path: &Path) -> Result<Self> {
+        Self::connect_account(path, false)
+    }
+    /// Connect to an explicitly installed root-owned local service, verifying its UID.
+    #[cfg(target_os = "macos")]
+    pub fn connect_system(path: &Path) -> Result<Self> {
+        Self::connect_account(path, true)
+    }
+    fn connect_account(path: &Path, system: bool) -> Result<Self> {
         #[cfg(windows)]
         {
+            let _ = system;
             validate_pipe_path(path)?;
         }
 
@@ -278,7 +324,11 @@ impl Client {
             .map_err(|_| Error::Unavailable)?;
         #[cfg(unix)]
         if stream.peer_creds().map_err(|_| Error::Denied)?.euid()
-            != Some(rustix::process::geteuid().as_raw())
+            != Some(if system {
+                ROOT_UID
+            } else {
+                rustix::process::geteuid().as_raw()
+            })
         {
             return Err(Error::Denied);
         }

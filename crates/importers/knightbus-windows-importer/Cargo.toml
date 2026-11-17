@@ -5,11 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Bounded Windows USB importer and original UDE driver adapter"
+description = "Windows USB importer using the signed usbip-win UDE driver"
 
 [dependencies]
 knightbus-transport = { path = "../../knightbus-transport" }
-knightbus-windows-protocol = { path = "../../knightbus-windows-protocol" }
 knightbus-core = { path = "../../knightbus-core" }
 
 [target.'cfg(windows)'.dependencies]

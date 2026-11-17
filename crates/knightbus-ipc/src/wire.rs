@@ -1,6 +1,7 @@
 use knightbus_core::*;
 /// Maximum complete control frame, including its length prefix.
-pub const MAX_FRAME: usize = 8192;
+// Fits a maximum public certificate in hex plus paired-peer and physical metadata.
+pub const MAX_FRAME: usize = 64 * 1024;
 const MAX_ITEMS: usize = 256;
 
 // Fixed widths in this control schema, independent of Rust layouts.
@@ -9,7 +10,15 @@ const DEVICE_KEY_BYTES: usize = 16; // device ID + generation, both u64
 const SESSION_ID_BYTES: usize = size_of::<u64>() + size_of::<u64>();
 // Number, alternate, class/subclass/protocol, and endpoint count.
 const INTERFACE_HEADER_BYTES: usize = 6;
-const DEVICE_INFO_BYTES: usize = DEVICE_KEY_BYTES + 1; // key + busy boolean
+// Key, busy boolean, vendor/product IDs, speed and device class.
+const DEVICE_INFO_BYTES: usize = DEVICE_KEY_BYTES
+    + size_of::<u8>() // busy
+    + size_of::<u8>() // shared
+    + size_of::<u16>()
+    + size_of::<u16>()
+    + size_of::<u32>()
+    + size_of::<u8>()
+    + size_of::<u16>(); // UTF-8 name length; zero means absent
 
 // Request and reply tags have separate namespaces; preserve their v1 wire values.
 const CMD_LIST: u8 = 0;
@@ -28,6 +37,7 @@ const CMD_INFO: u8 = 12;
 const CMD_INSPECT: u8 = 13;
 const CMD_SESSIONS: u8 = 14;
 const CMD_UNSHARE: u8 = 15;
+const CMD_HOST: u8 = 16;
 
 const REPLY_DONE: u8 = 0;
 const REPLY_DEVICES: u8 = 1;
@@ -38,6 +48,7 @@ const REPLY_PEERS: u8 = 5;
 const REPLY_INFO: u8 = 6;
 const REPLY_INSPECTION: u8 = 7;
 const REPLY_SESSIONS: u8 = 8;
+const REPLY_HOST: u8 = 9;
 
 const STATE_ACQUIRING: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
@@ -74,6 +85,10 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
     b.extend_from_slice(&request.deadline.to_le_bytes());
     let mut put = |tag: u8| b.push(tag);
     match &request.command {
+        Command::Host(value) => {
+            put(CMD_HOST);
+            b.extend(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
+        }
         Command::Info => put(CMD_INFO),
         Command::Sessions => put(CMD_SESSIONS),
         Command::Inspect(k) => {
@@ -194,6 +209,11 @@ pub fn decode_request(frame: &[u8]) -> Result<Request> {
     let id = r.u64()?;
     let deadline = r.u64()?;
     let command = match r.take::<1>()?[0] {
+        CMD_HOST => {
+            let value = serde_json::from_slice(r.0).map_err(|_| Error::Invalid)?;
+            r.0 = &[];
+            Command::Host(value)
+        }
         CMD_INFO => Command::Info,
         CMD_INSPECT => Command::Inspect(r.key()?),
         CMD_SESSIONS => Command::Sessions,
@@ -252,6 +272,10 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
         Ok(reply) => {
             b.extend_from_slice(&STATUS_OK.to_le_bytes());
             match reply {
+                Reply::Host(value) => {
+                    b.push(REPLY_HOST);
+                    b.extend(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
+                }
                 Reply::Info {
                     version,
                     epoch,
@@ -296,6 +320,17 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
                     for d in devices {
                         key(&mut b, d.key);
                         b.push(u8::from(d.busy));
+                        b.push(u8::from(d.shared));
+                        b.extend_from_slice(&d.vendor.to_le_bytes());
+                        b.extend_from_slice(&d.product.to_le_bytes());
+                        b.extend_from_slice(&d.speed.to_le_bytes());
+                        b.push(d.class);
+                        let name = d.name.as_deref().unwrap_or("");
+                        if name.len() > host::MAX_DEVICE_NAME_BYTES {
+                            return Err(Error::Invalid);
+                        }
+                        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                        b.extend_from_slice(name.as_bytes());
                     }
                 }
                 Reply::Session(s) => {
@@ -356,6 +391,16 @@ impl Reader<'_> {
             _ => Err(Error::Invalid),
         }
     }
+    fn device_name(&mut self) -> Result<Option<String>> {
+        let len = u16::from_le_bytes(self.take()?) as usize;
+        if len > host::MAX_DEVICE_NAME_BYTES {
+            return Err(Error::Invalid);
+        }
+        let name = std::str::from_utf8(self.0.get(..len).ok_or(Error::Invalid)?)
+            .map_err(|_| Error::Invalid)?;
+        self.0 = &self.0[len..];
+        Ok((!name.is_empty()).then(|| name.to_owned()))
+    }
     fn count(&mut self, width: usize) -> Result<usize> {
         let count = u16::from_le_bytes(self.take()?) as usize;
         if count > MAX_ITEMS || self.0.len() < count * width {
@@ -400,6 +445,11 @@ pub fn decode_response(frame: &[u8]) -> Result<Response> {
         Err(error)
     } else {
         Ok(match r.take::<1>()?[0] {
+            REPLY_HOST => {
+                let value = serde_json::from_slice(r.0).map_err(|_| Error::Invalid)?;
+                r.0 = &[];
+                Reply::Host(value)
+            }
             REPLY_INFO => Reply::Info {
                 version: u16::from_le_bytes(r.take()?),
                 epoch: r.u64()?,
@@ -430,6 +480,12 @@ pub fn decode_response(frame: &[u8]) -> Result<Response> {
                     devices.push(DeviceInfo {
                         key: r.key()?,
                         busy: r.boolean()?,
+                        shared: r.boolean()?,
+                        vendor: u16::from_le_bytes(r.take()?),
+                        product: u16::from_le_bytes(r.take()?),
+                        speed: u32::from_le_bytes(r.take()?),
+                        class: r.take::<1>()?[0],
+                        name: r.device_name()?,
                     });
                 }
                 Reply::Devices(devices)

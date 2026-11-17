@@ -32,7 +32,9 @@ individual types and methods; keep those comments beside the code.
 - Cover behavior changes with unit or integration tests. Add a regression test
   for each bug fix, including failure and cancellation cases where relevant.
 - Implement forwarding logic independently from specifications and OS contracts.
-  Do not copy, translate or bundle another project's forwarding code or drivers.
+  Do not copy or translate another project’s forwarding implementation. The
+  Windows package uses the pinned, unmodified usbip-win UDE driver through its
+  public device interface, with its license and corresponding source included.
   Review new dependencies, their licenses and build scripts.
 
 ## Adding an OS adapter
@@ -57,21 +59,6 @@ Implement new cross-platform behavior in the shared contract and its tests first
 
 Test notification races, cancellation, removal and failed cleanup as well as normal
 transfers. Portable regression tests belong with the crates.
-
-## Windows driver
-
-The kernel driver is outside the main workspace. Its build script requires Windows
-x64, Visual Studio C++ tools, SDK/WDK 10.0.28000.0, LLVM and Rust 1.97.1. With those
-installed, run from the repository root in PowerShell:
-
-```powershell
-cargo +1.97.1 fetch --manifest-path drivers/windows/Cargo.toml --locked
-& ./drivers/windows/build.ps1
-```
-
-The script compiles, links and checks stack frame sizes. It does not sign, install
-or load the driver. Running the Windows importer requires a matching signed driver
-installed separately.
 
 ## Fuzzing
 

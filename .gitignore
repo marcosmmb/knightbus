@@ -35,3 +35,6 @@ rustc-ice-*.txt
 /crates/knightbus-usbip/tests/fuzz/coverage/
 __pycache__/
 .DS_Store
+
+node_modules/
+applications/knightbus-desktop/gen/

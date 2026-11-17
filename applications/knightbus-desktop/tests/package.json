@@ -1,0 +1,12 @@
+{
+  "name": "knightbus-desktop-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test connection.test.js && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "@axe-core/playwright": "4.11.1"
+  }
+}

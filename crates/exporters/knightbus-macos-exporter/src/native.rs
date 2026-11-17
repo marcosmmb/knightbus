@@ -36,6 +36,7 @@ const USB_HOST_PIPE_STALLED: u32 = 0xe0005000;
 const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 // CoreFoundation kCFNumberSInt64Type.
 const CF_NUMBER_SINT64: i32 = 4;
+const C_STRING_TERMINATOR_BYTES: usize = 1;
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
@@ -66,6 +67,13 @@ unsafe extern "C" {
     fn CFRelease(value: *const c_void);
     fn CFGetTypeID(value: *const c_void) -> usize;
     fn CFNumberGetTypeID() -> usize;
+    fn CFStringGetTypeID() -> usize;
+    fn CFStringGetCString(
+        value: *const c_void,
+        buffer: *mut c_char,
+        capacity: isize,
+        encoding: u32,
+    ) -> bool;
     fn CFNumberGetValue(value: *const c_void, kind: i32, target: *mut i64) -> bool;
 }
 struct Service(u32);
@@ -173,6 +181,55 @@ fn find(id: Identity) -> Result<Service> {
     }
     Ok(service)
 }
+/// Exclude bus infrastructure without opening or displacing any OS driver.
+/// A candidate may still need capture authorization or be temporarily in use.
+pub fn share_candidate(id: Identity) -> bool {
+    find(id)
+        .ok()
+        .and_then(|entry| property(entry.0, c"bDeviceClass"))
+        .and_then(|class| u8::try_from(class).ok())
+        .is_some_and(usb::shareable_class)
+}
+/// Read the cached OS product name without opening or claiming the device.
+/// Names are untrusted display metadata and never identify an authorized device.
+pub fn display_name(id: Identity) -> Option<String> {
+    let entry = find(id).ok()?;
+    // SAFETY: retained CF property, checked string type, bounded writable buffer.
+    unsafe {
+        let key = CFStringCreateWithCString(
+            ptr::null(),
+            c"USB Product Name".as_ptr(),
+            CF_STRING_ENCODING_UTF8,
+        );
+        if key.is_null() {
+            return None;
+        }
+        let value = IORegistryEntryCreateCFProperty(entry.0, key, ptr::null(), 0);
+        CFRelease(key);
+        if value.is_null() {
+            return None;
+        }
+        let mut bytes =
+            [0u8; knightbus_core::host::MAX_DEVICE_NAME_BYTES + C_STRING_TERMINATOR_BYTES];
+        let valid = CFGetTypeID(value) == CFStringGetTypeID()
+            && CFStringGetCString(
+                value,
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            );
+        CFRelease(value);
+        if !valid {
+            return None;
+        }
+        let length = bytes.iter().position(|byte| *byte == 0)?;
+        let name = std::str::from_utf8(&bytes[..length]).ok()?.trim();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return None;
+        }
+        Some(name.to_owned())
+    }
+}
 /// Physical descriptors and validated inventory, without any native handles.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -190,7 +247,7 @@ pub struct Snapshot {
 pub fn inspect(id: Identity, key: DeviceKey) -> Result<Snapshot> {
     let gone = Arc::new(AtomicBool::new(false));
     let device = open_device(id, false, gone, Arc::default())?;
-    let result = read_snapshot(&device, id, key);
+    let result = cached_snapshot(&device, id, key);
     unsafe {
         device.destroy();
     }
@@ -226,6 +283,61 @@ fn open_device(
             RcBlock::as_ptr(&callback),
         )
         .ok_or_else(|| native_error(error.as_deref()))
+    }
+}
+// Inventory uses Apple's cached descriptors. Sending endpoint-zero requests while
+// the camera/audio driver owns the device can fail even though it is shareable.
+fn cached_snapshot(device: &IOUSBHostDevice, id: Identity, key: DeviceKey) -> Result<Snapshot> {
+    // SAFETY: IOUSBHost owns these immutable descriptor buffers until destroy.
+    // Copy them before releasing the object; lengths are bounded and validated.
+    unsafe {
+        let descriptor = device.deviceDescriptor();
+        if descriptor.is_null() {
+            return Err(Error::Unavailable);
+        }
+        let descriptor =
+            std::slice::from_raw_parts(descriptor.cast::<u8>(), usb::device::BYTES).to_vec();
+        let count = usize::from(descriptor[usb::device::CONFIGURATIONS]);
+        if count == 0 || count > limits::MAX_CONFIGURATIONS {
+            return Err(Error::Invalid);
+        }
+        let mut configurations = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut error = None;
+            let config = device.configurationDescriptorWithIndex_error(index, Some(&mut error));
+            if config.is_null() {
+                return Err(native_error(error.as_deref()));
+            }
+            let header = std::slice::from_raw_parts(config.cast::<u8>(), usb::configuration::BYTES);
+            let length = usize::from(usb::u16_at(header, usb::configuration::TOTAL_LENGTH));
+            if !(usb::configuration::BYTES..=descriptors::MAX_CONFIGURATION).contains(&length) {
+                return Err(Error::Invalid);
+            }
+            configurations.push(std::slice::from_raw_parts(config.cast::<u8>(), length).to_vec());
+        }
+        let selected = device.configurationDescriptor();
+        let active = if selected.is_null() {
+            0
+        } else {
+            (*selected).bConfigurationValue
+        };
+        let model = descriptors::device(
+            key,
+            id.location,
+            id.speed,
+            &descriptor,
+            &configurations,
+            active,
+        )?;
+        if model.wire.vendor_id != id.vendor || model.wire.product_id != id.product {
+            return Err(Error::Invalid);
+        }
+        Ok(Snapshot {
+            identity: id,
+            device: model,
+            descriptor,
+            configurations,
+        })
     }
 }
 fn read_snapshot(device: &IOUSBHostDevice, id: Identity, key: DeviceKey) -> Result<Snapshot> {

@@ -10,10 +10,9 @@ lifecycle in shared crates. OS adapters supply native USB access.
 ## Supported path
 
 The current adapters are a **macOS exporter** and a **Windows x64 importer**.
-Windows uses the KnightBus kernel driver. Other OS directions are not implemented.
+Windows uses the bundled, Microsoft-signed usbip-win UDE driver. Other OS directions are not implemented.
 
-Control, bulk, interrupt and isochronous transfers are implemented, including
-USB 3.x device speeds. Device support also depends
+Control, bulk, interrupt and isochronous transfers are implemented, within the Windows adapter’s current USB 1.x/2.0 limits. Device support also depends
 on the adapter's descriptor and feature limits; see the
 [architecture](docs/architecture.md#native-adapters).
 
@@ -30,8 +29,8 @@ Install Rust using the pinned [toolchain](rust-toolchain.toml), then run:
 cargo build --workspace --release --locked
 ```
 
-Native adapters run on their respective OS. The Windows kernel driver is a
-separate build; see [Contributing](CONTRIBUTING.md#windows-driver).
+Native adapters run on their respective OS. The Windows driver is an unmodified upstream binary;
+see [Contributing](CONTRIBUTING.md#windows-driver) for packaging.
 On macOS, list connected USB devices without capturing them:
 
 ```sh
@@ -41,6 +40,9 @@ target/release/knightbus local-list
 The standalone daemon, unified CLI and embedded C library use the same native
 forwarding implementation. See [standalone operation](docs/standalone.md) for
 pairing, sharing, native attachment, diagnostics and platform prerequisites.
+
+The optional [Desktop Manager](docs/desktop-manager.md) provides pairing, device
+permissions, attachment and session diagnostics through the same daemon.
 
 ## Documentation
 

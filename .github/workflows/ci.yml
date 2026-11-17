@@ -61,3 +61,40 @@ jobs:
           cargo +nightly-2026-05-25 fuzz run --fuzz-dir crates/knightbus-usbip/tests/fuzz stream -- -max_total_time=45 -max_len=8192 -rss_limit_mb=512
           cargo +nightly-2026-05-25 fuzz run --fuzz-dir crates/knightbus-usbip/tests/fuzz control -- -max_total_time=45 -max_len=8192 -rss_limit_mb=512
           git diff --exit-code -- crates/knightbus-usbip/tests/fuzz/Cargo.lock
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.88.0 fmt --manifest-path applications/knightbus-desktop/Cargo.toml --check
+      - run: cargo +1.88.0 clippy --manifest-path applications/knightbus-desktop/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo +1.88.0 test --manifest-path applications/knightbus-desktop/Cargo.toml --locked
+      - name: Windows installation recovery checks
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./applications/knightbus-desktop/tests/windows-installation.tests.ps1
+      - run: cargo +1.88.0 build --manifest-path applications/knightbus-desktop/Cargo.toml --release --locked
+  desktop-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: applications/knightbus-desktop/tests/package-lock.json
+      - run: npm ci --prefix applications/knightbus-desktop/tests
+      - run: npx --prefix applications/knightbus-desktop/tests playwright install --with-deps chromium
+      - run: npm --prefix applications/knightbus-desktop/tests test
+      - run: python3 -m unittest discover -s applications/knightbus-desktop/tests -p "test_*.py"

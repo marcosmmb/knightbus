@@ -13,6 +13,7 @@ use std::{
     task::{Wake, Waker},
     time::{Duration, Instant},
 };
+pub mod pairing;
 pub mod security;
 mod stream;
 pub use stream::Stream;

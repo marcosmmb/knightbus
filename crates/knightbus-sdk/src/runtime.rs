@@ -29,6 +29,9 @@ pub(crate) const ADMIN: Caller = Caller {
 pub(crate) trait Managed: Send + Sync {
     fn execute(&self, caller: Caller, command: Command, deadline: u64) -> Result<Reply>;
     fn shutdown(&self);
+    fn add_exporter(&self, _config: &Configuration) -> Result<()> {
+        Err(Error::Unsupported)
+    }
     fn audit(&self) -> Option<Audit> {
         None
     }
@@ -142,6 +145,9 @@ impl Runtime {
         let runner = host.clone();
         Self::spawn(host, move || runner.run(usb, control, None, store.as_ref()))
     }
+    pub(crate) fn add_exporter(&self, config: &Configuration) -> Result<()> {
+        self.0.host.add_exporter(config)
+    }
     /// Connect to this host with a connection-scoped control adapter.
     pub fn endpoint(&self) -> Endpoint {
         Endpoint(self.clone())
@@ -240,76 +246,119 @@ impl Runtime {
     }
 }
 #[cfg(target_os = "macos")]
+struct MacExporter {
+    generation: std::sync::atomic::AtomicU64,
+    host: Arc<Host<knightbus_core::exporter::Group, Mono>>,
+    budget: Budget,
+}
+#[cfg(target_os = "macos")]
+impl Managed for MacExporter {
+    fn execute(&self, caller: Caller, command: Command, deadline: u64) -> Result<Reply> {
+        self.host.execute(caller, command, deadline)
+    }
+    fn shutdown(&self) {
+        self.host.shutdown();
+    }
+    fn audit(&self) -> Option<Audit> {
+        self.host.audit()
+    }
+    fn add_exporter(&self, config: &Configuration) -> Result<()> {
+        use knightbus_macos_exporter::native::{self, Native};
+        let Role::Exporter {
+            registry,
+            capture,
+            storage_unmounted,
+            grants,
+        } = &config.role
+        else {
+            return Err(Error::Invalid);
+        };
+        if !capture {
+            return Err(Error::Denied);
+        }
+        let peers = Store::open(&config.state)?.peers()?;
+        if grants.iter().any(|peer| !peers.contains(*peer)) {
+            return Err(Error::Denied);
+        }
+        let id = native::enumerate()?
+            .into_iter()
+            .find(|d| d.registry_id == *registry)
+            .ok_or(Error::NotFound)?;
+        // Capture generations advance even when the physical device was not replugged.
+        let generation = self
+            .generation
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .map_err(|_| Error::Exhausted)?;
+        let snapshot = native::inspect(
+            id,
+            DeviceKey {
+                id: id.device_key().id,
+                generation,
+            },
+        )?;
+        if !storage_unmounted
+            && snapshot
+                .device
+                .configurations
+                .iter()
+                .flat_map(|c| &c.interfaces)
+                .any(|i| i.class.class == topology::CLASS_MASS_STORAGE)
+        {
+            return Err(Error::Denied);
+        }
+        let device = snapshot.device.clone();
+        let key = device.key;
+        let budget = self.budget.clone();
+        let backend =
+            knightbus_core::exporter::Backend::new(device.clone(), &self.budget, move || {
+                Native::open(snapshot, true, budget)
+            })?;
+        self.host
+            .register_backend(device.clone(), native::display_name(id), |group| {
+                group.insert(&device, Box::new(backend), &self.budget)
+            })?;
+        for peer in grants {
+            self.host.execute(
+                ADMIN,
+                Command::Authorize {
+                    device: key,
+                    peer: *peer,
+                    allow: true,
+                },
+                u64::MAX,
+            )?;
+        }
+        Ok(())
+    }
+}
+#[cfg(target_os = "macos")]
 fn exporter(config: &Configuration) -> Result<Runtime> {
-    use knightbus_macos_exporter::native::{self, Native};
-    let Role::Exporter {
-        registry,
-        capture,
-        storage_unmounted,
-        grants,
-    } = &config.role
-    else {
-        return Err(Error::Invalid);
-    };
-    if !capture {
-        return Err(Error::Denied);
-    }
     let store = Store::open(&config.state)?;
-    let identity = store.identity()?;
-    let peers = store.peers()?;
-    if grants.iter().any(|peer| !peers.contains(*peer)) {
-        return Err(Error::Denied);
-    }
-    let id = native::enumerate()?
-        .into_iter()
-        .find(|d| d.registry_id == *registry)
-        .ok_or(Error::NotFound)?;
-    let snapshot = native::inspect(id, id.device_key())?;
-    if !storage_unmounted
-        && snapshot
-            .device
-            .configurations
-            .iter()
-            .flat_map(|c| &c.interfaces)
-            .any(|i| i.class.class == topology::CLASS_MASS_STORAGE)
-    {
-        return Err(Error::Denied);
-    }
-    let device = snapshot.device.clone();
-    let key = device.key;
-    // Bind both listeners before creating the backend worker. No device is claimed
-    // until the engine authorizes a real USB/IP import.
     let usb = TcpListener::bind(config.usb).map_err(|_| Error::Unavailable)?;
     let control = TcpListener::bind(config.control).map_err(|_| Error::Unavailable)?;
-    let mut engine = Engine::new(
+    let engine = Engine::new(
         Mono::default(),
         Config {
             resources: EXPORTER_RESOURCES,
-            devices: 1,
             lease_ms: EXPORTER_LEASE_MS,
             ..Config::default()
         },
         knightbus_transport::security::epoch()?,
-        |budget| {
-            let b = budget.clone();
-            knightbus_core::exporter::Backend::new(device.clone(), budget, move || {
-                Native::open(snapshot, true, b)
-            })
-        },
+        |_| Ok(knightbus_core::exporter::Group::default()),
     )?;
-    engine.register(device)?;
-    for peer in grants {
-        engine.execute(
-            ADMIN,
-            Command::Authorize {
-                device: key,
-                peer: *peer,
-                allow: true,
-            },
-            u64::MAX,
-        )?;
-    }
-    Runtime::exporter(engine, identity, peers, usb, control, Some(store))
+    let budget = engine.budget();
+    let host = Arc::new(Host::new(engine, store.identity()?, store.peers()?));
+    let managed = Arc::new(MacExporter {
+        generation: std::sync::atomic::AtomicU64::new(1),
+        host: host.clone(),
+        budget,
+    });
+    managed.add_exporter(config)?;
+    Runtime::spawn(managed, move || host.run(usb, control, None, Some(&store)))
 }
 #[cfg(not(target_os = "macos"))]
 fn exporter(_: &Configuration) -> Result<Runtime> {

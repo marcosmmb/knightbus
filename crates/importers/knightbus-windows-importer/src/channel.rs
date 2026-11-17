@@ -1,218 +1,167 @@
-//! Private driver ABI. Little-endian integers, exact lengths, no native pointers.
-//! The driver independently checks ownership and request lifetimes.
-use crate::descriptors::{self, Speed, Topology};
-use knightbus_core::{Budget, Buffer, Error, Result};
-use knightbus_windows_protocol::iso;
+//! usbip-win 0.3.6 UDE ABI. Integers on the device handle are little-endian.
+//! Network framing remains the responsibility of knightbus-transport.
+use knightbus_core::{Budget, Buffer, DescriptorSet, Error, Result, topology as usb, usbip};
 
+pub(crate) const WORD: usize = size_of::<u32>();
+pub(crate) const HEADER: usize = usbip::TRANSFER_HEADER_LEN;
+pub(crate) const PACKET_BYTES: usize = 4 * WORD;
+pub(crate) const MAX_TRANSFER: usize = 1024 * 1024;
+pub(crate) const MAX_PACKETS: usize = 1024;
+pub(crate) const SLOTS: usize = 31; // EP0 plus fifteen endpoints in each direction.
+pub(crate) const MAX_MESSAGE: usize = HEADER + MAX_TRANSFER + MAX_PACKETS * PACKET_BYTES;
+pub(crate) const MAX_QUEUED: usize = SLOTS;
+pub(crate) const LOCAL_DEVICE_ID: u32 = 1; // Private to this driver handle; never sent remotely.
+pub(crate) const SHORT_NOT_OK: u32 = 1;
+pub(crate) const SHORT_TRANSFER: i32 = -121; // Linux EREMOTEIO, understood by usbip-win.
+pub(crate) const CMD_SUBMIT: u32 = 1;
+pub(crate) const CMD_UNLINK: u32 = 2;
+pub(crate) const RET_SUBMIT: u32 = 3;
+pub(crate) const RET_UNLINK: u32 = 4;
+// usbip_header fields, shared by the upstream read/write ABI and USB/IP.
+pub(crate) mod field {
+    pub const COMMAND: usize = 0;
+    pub const SEQUENCE: usize = 4;
+    pub const DEVICE: usize = 8;
+    pub const DIRECTION: usize = 12;
+    pub const ENDPOINT: usize = 16;
+    pub const FLAGS_STATUS_TARGET: usize = 20;
+    pub const LENGTH: usize = 24;
+    pub const FRAME: usize = 28;
+    pub const PACKETS: usize = 32;
+    pub const INTERVAL_ERRORS: usize = 36;
+    pub const SETUP: usize = 40;
+}
+// Layout of vhci_pluginfo_t in upstream include/usbip_vhci_api.h (Windows ABI).
+pub(crate) const PLUG_SIZE: usize = 296;
+pub(crate) const PLUG_DEVICE: usize = 4;
 #[cfg(windows)]
-pub(crate) use knightbus_windows_protocol::wire::{
-    ATTACH, DETACH, FETCH, REPLY, STATS, TRANSFER_READY,
-};
-pub(crate) use knightbus_windows_protocol::wire::{HEADER, STATS_BYTES};
-pub use knightbus_windows_protocol::wire::{MAX_TRANSFER, SLOTS};
-
-// Offsets in the private driver ABI, defined by knightbus-windows-protocol.
-pub(crate) const ABI_VERSION: u32 = 1;
-pub(crate) mod transfer {
-    pub const VERSION: usize = 0;
-    pub const ENDPOINT: usize = 4;
-    pub const TOKEN: usize = 8;
-    pub const LENGTH: usize = 16;
-    pub const PAYLOAD_LENGTH: usize = 20;
-    pub const SETUP: usize = 24;
-    pub const STATUS: usize = 24; // REPLY uses this field instead of FETCH setup.
-    pub const SUCCESS: u32 = 0;
-    pub const STALL: u32 = 1;
-    pub const FAILURE: u32 = 2;
-}
-pub(crate) mod stats {
-    pub const VERSION: usize = 0;
-    pub const LIVE_MASK: usize = 56;
-    pub const TOKENS: usize = 64;
-}
-const ATTACH_MAGIC: &[u8; 4] = b"KBWD";
-const ATTACH_VERSION: usize = 4;
-const ATTACH_SPEED: usize = 8;
-const ATTACH_DEVICE_LENGTH: usize = 12;
-const ATTACH_CONFIG_LENGTH: usize = 16;
-const ATTACH_HEADER: usize = 20;
-const ATTACH_CONFIG: usize = ATTACH_HEADER + descriptors::device::BYTES;
-
-/// Validated raw descriptors and their charged driver attach representation.
-pub struct Descriptors {
-    pub(crate) bytes: Buffer,
-    /// Allocation-free, validated metadata.
-    pub topology: Topology,
-    /// Actual physical speed, never inferred from USB revision.
-    pub speed: Speed,
-}
-impl Descriptors {
-    pub(crate) fn from_descriptor_set(
-        budget: &Budget,
-        descriptors: &knightbus_core::DescriptorSet,
-    ) -> Result<Self> {
-        Self::new(
-            budget,
-            descriptors.device(),
-            descriptors.configuration(),
-            descriptors.bos(),
-            descriptors.speed(),
-        )
+pub(crate) const PLUG_PORT: usize = 8;
+const PLUG_DESCRIPTOR: usize = 266;
+const PLUG_CONFIGURATION: usize = PLUG_DESCRIPTOR + usb::device::BYTES;
+const USB_1_0: u16 = 0x0100;
+const USB_1_1: u16 = 0x0110;
+const USB_2_0: u16 = 0x0200;
+// The UDE ABI encodes link speed through bcdUSB, not a separate speed field.
+pub(crate) fn virtual_revision(speed: usb::Speed) -> Result<u16> {
+    match speed {
+        usb::Speed::Low => Ok(USB_1_0),
+        usb::Speed::Full => Ok(USB_1_1),
+        usb::Speed::High => Ok(USB_2_0),
+        _ => Err(Error::Unsupported),
     }
-
-    /// Validate raw descriptors before allocation. Supply an empty BOS for USB2.
-    pub fn new(
-        budget: &Budget,
-        device: &[u8],
-        config: &[u8],
-        bos: &[u8],
-        speed: Speed,
-    ) -> Result<Self> {
-        let topology =
-            descriptors::validate(device, config, speed).map_err(|_| Error::Unsupported)?;
-        descriptors::validate_bos(bos, speed).map_err(|_| Error::Unsupported)?;
-        let mut bytes = budget.buffer(ATTACH_HEADER + device.len() + config.len() + bos.len())?;
-        let b = bytes.as_mut_slice();
-        b[..ATTACH_MAGIC.len()].copy_from_slice(ATTACH_MAGIC);
-        for (offset, value) in [
-            (ATTACH_VERSION, if bos.is_empty() { ABI_VERSION } else { 2 }),
-            (ATTACH_SPEED, speed as u32),
-            (ATTACH_DEVICE_LENGTH, descriptors::device::BYTES as u32),
-            (ATTACH_CONFIG_LENGTH, config.len() as u32),
-        ] {
-            b[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+pub(crate) fn patch_revision(bytes: &mut [u8], revision: u16) {
+    for (offset, byte) in revision.to_le_bytes().into_iter().enumerate() {
+        if let Some(out) = bytes.get_mut(usb::device::USB_REVISION + offset) {
+            *out = byte;
         }
-        b[ATTACH_HEADER..ATTACH_CONFIG].copy_from_slice(device);
-        b[ATTACH_CONFIG..ATTACH_CONFIG + config.len()].copy_from_slice(config);
-        b[ATTACH_CONFIG + config.len()..].copy_from_slice(bos);
-        Ok(Self {
-            bytes,
-            topology,
-            speed,
-        })
     }
 }
 
-/// Borrowed driver request; the payload is consumed before scratch reuse.
-#[derive(Debug)]
-pub struct Request<'a> {
-    /// Index in the native liveness snapshot.
-    pub slot: usize,
-    /// Monotonic native token, scoped to the owning driver handle.
-    pub token: u64,
-    /// USB endpoint address.
+pub(crate) fn plugin(descriptors: &DescriptorSet, budget: &Budget) -> Result<Buffer> {
+    let revision = virtual_revision(descriptors.speed())?;
+    if !descriptors.bos().is_empty() {
+        return Err(Error::Unsupported);
+    }
+    let size = PLUG_SIZE + descriptors.configuration().len() - usb::configuration::BYTES;
+    let mut bytes = budget.buffer(size)?;
+    let out = bytes.as_mut_slice();
+    out.fill(0);
+    put(out, 0, size as u32);
+    put(out, PLUG_DEVICE, LOCAL_DEVICE_ID);
+    out[PLUG_DESCRIPTOR..PLUG_CONFIGURATION].copy_from_slice(descriptors.device());
+    patch_revision(&mut out[PLUG_DESCRIPTOR..PLUG_CONFIGURATION], revision);
+    out[PLUG_CONFIGURATION..PLUG_CONFIGURATION + descriptors.configuration().len()]
+        .copy_from_slice(descriptors.configuration());
+    Ok(bytes)
+}
+pub(crate) fn word(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + WORD].try_into().unwrap())
+}
+pub(crate) fn put(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + WORD].copy_from_slice(&value.to_le_bytes());
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Header {
+    pub sequence: u32,
     pub endpoint: u8,
-    /// Requested transfer length.
+    pub input: bool,
     pub length: u32,
-    /// USB setup bytes, zero for nondefault endpoints.
-    pub setup: [u8; descriptors::SETUP_SIZE],
-    /// OUT data only.
-    pub payload: &'a [u8],
-    /// Validated ISO packet layout, absent for other transfers.
-    pub packets: Option<iso::Packets<'a>>,
-    /// ISO scheduling flags.
     pub flags: u32,
-    /// Native frame metadata.
-    pub start_frame: i32,
+    pub packets: usize,
+    pub payload: usize,
+    pub setup: [u8; usb::SETUP_SIZE],
 }
-impl<'a> Request<'a> {
-    /// Reject malformed native responses before constructing engine work.
-    pub fn decode(bytes: &'a [u8], topology: &Topology) -> Result<Self> {
-        if bytes.len() < HEADER {
-            return Err(Error::Invalid);
-        }
-        let endpoint =
-            u8::try_from(u32_at(bytes, transfer::ENDPOINT)).map_err(|_| Error::Invalid)?;
-        let token = u64_at(bytes, transfer::TOKEN);
-        let length = u32_at(bytes, transfer::LENGTH);
-        let payload = u32_at(bytes, transfer::PAYLOAD_LENGTH) as usize;
-        let (header, packets, flags, start_frame) = match u32_at(bytes, 0) {
-            ABI_VERSION => (HEADER, None, 0, 0),
-            iso::VERSION if bytes.len() >= iso::HEADER => {
-                let count = u32_at(bytes, iso::field::PACKET_COUNT) as usize;
-                let flags = u32_at(bytes, iso::field::FLAGS);
-                let frame = u32_at(bytes, iso::field::START_FRAME) as i32;
-                if count == 0
-                    || count > iso::MAX_PACKETS
-                    || flags != iso::ASAP
-                    || frame != 0
-                    || u32_at(bytes, iso::field::SLOT) == 0
-                    || u32_at(bytes, iso::field::SLOT) as usize >= SLOTS
-                    || payload > MAX_TRANSFER
-                    || iso::HEADER + payload + count * iso::PACKET_BYTES != bytes.len()
-                {
-                    return Err(Error::Invalid);
-                }
-                (
-                    iso::HEADER,
-                    Some(
-                        iso::Packets::decode(
-                            &bytes[iso::HEADER + payload..],
-                            length as usize,
-                            false,
-                        )
-                        .map_err(|_| Error::Invalid)?,
-                    ),
-                    flags,
-                    frame,
-                )
-            }
-            _ => return Err(Error::Invalid),
-        };
-        let setup: [u8; descriptors::SETUP_SIZE] =
-            bytes[transfer::SETUP..HEADER].try_into().unwrap();
-        let input = if endpoint == 0 {
-            setup[descriptors::SETUP_TYPE] & descriptors::DIRECTION_IN != 0
-        } else {
-            endpoint & descriptors::DIRECTION_IN != 0
-        };
-        if token == 0
-            || length as usize > MAX_TRANSFER
-            || (packets.is_none() && bytes.len() - header != payload)
-            || (packets.is_some() && endpoint == 0)
-            || payload != if input { 0 } else { length as usize }
-            || (endpoint != 0
-                && (!topology
-                    .endpoints
-                    .iter()
-                    .flatten()
-                    .any(|e| e.address == endpoint)
-                    || setup != [0; descriptors::SETUP_SIZE]))
-            || (endpoint == 0
-                && u32::from(descriptors::u16_at(&setup, descriptors::SETUP_LENGTH)) != length)
-        {
-            return Err(Error::Invalid);
-        }
-        let slot = if packets.is_some() {
-            u32_at(bytes, iso::field::SLOT) as usize
-        } else if endpoint == 0 {
-            0
-        } else {
-            topology
-                .endpoints
-                .iter()
-                .flatten()
-                .position(|e| e.address == endpoint)
-                .ok_or(Error::Invalid)?
-                + 1
-        };
-        Ok(Self {
-            slot,
-            token,
-            endpoint,
-            length,
-            setup,
-            payload: &bytes[header..header + payload],
-            packets,
-            flags,
-            start_frame,
-        })
+pub(crate) enum Frame {
+    Submit(Header),
+    Unlink { sequence: u32, target: u32 },
+}
+pub(crate) fn decode(bytes: &[u8]) -> Result<Frame> {
+    use field::*;
+    if bytes.len() < HEADER || word(bytes, DEVICE) != LOCAL_DEVICE_ID || word(bytes, SEQUENCE) == 0
+    {
+        return Err(Error::Invalid);
     }
-}
-pub(crate) fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + size_of::<u32>()].try_into().unwrap())
-}
-
-pub(crate) fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + size_of::<u64>()].try_into().unwrap())
+    let sequence = word(bytes, SEQUENCE);
+    match word(bytes, COMMAND) {
+        CMD_UNLINK if bytes.len() == HEADER && word(bytes, FLAGS_STATUS_TARGET) != 0 => {
+            Ok(Frame::Unlink {
+                sequence,
+                target: word(bytes, FLAGS_STATUS_TARGET),
+            })
+        }
+        CMD_SUBMIT => {
+            let input = match word(bytes, DIRECTION) {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Invalid),
+            };
+            let number = word(bytes, ENDPOINT);
+            if number > u32::from(usb::ENDPOINT_NUMBER_MASK) {
+                return Err(Error::Invalid);
+            }
+            let endpoint = number as u8
+                | if input && number != 0 {
+                    usb::DIRECTION_IN
+                } else {
+                    0
+                };
+            let length = word(bytes, LENGTH);
+            let packets = word(bytes, PACKETS) as usize;
+            let flags = word(bytes, FLAGS_STATUS_TARGET);
+            let payload = if input { 0 } else { length as usize };
+            if length as usize > MAX_TRANSFER
+                || packets > MAX_PACKETS
+                || bytes.len() != HEADER + payload + packets * PACKET_BYTES
+                || flags & !(SHORT_NOT_OK | usbip::ISO_ASAP) != 0
+                || (packets != 0 && (endpoint == 0 || flags & usbip::ISO_ASAP == 0))
+                || (packets == 0 && flags & usbip::ISO_ASAP != 0)
+            {
+                return Err(Error::Unsupported);
+            }
+            // The upstream driver leaves setup/padding uninitialized on data endpoints.
+            let setup = if endpoint == 0 {
+                bytes[SETUP..HEADER].try_into().unwrap()
+            } else {
+                [0; usb::SETUP_SIZE]
+            };
+            if endpoint == 0
+                && ((setup[usb::SETUP_TYPE] & usb::DIRECTION_IN != 0) != input
+                    || u32::from(usb::u16_at(&setup, usb::SETUP_LENGTH)) != length)
+            {
+                return Err(Error::Invalid);
+            }
+            Ok(Frame::Submit(Header {
+                sequence,
+                endpoint,
+                input,
+                length,
+                flags,
+                packets,
+                payload,
+                setup,
+            }))
+        }
+        _ => Err(Error::Invalid),
+    }
 }

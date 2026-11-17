@@ -1,0 +1,6 @@
+{
+  "identifier": "main-window",
+  "description": "Local manager window; no shell, filesystem, HTTP or process access.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

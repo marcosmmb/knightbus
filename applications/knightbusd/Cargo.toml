@@ -9,5 +9,10 @@ license.workspace = true
 ctrlc = { version = "=3.5.2", features = ["termination"] }
 knightbus-sdk = { path = "../../crates/knightbus-sdk" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "=1.1.6", features = ["process", "fs"] }
+knightbus-transport = { path = "../../crates/knightbus-transport" }
+zeroize = "=1.9.1"
+
 [lints]
 workspace = true
