@@ -5,8 +5,10 @@ pub mod config;
 #[cfg(feature = "mdns")]
 pub mod discovery;
 mod importer;
+mod pairing;
 pub mod physical;
 mod policy;
+pub use policy::{ATTACH_TIMEOUT_MS, CONTROL_POLL_INTERVAL, CONTROL_TIMEOUT_MS};
 mod runtime;
 pub use knightbus_core as core;
 use knightbus_core::*;
@@ -51,6 +53,13 @@ impl HostClock {
     }
 }
 impl Client {
+    /// Connect to a separately installed macOS root service. Its peer UID is verified.
+    #[cfg(target_os = "macos")]
+    pub fn connect_system(path: &Path) -> Result<Self> {
+        let mut control = knightbus_ipc::local::Client::connect_system(path)?;
+        let clock = HostClock::negotiate(&mut control)?;
+        Ok(Self { control, clock })
+    }
     /// Connect and negotiate before exposing mutations. There is no automatic replay.
     pub fn connect(path: &Path) -> Result<Self> {
         let mut control = knightbus_ipc::local::Client::connect(path)?;
@@ -112,4 +121,44 @@ pub fn guidance(error: Error) -> &'static str {
             "Native cleanup has not completed; the device remains quarantined. Do not recapture it."
         }
     }
+}
+
+/// Idle-capable service administration using the common control contract.
+pub mod service;
+#[cfg(target_os = "macos")]
+pub use knightbus_macos_exporter::storage_access;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+/// Installed macOS service endpoint, protected by the root installer.
+#[cfg(target_os = "macos")]
+pub use macos::CONTROL_ENDPOINT as SYSTEM_ENDPOINT;
+
+#[cfg(target_os = "macos")]
+impl Client {
+    /// Request removable-drive consent in the app, then share through its authenticated helper.
+    pub fn request_export(&mut self, command: Command) -> Result<Reply> {
+        let Command::Host(host::Request::Export {
+            registry,
+            storage_unmounted,
+            ..
+        }) = &command
+        else {
+            return Err(Error::Invalid);
+        };
+        if *storage_unmounted {
+            knightbus_macos_exporter::native::request_storage_consent(
+                registry.parse().map_err(|_| Error::Invalid)?,
+            )?;
+        }
+        self.request(command, CONTROL_TIMEOUT_MS)
+    }
+}
+/// Connect to the installed system service or an explicitly selected same-account endpoint.
+pub fn connect_local(path: &Path) -> Result<Client> {
+    #[cfg(target_os = "macos")]
+    if path == Path::new(SYSTEM_ENDPOINT) {
+        return Client::connect_system(path);
+    }
+    Client::connect(path)
 }

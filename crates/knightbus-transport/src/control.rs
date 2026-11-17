@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 /// Maximum management payload, including versioned IPC envelopes.
-pub const MAX_FRAME: usize = 8192;
+pub const MAX_FRAME: usize = knightbus_ipc::MAX_FRAME + size_of::<u8>();
+// Inventory is the single handshake response, before the heartbeat stream.
+const INVENTORY_RESPONSE_ID: u64 = 1;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 const SOCKET: mio::Token = mio::Token(0);
 const POLL_CAPACITY: usize = 2;
@@ -22,6 +24,7 @@ enum Tag {
     Ping = 2,
     Pong = 3,
     Event = 4,
+    Inventory = 5,
 }
 
 pub(crate) enum Message {
@@ -29,6 +32,7 @@ pub(crate) enum Message {
     Ping(u64),
     Pong(u64),
     Event(Event),
+    Inventory(Vec<knightbus_core::DeviceInfo>),
 }
 impl Message {
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -47,6 +51,13 @@ impl Message {
                 };
                 bytes.push(tag as u8);
                 bytes.extend_from_slice(&sequence.to_be_bytes());
+            }
+            Self::Inventory(devices) => {
+                bytes.push(Tag::Inventory as u8);
+                bytes.extend_from_slice(&knightbus_ipc::encode_response(&Response {
+                    id: INVENTORY_RESPONSE_ID,
+                    result: Ok(Reply::Devices(devices.clone())),
+                })?);
             }
             Self::Event(event) => {
                 bytes.push(Tag::Event as u8);
@@ -80,6 +91,16 @@ impl Message {
                 } else {
                     Self::Pong(sequence)
                 })
+            }
+            tag if tag == Tag::Inventory as u8 => {
+                let response = knightbus_ipc::decode_response(payload)?;
+                let Ok(Reply::Devices(devices)) = response.result else {
+                    return Err(Error::Invalid);
+                };
+                if response.id != INVENTORY_RESPONSE_ID {
+                    return Err(Error::Invalid);
+                }
+                Ok(Self::Inventory(devices))
             }
             tag if tag == Tag::Event as u8 => {
                 let response = knightbus_ipc::decode_response(payload)?;

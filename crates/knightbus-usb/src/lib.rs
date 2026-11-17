@@ -6,6 +6,14 @@
 // validator so parsing and userspace topology construction use the same layout.
 /// USB mass-storage class code used when checking capture consent.
 pub const CLASS_MASS_STORAGE: u8 = 0x08;
+/// Hubs belong to the physical bus and are not forwarded as USB functions.
+pub const CLASS_HUB: u8 = 0x09;
+/// Billboard devices describe alternate-mode connectors, not shareable functions.
+pub const CLASS_BILLBOARD: u8 = 0x11;
+/// Whether a device class represents a function eligible for USB forwarding.
+pub const fn shareable_class(class: u8) -> bool {
+    !matches!(class, CLASS_HUB | CLASS_BILLBOARD)
+}
 /// Length of the type/length prefix common to USB descriptors.
 pub const DESCRIPTOR_HEADER_BYTES: usize = 2;
 pub const DESCRIPTOR_TYPE: usize = 1;
@@ -193,6 +201,8 @@ pub const MAX_BOS: usize = u16::MAX as usize;
 pub const BOS_TYPE: u8 = 15;
 /// BOS header size.
 pub const BOS_HEADER: usize = 5;
+/// Offset of wTotalLength in the BOS header.
+pub const BOS_TOTAL_LENGTH: usize = 2;
 /// All nondefault USB endpoint addresses (15 in each direction).
 pub const MAX_ENDPOINTS: usize = 30;
 /// Maximum interface/alternate pairs in a configuration.

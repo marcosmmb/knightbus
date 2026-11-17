@@ -23,8 +23,8 @@ extern "C" {
 typedef struct KbHandle KbHandle;
 typedef struct KbBuffer KbBuffer;
 #define KB_ABI_VERSION 1u
-#define KB_CONTROL_VERSION 1u
-#define KB_MAX_FRAME 8192u
+#define KB_CONTROL_VERSION 4u
+#define KB_MAX_FRAME (64u * 1024u)
 /* Return codes: 0 success, 1 invalid, 2 state, 3 unsupported, 4 unavailable,
  * 5 denied, 6 not found, 7 version, 8 deadline, 9 cancelled, 10 exhausted,
  * 11 internal/panic, 12 cleanup (native resources still quarantined).

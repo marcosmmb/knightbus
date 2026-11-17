@@ -108,7 +108,7 @@ pub unsafe extern "C" fn kb_service_open(
         let path = std::str::from_utf8(unsafe { bytes(path, len, MAX_ENDPOINT_PATH_BYTES)? })
             .map_err(|_| Error::Invalid)?;
         let handle = KbHandle {
-            mode: Mode::Service(Client::connect(Path::new(path))?),
+            mode: Mode::Service(knightbus_sdk::connect_local(Path::new(path))?),
             next: 0,
             poisoned: false,
         };

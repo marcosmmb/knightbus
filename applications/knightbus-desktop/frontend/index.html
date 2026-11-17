@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KnightBus</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="app-header">
+  <div class="brand"><img src="icon.svg" width="40" height="40" alt=""><div><h1>KnightBus</h1><p class="app-subtitle">Share USB devices between your computers.</p></div></div>
+  <button id="quit-app" class="secondary" data-tooltip="Disconnect devices, stop the background service and quit the app.">Quit KnightBus</button>
+</header>
+<main>
+  <nav class="tabs" role="tablist" aria-label="KnightBus">
+    <button id="tab-devices" role="tab" aria-selected="true" aria-controls="devices-panel" tabindex="0">Devices</button>
+    <button id="tab-computers" role="tab" aria-selected="false" aria-controls="computers-panel" tabindex="-1">Computers</button>
+    <button id="tab-settings" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1">Settings</button>
+  </nav>
+  <section id="service-recovery" class="panel recovery" aria-labelledby="service-title" hidden>
+    <h2 id="service-title">Service disconnected</h2>
+    <p id="service-message" role="status"></p>
+    <div class="actions">
+      <button id="start-service" data-tooltip="Starts the installed service, or a bundled account service when none is installed. Closing the window keeps it running; Quit KnightBus stops it.">Start local service</button>
+      <button id="retry-service" class="secondary">Retry connection</button>
+      <button id="service-settings" class="secondary">Connection settings</button>
+      <button id="service-help" class="secondary">Setup help</button>
+    </div>
+    <details><summary>Technical details</summary><pre id="service-error"></pre></details>
+  </section>
+  <div id="alerts"><div id="error" role="alert" hidden><span id="error-message"></span><button id="error-close" type="button" class="icon-button" aria-label="Close error">×</button></div></div>
+  <div id="notice" class="notice" role="status" hidden><span id="notice-message"></span><button id="notice-close" type="button" class="icon-button" aria-label="Close notification">×</button></div>
+  <div id="devices-panel" role="tabpanel" aria-labelledby="tab-devices">
+    <div class="page-heading"><h2>Devices</h2><button data-open-pair class="secondary" data-connected>Add a computer</button></div>
+    <div class="device-columns">
+      <section class="panel" aria-labelledby="local-title">
+        <div class="panel-heading"><h3 id="local-title">Local devices</h3><button class="help" aria-label="About local devices" data-tooltip="Exporter: share a USB device plugged into this computer with a paired computer.">?</button><button id="physical-refresh" class="icon-button" aria-label="Refresh local devices" data-exporter data-tooltip="Check for connected USB devices.">↻</button></div>
+        <p id="exporter-support" class="support" hidden></p><div id="local-device-scroll" class="device-scroll"><section class="local-section" aria-labelledby="shared-local-title"><h4 id="shared-local-title">Shared devices</h4><div id="shared-devices" class="device-list"></div></section><section class="local-section" aria-labelledby="available-local-title"><h4 id="available-local-title">Available devices</h4><div id="physical" class="device-list"></div></section></div>
+      </section>
+      <section class="panel" aria-labelledby="remote-title">
+        <div class="panel-heading"><h3 id="remote-title">Remote devices</h3><button class="help" aria-label="About remote devices" data-tooltip="Importer: use a USB device shared by another computer. Connect first, then choose Use device.">?</button><button id="inventory-refresh" class="icon-button" aria-label="Refresh remote devices" data-importer data-tooltip="Refresh the other computer’s shared devices.">↻</button></div>
+        <p id="importer-support" class="support" hidden></p>
+        <div id="driver-setup" class="recovery" hidden><h4>USB driver required</h4><p id="driver-message"></p></div>
+        <form id="import">
+          <label for="exporter-peer">Computer</label><div class="inline"><select id="exporter-peer" name="fingerprint" required><option value="">Choose a paired computer</option></select><button data-importer data-tooltip="List this computer’s shared devices. This does not attach a device.">Connect</button></div>
+          <details id="remote-advanced"><summary>Advanced connection settings</summary><label for="remote-address">IP address <button type="button" class="help" aria-label="About the remote IP address" data-tooltip="Uses the address saved during pairing or found on your LAN. Enter an override only if needed; clear it to use the automatic address.">?</button></label><input id="remote-address" placeholder="Automatic" spellcheck="false"></details>
+        </form>
+        <p id="inventory-status" class="hint" role="status"></p><div id="remote-devices" class="device-list device-scroll"></div>
+      </section>
+    </div>
+  </div>
+  <div id="computers-panel" role="tabpanel" aria-labelledby="tab-computers" hidden>
+    <div class="page-heading"><h2>Computers</h2><button data-open-pair data-connected>Add a computer</button></div>
+    <div class="computer-panels">
+      <section class="panel" aria-labelledby="paired-title"><div class="panel-heading"><h3 id="paired-title">Paired computers</h3><button class="help" aria-label="About pairing" data-tooltip="Pairing verifies a computer’s identity. Device access must be granted separately.">?</button><button id="browse" class="secondary" data-connected data-tooltip="Find computers on your LAN, including computers that are not sharing USB devices. Use a PIN to pair.">Find nearby</button><button id="paired-refresh" class="icon-button" data-connected aria-label="Refresh paired computers" data-tooltip="Refresh paired computers and nearby availability.">↻</button></div><div class="computer-list"><div id="paired"></div><div id="hints"></div></div></section>
+      <section class="panel" aria-labelledby="sessions-title"><div class="panel-heading"><h3 id="sessions-title">Connections <span id="connection-count">0</span></h3><button class="help" aria-label="About connections" data-tooltip="Closing the window keeps USB connections running. Disconnect devices here.">?</button><button id="connections-refresh" class="icon-button" data-connected aria-label="Refresh connections" data-tooltip="Refresh device connections.">↻</button></div><div id="session-list" class="computer-list"></div></section>
+    </div>
+    <details id="recent-actions" class="panel"><summary>Recent actions</summary><pre id="activity"></pre></details>
+  </div>
+  <div id="settings-panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+    <div class="page-heading"><h2>Settings</h2></div>
+    <section class="panel"><div class="panel-heading"><h3>This computer</h3></div><div class="columns"><label>Name<input id="computer-name" maxlength="64"  data-tooltip="Leave empty to use this computer’s name. Names do not prove identity."></label><label>IP address<input id="local-address" placeholder="192.168.1.10" spellcheck="false" data-tooltip="Leave empty to use the detected network address. With a VPN or multiple adapters, enter the address reachable from your other computer."></label></div></section>
+    <details class="panel" id="advanced"><summary>Advanced settings</summary>
+      <form id="connect"><label>Local service endpoint<input id="endpoint" required spellcheck="false" data-tooltip="The local socket or named pipe used to contact knightbusd. This is separate from the network ports below."></label><button class="secondary">Reconnect service</button></form>
+      <div class="columns"><label>USB port<input id="usb-port" type="number" min="1" max="65535" data-tooltip="3337 is the KnightBus USB default. Both computers must use the exporter’s configured port."></label><label>Control port<input id="control-port" type="number" min="1" max="65535" data-tooltip="KnightBus uses a separate port for remote management. 3338 is the KnightBus control default. Both computers must agree on the ports."></label></div>
+      <label>Listen address<input id="listen-address" spellcheck="false" data-tooltip="Defaults to the detected LAN address. To listen on all IPv4 interfaces, use 0.0.0.0 and disable discovery."></label>
+      <label class="check"><input id="announce" type="checkbox" checked data-tooltip="Announce this computer’s name, public fingerprint and configured addresses while the service runs, even before pairing or sharing. Never publishes a device list or grants access. Uses the IP shown in Settings.">Make computer discoverable on LAN</label>
+      
+      <h4>Identity</h4><output id="fingerprint"></output>
+    </details>
+    <details class="panel" id="diagnostic-settings"><summary>Diagnostics</summary><h4>USB service details</h4><p id="capabilities"></p><pre id="selection"></pre><p id="quality"></p><button id="diagnostics" class="secondary" data-connected data-tooltip="Collect identifiers and errors. Reports exclude keys and USB data. Incomplete reports are marked.">Collect diagnostics</button><label>Report<textarea id="report" readonly rows="5"></textarea></label></details>
+  </div>
+</main>
+<dialog id="pairing" aria-labelledby="pairing-title">
+  <div class="dialog-heading"><h2 id="pairing-title">Add a computer</h2><button class="help" aria-label="Pairing instructions" data-tooltip="Show a PIN on one computer. On the other, find that computer and enter its PIN. Both computers are paired together; devices stay private until you share them.">?</button><button class="icon-button" data-close="pairing" aria-label="Close pairing">×</button></div>
+  <div id="pin-pairing" class="columns">
+    <section><h3>Show a PIN</h3><button id="pin-start" data-connected data-tooltip="Open a two-minute pairing window. Read the PIN on your other computer. The PIN is single-use and allows at most five attempts.">Show PIN</button>
+      <output id="pin-value" class="pairing-pin" aria-label="Pairing PIN" hidden></output>
+      <details id="pin-listen-details" hidden><summary>Manual pairing address</summary><output id="pin-listen"></output></details>
+    </section>
+    <form id="pin-join"><h3>Enter a PIN</h3>
+      <label>Computer<select id="pin-peer"><option value="">Choose a computer</option></select></label>
+      <button id="pin-find" type="button" class="secondary" data-connected>Find computers</button>
+      <details><summary>Manual pairing address</summary><label>Address<input id="pin-endpoint" spellcheck="false" placeholder="IP:port" data-tooltip="Use the manual pairing address displayed below the PIN on the other computer if LAN discovery is unavailable."></label></details>
+      <label>PIN<input id="pin-input" name="pin" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" minlength="6" maxlength="6" required spellcheck="false"></label>
+      <button id="pin-submit" data-connected>Pair</button>
+    </form>
+  </div>
+  <p id="pin-progress" role="status" class="hint"></p><button id="pin-cancel" class="secondary" data-connected hidden>Cancel pairing</button>
+  <details id="pairing-advanced"><summary>Advanced pairing</summary>
+  <div class="step"><span class="step-number">1</span><h3>Copy your code</h3><button class="help" aria-label="About connection codes" data-tooltip="A code contains your public certificate, fingerprint, name and optional address. It does not share devices or private keys.">?</button></div>
+  <div class="columns"><label>Computer name<input id="pair-name" maxlength="64"></label><label>IP address<input id="pair-address" placeholder="Optional" data-tooltip="Optional LAN address. Including it avoids typing it on the other computer."></label></div>
+  <button id="copy-code" data-connected>Copy my connection code</button>
+  <details><summary>Code &amp; fingerprint</summary><label>Connection code<textarea id="own-code" rows="2" readonly></textarea></label><output id="pair-fingerprint"></output></details>
+  <div class="step"><span class="step-number">2</span><h3>Paste their code</h3></div>
+  <form id="pair"><label>Other computer’s code<textarea name="code" required rows="3" placeholder="knightbus:1:…" spellcheck="false"></textarea></label><button data-connected>Review &amp; pair</button></form><p id="pair-message" class="hint" role="status"></p>
+  </details>
+</dialog>
+<dialog id="share-dialog" aria-labelledby="share-title">
+  <div class="dialog-heading"><h2 id="share-title">Share device</h2><button class="icon-button" data-close="share-dialog" aria-label="Close sharing">×</button></div><p id="share-device"></p>
+  <form id="share"><label>Computer<select id="share-peer" required></select></label><p>This computer can access the device and its data. The device may become unavailable locally while in use.</p><div id="storage-confirmation" hidden><p>Eject all volumes on this device in Finder before sharing to avoid data loss.</p><label class="check"><input id="storage-unmounted" type="checkbox">All volumes on this device are cleanly unmounted.</label></div><button data-exporter>Share device</button><p id="share-message" role="status"></p></form>
+</dialog>
+<dialog id="service-guide" aria-labelledby="guide-title">
+  <div class="dialog-heading"><h2 id="guide-title">Service setup</h2><button class="icon-button" data-close="service-guide" aria-label="Close setup help">×</button></div>
+  <p>KnightBus uses a background process named <code>knightbusd</code> to handle devices. The app connects to that process.</p>
+  <ol><li>Choose <strong>Start local service</strong> to restart the installed service, or run the bundled account service. macOS may ask for administrator approval.</li><li>If the companion is missing, reinstall the complete KnightBus package. On macOS it belongs inside KnightBus.app; on Windows keep knightbusd.exe next to the app.</li><li>For an existing system service, use <strong>Connection settings</strong> to check its endpoint, then retry. Use its installer to repair permissions or mismatched versions.</li></ol>
+  <p>The first Share device action on macOS offers administrator setup for USB capture. Windows USB import requires the USB/IP driver included with the KnightBus installer.</p>
+</dialog>
+<dialog id="inspection-dialog" aria-labelledby="inspection-title"><div class="dialog-heading"><h2 id="inspection-title">Device details</h2><button class="icon-button" data-close="inspection-dialog" aria-label="Close device details">×</button></div><pre id="inspection"></pre></dialog>
+<dialog id="consent" aria-labelledby="consent-title"><h2 id="consent-title">Confirm action</h2><p id="consent-message"></p><form method="dialog"><button value="cancel" class="secondary" autofocus>Cancel</button><button value="confirm">Confirm</button></form></dialog>
+<div id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

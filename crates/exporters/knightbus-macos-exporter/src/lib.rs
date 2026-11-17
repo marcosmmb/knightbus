@@ -4,6 +4,8 @@ pub mod constants;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub mod native;
+#[cfg(target_os = "macos")]
+pub mod storage_access;
 
 /// Maximum simultaneous requests, including queued and completed owners.
 pub const SLOTS: usize = 64;

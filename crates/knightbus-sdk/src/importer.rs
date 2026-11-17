@@ -66,6 +66,15 @@ fn discover_until(
     let (stream, _remote) = connect(config, operation)?;
     inventory(stream, operation)
 }
+#[cfg(windows)]
+fn discover_named_until(
+    config: &Configuration,
+    operation: &Operation<'_>,
+) -> Result<(Vec<usbip::ListedDevice>, Vec<DeviceInfo>)> {
+    let (stream, remote) = connect(config, operation)?;
+    let devices = inventory(stream, operation)?;
+    Ok((devices, remote.inventory().to_vec()))
+}
 fn inventory(
     stream: knightbus_transport::Stream,
     operation: &Operation<'_>,
@@ -98,6 +107,7 @@ mod native {
     const MAX_EVENTS: usize = 64;
     const MAX_RETAINED_SESSIONS: usize = 64;
     const MAX_SUBSCRIPTIONS: usize = 32;
+    const WORKER_REAP_INTERVAL: Duration = Duration::from_millis(100);
     const TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
     const FORWARDING_RESOURCES: ResourceLimits = ResourceLimits {
         bytes: 96 * 1024 * 1024,
@@ -114,7 +124,18 @@ mod native {
         next: u64,
         subscription: u64,
         events: BTreeMap<u64, (u64, VecDeque<Event>)>,
-        job: Option<(SessionId, DeviceKey, u64)>,
+        jobs: VecDeque<(SessionId, DeviceKey, u64)>,
+    }
+    impl State {
+        fn remove_session(&mut self, id: SessionId) {
+            self.sessions.remove(&id);
+            // A descriptor may still belong to another retained or active session.
+            self.descriptions.retain(|key, _| {
+                self.sessions
+                    .values()
+                    .any(|session| session.devices.contains(key))
+            });
+        }
     }
     struct Host {
         config: Configuration,
@@ -122,6 +143,7 @@ mod native {
         clock: Instant,
         state: Mutex<State>,
         wake: Condvar,
+        budget: Budget,
     }
     impl Host {
         fn now(&self) -> u64 {
@@ -178,34 +200,81 @@ mod native {
             })
         }
         fn run(&self) -> Result<()> {
-            loop {
-                let mut state = self.state.lock().map_err(|_| Error::Internal)?;
-                while state.job.is_none() && !state.stopped {
-                    state = self.wake.wait(state).map_err(|_| Error::Internal)?;
+            self.run_jobs(|id, key, deadline| self.forward(id, key, deadline))
+        }
+        fn run_jobs(
+            &self,
+            forward: impl Fn(SessionId, DeviceKey, u64) -> Result<()> + Sync,
+        ) -> Result<()> {
+            std::thread::scope(|scope| {
+                let mut workers: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
+                loop {
+                    let mut index = 0;
+                    while index < workers.len() {
+                        if workers[index].is_finished() {
+                            workers
+                                .swap_remove(index)
+                                .join()
+                                .map_err(|_| Error::Cleanup)?;
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    let mut state = self.state.lock().map_err(|_| Error::Internal)?;
+                    if state.stopped && state.jobs.is_empty() && workers.is_empty() {
+                        return if state.cleanup_failed {
+                            Err(Error::Cleanup)
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    if workers.len() < MAX_IMPORT_ATTACHMENTS
+                        && let Some((id, key, deadline)) = state.jobs.pop_front()
+                    {
+                        drop(state);
+                        if self.cancelled(id) {
+                            self.update(id, SessionState::Closed, Some(Error::Cancelled));
+                            continue;
+                        }
+                        let forward = &forward;
+                        match std::thread::Builder::new()
+                            .name("usb-import".into())
+                            .spawn_scoped(scope, move || {
+                                // A panic cannot establish native retirement either.
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        forward(id, key, deadline)
+                                    }))
+                                    .unwrap_or(Err(Error::Cleanup));
+                                if result == Err(Error::Cleanup) {
+                                    if let Ok(mut state) = self.state.lock() {
+                                        state.cleanup_failed = true;
+                                    }
+                                    self.update(
+                                        id,
+                                        SessionState::Quarantined,
+                                        Some(Error::Cleanup),
+                                    );
+                                } else {
+                                    self.update(id, SessionState::Closed, result.err());
+                                }
+                                self.wake.notify_all();
+                            }) {
+                            Ok(worker) => workers.push(worker),
+                            Err(_) => {
+                                self.update(id, SessionState::Closed, Some(Error::Unavailable))
+                            }
+                        }
+                        continue;
+                    }
+                    // Completion can notify just before the thread becomes joinable.
+                    drop(
+                        self.wake
+                            .wait_timeout(state, WORKER_REAP_INTERVAL)
+                            .map_err(|_| Error::Internal)?,
+                    );
                 }
-                let job = state.job.take();
-                if job.is_none() && state.stopped {
-                    return if state.cleanup_failed {
-                        Err(Error::Cleanup)
-                    } else {
-                        Ok(())
-                    };
-                }
-                let (id, key, deadline) = job.unwrap();
-                drop(state);
-                let result = self.forward(id, key, deadline);
-                if result == Err(Error::Cleanup) {
-                    // Forwarder errors do not establish native retirement. Its
-                    // backend retains native owners; quarantine blocks reuse.
-                    self.state
-                        .lock()
-                        .map_err(|_| Error::Internal)?
-                        .cleanup_failed = true;
-                    self.update(id, SessionState::Quarantined, Some(Error::Cleanup));
-                } else {
-                    self.update(id, SessionState::Closed, result.err());
-                }
-            }
+            })
         }
         fn forward(&self, id: SessionId, key: DeviceKey, deadline: u64) -> Result<()> {
             let cancelled = || self.cancelled(id);
@@ -216,7 +285,7 @@ mod native {
                 &cancelled,
             );
             let (stream, remote) = connect(&self.config, &operation)?;
-            let budget = Budget::new(FORWARDING_RESOURCES);
+            let budget = self.budget.clone();
             let mut forwarding = knightbus_windows_importer::backend::connect_until(
                 stream,
                 key.id.bus_id(),
@@ -291,7 +360,7 @@ mod native {
             }
             // Discovery authenticates before the remote exporter reveals its inventory.
             let discovered = if command == Command::List {
-                Some(discover_until(
+                Some(discover_named_until(
                     &self.config,
                     &Operation::new(
                         self.clock
@@ -322,7 +391,8 @@ mod native {
                     s.generation = s.generation.checked_add(1).ok_or(Error::Exhausted)?;
                     let generation = s.generation;
                     s.inventory.clear();
-                    for d in discovered.unwrap() {
+                    let (discovered, metadata) = discovered.unwrap();
+                    for d in discovered {
                         let bus = std::str::from_utf8(d.device.bus_id.as_bytes())
                             .map_err(|_| Error::Invalid)?;
                         let id = u64::from_str_radix(
@@ -341,9 +411,22 @@ mod native {
                     Self::emit(&mut s, EventKind::Inventory, None);
                     Ok(Reply::Devices(
                         s.inventory
-                            .keys()
-                            .map(|key| DeviceInfo {
+                            .iter()
+                            .map(|(key, entry)| DeviceInfo {
+                                name: metadata
+                                    .iter()
+                                    .find(|d| {
+                                        d.key.id == key.id
+                                            && d.vendor == entry.device.vendor_id
+                                            && d.product == entry.device.product_id
+                                    })
+                                    .and_then(|d| d.name.clone()),
                                 key: *key,
+                                vendor: entry.device.vendor_id,
+                                product: entry.device.product_id,
+                                speed: entry.device.speed,
+                                class: entry.device.class,
+                                shared: true,
                                 busy: s.sessions.values().any(|session| {
                                     session.state != SessionState::Closed
                                         && session.devices.iter().any(|d| d.id == key.id)
@@ -365,14 +448,29 @@ mod native {
                     if keys.len() != 1 || !s.inventory.contains_key(&keys[0]) {
                         return Err(Error::NotFound);
                     }
-                    if s.sessions.values().any(|v| v.state != SessionState::Closed) {
+                    let active: Vec<_> = s
+                        .sessions
+                        .values()
+                        .filter(|v| v.state != SessionState::Closed)
+                        .collect();
+                    if active
+                        .iter()
+                        .any(|v| v.devices.iter().any(|d| d.id == keys[0].id))
+                    {
+                        return Err(Error::State);
+                    }
+                    if active.len() >= MAX_IMPORT_ATTACHMENTS {
                         return Err(Error::Exhausted);
                     }
                     if s.sessions.len() >= MAX_RETAINED_SESSIONS {
-                        let oldest = *s.sessions.keys().next().unwrap();
-                        s.sessions.remove(&oldest);
+                        let oldest = *s
+                            .sessions
+                            .iter()
+                            .find(|(_, v)| v.state == SessionState::Closed)
+                            .ok_or(Error::Exhausted)?
+                            .0;
+                        s.remove_session(oldest);
                     }
-                    s.descriptions.clear();
                     s.next = s.next.checked_add(1).ok_or(Error::Exhausted)?;
                     let id = SessionId {
                         epoch: self.epoch,
@@ -389,7 +487,7 @@ mod native {
                         error: None,
                     };
                     s.sessions.insert(id, session.clone());
-                    s.job = Some((id, keys[0], deadline));
+                    s.jobs.push_back((id, keys[0], deadline));
                     Self::emit(&mut s, EventKind::Session, Some(id));
                     self.wake.notify_all();
                     Ok(Reply::Session(session))
@@ -417,7 +515,7 @@ mod native {
                     if s.sessions.get(&id).ok_or(Error::NotFound)?.state != SessionState::Closed {
                         return Err(Error::State);
                     }
-                    s.sessions.remove(&id);
+                    s.remove_session(id);
                     Ok(Reply::Done)
                 }
                 Command::Subscribe => {
@@ -474,9 +572,10 @@ mod native {
                 next: 0,
                 subscription: 0,
                 events: BTreeMap::new(),
-                job: None,
+                jobs: VecDeque::new(),
             }),
             wake: Condvar::new(),
+            budget: Budget::new(FORWARDING_RESOURCES),
         });
         let runner = host.clone();
         Runtime::spawn(host, move || runner.run())
@@ -484,13 +583,12 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        #[test]
-        fn cancellation_and_quarantine_are_monotonic_and_events_do_not_spin() {
+        fn test_host() -> Host {
             let id = SessionId {
                 epoch: 1,
                 serial: 1,
             };
-            let host = Host {
+            Host {
                 config: Configuration {
                     role: Role::Importer {
                         peer: PeerId([1; 32]),
@@ -503,6 +601,7 @@ mod native {
                 epoch: 1,
                 clock: Instant::now(),
                 wake: Condvar::new(),
+                budget: Budget::new(FORWARDING_RESOURCES),
                 state: Mutex::new(State {
                     stopped: false,
                     cleanup_failed: false,
@@ -511,7 +610,7 @@ mod native {
                     descriptions: BTreeMap::new(),
                     next: 1,
                     subscription: 1,
-                    job: None,
+                    jobs: VecDeque::new(),
                     sessions: [(
                         id,
                         Session {
@@ -525,7 +624,219 @@ mod native {
                     .into(),
                     events: [(1, (0, VecDeque::new()))].into(),
                 }),
+            }
+        }
+        fn admit(host: &Host, number: u64) -> SessionId {
+            let key = DeviceKey {
+                id: DeviceId(number),
+                generation: 1,
             };
+            host.state.lock().unwrap().inventory.insert(
+                key,
+                usbip::ListedDevice {
+                    device: usbip::Device {
+                        path: usbip::WireString::new(b"test").unwrap(),
+                        bus_id: key.id.bus_id(),
+                        bus_number: 1,
+                        device_number: number as u32,
+                        speed: 2,
+                        vendor_id: 1,
+                        product_id: 1,
+                        device_bcd: 1,
+                        class: 0,
+                        subclass: 0,
+                        protocol: 0,
+                        configuration: 1,
+                        configurations: 1,
+                        interfaces: 0,
+                    },
+                    interfaces: vec![],
+                },
+            );
+            let Reply::Session(session) = host
+                .execute(crate::runtime::ADMIN, Command::Attach(vec![key]), u64::MAX)
+                .unwrap()
+            else {
+                panic!()
+            };
+            session.id
+        }
+        #[test]
+        fn forgetting_closed_sessions_releases_unreferenced_descriptors() {
+            const CYCLES: usize = MAX_RETAINED_SESSIONS * 2;
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            for number in 1..=CYCLES as u64 {
+                let id = admit(&host, number);
+                let key;
+                {
+                    let mut state = host.state.lock().unwrap();
+                    key = state.sessions[&id].devices[0];
+                    let device = Device {
+                        key,
+                        wire: state.inventory[&key].device.clone(),
+                        configurations: vec![knightbus_core::Configuration {
+                            value: 1,
+                            interfaces: vec![],
+                        }],
+                    };
+                    state.descriptions.insert(key, device);
+                    state.jobs.clear();
+                }
+                host.update(id, SessionState::Closed, None);
+                host.execute(crate::runtime::ADMIN, Command::Forget(id), u64::MAX)
+                    .unwrap();
+                assert_eq!(
+                    host.execute(crate::runtime::ADMIN, Command::Inspect(key), u64::MAX),
+                    Err(Error::Unavailable)
+                );
+                assert!(host.state.lock().unwrap().descriptions.is_empty());
+            }
+        }
+        #[test]
+        fn session_removal_preserves_descriptors_referenced_by_another_session() {
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            let id = admit(&host, 1);
+            let retained = SessionId {
+                serial: id.serial + 1,
+                ..id
+            };
+            let key;
+            {
+                let mut state = host.state.lock().unwrap();
+                key = state.sessions[&id].devices[0];
+                let device = Device {
+                    key,
+                    wire: state.inventory[&key].device.clone(),
+                    configurations: vec![],
+                };
+                state.descriptions.insert(key, device);
+                let mut session = state.sessions[&id].clone();
+                session.id = retained;
+                state.sessions.insert(retained, session);
+            }
+            host.update(id, SessionState::Closed, None);
+            host.execute(crate::runtime::ADMIN, Command::Forget(id), u64::MAX)
+                .unwrap();
+            assert!(matches!(
+                host.execute(crate::runtime::ADMIN, Command::Inspect(key), u64::MAX),
+                Ok(Reply::Inspection(_))
+            ));
+            // Automatic eviction uses the same cleanup as explicit dismissal.
+            host.state.lock().unwrap().remove_session(retained);
+            assert!(host.state.lock().unwrap().descriptions.is_empty());
+        }
+        #[test]
+        fn independent_imports_detach_and_shutdown_without_blocking_each_other() {
+            use std::sync::mpsc;
+            const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            let first = admit(&host, 1);
+            let second = admit(&host, 2);
+            let (started, arrivals) = mpsc::channel();
+            let (closed, departures) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let runner = scope.spawn(|| {
+                    host.run_jobs(|id, _, _| {
+                        host.update(id, SessionState::Active, None);
+                        started.send(id).unwrap();
+                        let end = Instant::now() + TEST_TIMEOUT;
+                        while !host.cancelled(id) && Instant::now() < end {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        assert!(host.cancelled(id), "worker did not receive cancellation");
+                        closed.send(id).unwrap();
+                        Ok(())
+                    })
+                });
+                let mut active = [
+                    arrivals.recv_timeout(TEST_TIMEOUT).unwrap(),
+                    arrivals.recv_timeout(TEST_TIMEOUT).unwrap(),
+                ];
+                active.sort();
+                assert_eq!(active, [first, second]);
+                host.execute(crate::runtime::ADMIN, Command::Detach(first), u64::MAX)
+                    .unwrap();
+                assert_eq!(departures.recv_timeout(TEST_TIMEOUT).unwrap(), first);
+                assert_eq!(
+                    host.state.lock().unwrap().sessions[&second].state,
+                    SessionState::Active
+                );
+                host.shutdown();
+                assert_eq!(departures.recv_timeout(TEST_TIMEOUT).unwrap(), second);
+                assert_eq!(runner.join().unwrap(), Ok(()));
+            });
+            assert!(
+                host.state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .values()
+                    .all(|s| s.state == SessionState::Closed)
+            );
+            assert_eq!(host.budget.usage().bytes, 0);
+        }
+        #[test]
+        fn admission_bounds_active_imports_and_retains_quarantined_devices() {
+            let host = test_host();
+            host.state.lock().unwrap().sessions.clear();
+            let first = admit(&host, 1);
+            for number in 2..=MAX_IMPORT_ATTACHMENTS as u64 {
+                admit(&host, number);
+            }
+            let old = DeviceKey {
+                id: DeviceId(1),
+                generation: 1,
+            };
+            let fresh = DeviceKey {
+                generation: 2,
+                ..old
+            };
+            {
+                let mut state = host.state.lock().unwrap();
+                let entry = state.inventory[&old].clone();
+                state.inventory.insert(fresh, entry);
+            }
+            assert_eq!(
+                host.execute(
+                    crate::runtime::ADMIN,
+                    Command::Attach(vec![fresh]),
+                    u64::MAX
+                ),
+                Err(Error::State)
+            );
+            host.update(first, SessionState::Quarantined, Some(Error::Cleanup));
+            assert_eq!(
+                host.execute(crate::runtime::ADMIN, Command::Forget(first), u64::MAX),
+                Err(Error::State)
+            );
+            let other = DeviceKey {
+                id: DeviceId(100),
+                generation: 1,
+            };
+            {
+                let mut state = host.state.lock().unwrap();
+                let entry = state.inventory[&old].clone();
+                state.inventory.insert(other, entry);
+            }
+            assert_eq!(
+                host.execute(
+                    crate::runtime::ADMIN,
+                    Command::Attach(vec![other]),
+                    u64::MAX
+                ),
+                Err(Error::Exhausted)
+            );
+        }
+        #[test]
+        fn cancellation_and_quarantine_are_monotonic_and_events_do_not_spin() {
+            let id = SessionId {
+                epoch: 1,
+                serial: 1,
+            };
+            let host = test_host();
             host.update(id, SessionState::Draining, Some(Error::Cancelled));
             host.update(id, SessionState::Active, None);
             for _ in 0..100 {

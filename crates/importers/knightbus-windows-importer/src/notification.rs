@@ -67,7 +67,7 @@ mod platform {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
-        System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject},
+        System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects},
     };
 
     struct Handle(HANDLE);
@@ -93,28 +93,35 @@ mod platform {
     }
 
     /// Latched wake signal for a native worker.
-    pub struct Signal(Handle);
+    pub struct Signal {
+        wake: Handle,
+        native: Handle,
+    }
     impl Signal {
         pub(crate) fn new() -> Result<Self> {
             // Unnamed, non-inherited, auto-reset event. Signals survive until
             // the single worker consumes them, including signals before wait.
-            Ok(Self(Handle::new(unsafe {
-                CreateEventW(ptr::null(), 0, 0, ptr::null())
-            })?))
+            Ok(Self {
+                wake: Handle::new(unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) })?,
+                native: Handle::new(unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) })?,
+            })
         }
         pub(crate) fn handle(&self) -> HANDLE {
-            self.0.0
+            self.native.0
         }
         pub(crate) fn wait(&self) -> Result<()> {
-            match unsafe { WaitForSingleObject(self.0.0, INFINITE) } {
-                WAIT_OBJECT_0 => Ok(()),
+            let handles = [self.wake.0, self.native.0];
+            match unsafe {
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
+            } {
+                status if status < WAIT_OBJECT_0 + handles.len() as u32 => Ok(()),
                 _ => Err(Error::Unavailable),
             }
         }
         pub fn notify(&self) {
             // Shared ownership keeps this event valid through worker shutdown.
             unsafe {
-                SetEvent(self.0.0);
+                SetEvent(self.wake.0);
             }
         }
     }

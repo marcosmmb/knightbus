@@ -91,7 +91,9 @@ fn pipe(transfer: &Transfer) -> usize {
 }
 
 mod control;
+mod group;
 use control::Change;
+pub use group::Group;
 
 fn endpoint_bit(address: u8) -> u32 {
     let pipe = if address & usb::ENDPOINT_NUMBER_MASK == 0 {
@@ -295,7 +297,9 @@ impl<D: Driver, F: FnOnce() -> Result<D> + Send + 'static> ExporterBackend for B
                 .spawn(move || worker(shared, factory, device))
                 .is_err()
             {
-                self.lock().state = State::Failed(Error::Unavailable);
+                let mut mailbox = self.lock();
+                mailbox.state = State::Failed(Error::Unavailable);
+                mailbox.gone = true;
             }
         }
         match self.lock().state {
@@ -407,7 +411,12 @@ fn worker<D: Driver>(
     let mut driver = match factory() {
         Ok(d) => d,
         Err(e) => {
-            shared.mailbox.lock().unwrap().state = State::Failed(e);
+            let mut mailbox = shared.mailbox.lock().unwrap();
+            mailbox.state = State::Failed(e);
+            // The factory is single-use. Retire this inventory generation so a
+            // second session cannot reuse a failed native owner.
+            mailbox.gone = true;
+            drop(mailbox);
             shared.notify_host();
             return;
         }
@@ -450,7 +459,10 @@ impl<D: Driver> Worker<D> {
                     // Publish retirement only after native objects and their memory
                     // reservations have actually been dropped.
                     drop(self.driver);
-                    self.shared.mailbox.lock().unwrap().state = State::Retired;
+                    let mut mailbox = self.shared.mailbox.lock().unwrap();
+                    mailbox.state = State::Retired;
+                    mailbox.gone = true;
+                    drop(mailbox);
                     self.shared.notify_host();
                     return;
                 }
@@ -785,17 +797,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sixty_four_immediate_completions_drain_without_inter_request_waits() {
-        let budget = Budget::new(ResourceLimits {
-            bytes: 4 * 1024 * 1024,
-            requests: 64,
-        });
+    fn test_device() -> Device {
         let descriptor = [18, 1, 0, 2, 0, 0, 0, 64, 9, 0x12, 1, 0, 0, 1, 0, 0, 0, 1];
         let config = vec![
             9, 2, 25, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 64, 0, 0,
         ];
-        let device = crate::descriptors::device(
+        crate::descriptors::device(
             DeviceKey {
                 id: DeviceId(1),
                 generation: 1,
@@ -810,7 +817,46 @@ mod tests {
             &[config],
             1,
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_native_open_retires_the_generation_without_quarantining_it() {
+        use crate::ExporterBackend;
+        let budget = Budget::new(ResourceLimits {
+            bytes: 4 * 1024 * 1024,
+            requests: 64,
+        });
+        let device = test_device();
+        let mut backend = Backend::new(device.clone(), &budget, || {
+            Err::<Immediate, _>(Error::Denied)
+        })
         .unwrap();
+        let session = SessionId {
+            epoch: 1,
+            serial: 1,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Poll::Ready(result) = backend.claim(session, &device) {
+                assert_eq!(result, Err(Error::Denied));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(backend.release(session, device.key), Poll::Ready(Ok(())));
+        assert_eq!(backend.poll_removed(), Some(device.key));
+        assert_eq!(backend.poll_removed(), None);
+    }
+
+    #[test]
+    fn sixty_four_immediate_completions_drain_without_inter_request_waits() {
+        let budget = Budget::new(ResourceLimits {
+            bytes: 4 * 1024 * 1024,
+            requests: 64,
+        });
+        let device = test_device();
         let factory = || {
             Ok(Immediate {
                 pending: None,

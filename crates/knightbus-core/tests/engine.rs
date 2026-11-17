@@ -278,9 +278,9 @@ fn shared_control_suite_through_both_hosts() {
             Err(knightbus_core::Error::Deadline)
         ]
     );
-    assert!(ControlConnection::new(&mut direct, USER, 2).is_err());
-    assert!(IpcControl::new(&mut service, USER, true, 7, 2).is_err());
-    assert!(IpcControl::new(&mut service, USER, false, 7, 1).is_err());
+    assert!(ControlConnection::new(&mut direct, USER, CONTROL_VERSION + 1).is_err());
+    assert!(IpcControl::new(&mut service, USER, true, 7, CONTROL_VERSION + 1).is_err());
+    assert!(IpcControl::new(&mut service, USER, false, 7, CONTROL_VERSION).is_err());
 }
 
 #[test]
@@ -291,9 +291,9 @@ fn lifecycle_event_and_shutdown_parity() {
         let id;
         {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
-                Box::new(IpcControl::new(&mut e, USER, true, 7, 1).unwrap())
+                Box::new(IpcControl::new(&mut e, USER, true, 7, CONTROL_VERSION).unwrap())
             } else {
-                Box::new(ControlConnection::new(&mut e, USER, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, USER, CONTROL_VERSION).unwrap())
             };
             let Reply::Subscription(sub) = c.call(Command::Subscribe, END).unwrap() else {
                 panic!()
@@ -324,9 +324,9 @@ fn lifecycle_event_and_shutdown_parity() {
         assert_eq!(status(&mut e, id).state, SessionState::Active);
         {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
-                Box::new(IpcControl::new(&mut e, ADMIN, true, 7, 1).unwrap())
+                Box::new(IpcControl::new(&mut e, ADMIN, true, 7, CONTROL_VERSION).unwrap())
             } else {
-                Box::new(ControlConnection::new(&mut e, ADMIN, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, ADMIN, CONTROL_VERSION).unwrap())
             };
             c.call(Command::Shutdown, END).unwrap();
         }
@@ -743,10 +743,10 @@ fn events_overflow_are_bounded_and_subscription_owners_are_checked() {
 #[test]
 fn ipc_request_ids_cancellation_deadlines_access_and_restart() {
     let (mut e, _, time) = fixture(Config::default());
-    let mut service = Service::connect(&mut e, USER, true, 7, 1, 1).unwrap();
+    let mut service = Service::connect(&mut e, USER, true, 7, CONTROL_VERSION, 1).unwrap();
     let frame = |id, deadline| {
         encode_request(&Request {
-            version: 1,
+            version: CONTROL_VERSION,
             id,
             deadline,
             command: Command::List,
@@ -822,7 +822,7 @@ fn ipc_framing_checks_all_truncations_tags_counts_and_trailing_bytes() {
     ];
     for command in commands {
         let r = Request {
-            version: 1,
+            version: CONTROL_VERSION,
             id: u64::MAX,
             deadline: END,
             command,
@@ -841,7 +841,7 @@ fn ipc_framing_checks_all_truncations_tags_counts_and_trailing_bytes() {
     }
     assert!(decode_request(&vec![0; 8193]).is_err());
     let r = Request {
-        version: 1,
+        version: CONTROL_VERSION,
         id: 1,
         deadline: END,
         command: Command::Attach(vec![KEY; 257]),
@@ -939,8 +939,14 @@ fn response_frames_preserve_errors_sessions_events_and_wide_ids() {
     let mut results = vec![
         Ok(Reply::Done),
         Ok(Reply::Devices(vec![DeviceInfo {
+            shared: false,
+            name: None,
             key: KEY,
             busy: true,
+            vendor: 0x046d,
+            product: 0xc215,
+            speed: 2,
+            class: 0,
         }])),
         Ok(Reply::Subscription(u64::MAX)),
         Ok(Reply::Event(None)),
@@ -1200,9 +1206,9 @@ fn host_drop_retires_events_and_does_not_release_engine_owned_leases() {
         let baseline = e.budget().usage();
         {
             let mut c: Box<dyn KnightBusControl + '_> = if ipc {
-                Box::new(IpcControl::new(&mut e, USER, true, 7, 1).unwrap())
+                Box::new(IpcControl::new(&mut e, USER, true, 7, CONTROL_VERSION).unwrap())
             } else {
-                Box::new(ControlConnection::new(&mut e, USER, 1).unwrap())
+                Box::new(ControlConnection::new(&mut e, USER, CONTROL_VERSION).unwrap())
             };
             c.call(Command::Subscribe, END).unwrap();
         }
@@ -1388,9 +1394,9 @@ fn subscription_quotas_span_connections_and_admin_queue_survives_full_data_budge
         };
         let adapter = |target, caller| -> Box<dyn KnightBusControl + '_> {
             if ipc {
-                Box::new(IpcControl::new(target, caller, true, 7, 1).unwrap())
+                Box::new(IpcControl::new(target, caller, true, 7, CONTROL_VERSION).unwrap())
             } else {
-                Box::new(ControlConnection::new(target, caller, 1).unwrap())
+                Box::new(ControlConnection::new(target, caller, CONTROL_VERSION).unwrap())
             }
         };
         let mut first = adapter(&mut a, USER);
@@ -1903,4 +1909,22 @@ fn unshare_notifies_only_administrators_and_former_grantees() {
         e.execute(former, Command::Poll(affected), END),
         Ok(Reply::Event(None))
     );
+}
+
+#[test]
+fn sharing_state_tracks_grants_and_can_be_enabled_again() {
+    let (mut engine, _, _) = fixture(Config::default());
+    let shared = |engine: &mut TestEngine| {
+        let Reply::Devices(devices) = engine.execute(ADMIN, Command::List, END).unwrap() else {
+            panic!()
+        };
+        devices.iter().find(|d| d.key == KEY).unwrap().shared
+    };
+    assert!(!shared(&mut engine));
+    grant(&mut engine, KEY, PEER);
+    assert!(shared(&mut engine));
+    engine.execute(ADMIN, Command::Unshare(KEY), END).unwrap();
+    assert!(!shared(&mut engine));
+    grant(&mut engine, KEY, PEER);
+    assert!(shared(&mut engine));
 }

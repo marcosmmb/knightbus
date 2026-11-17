@@ -10,11 +10,10 @@ members = [
     "crates/knightbus-core",
     "crates/knightbus-ipc",
     "crates/knightbus-transport",
-    "crates/knightbus-windows-protocol",
     "crates/importers/knightbus-windows-importer",
     "crates/exporters/knightbus-macos-exporter",
 ]
-exclude = ["crates/knightbus-usbip/tests/fuzz", "drivers/windows"]
+exclude = ["applications/knightbus-desktop", "crates/knightbus-usbip/tests/fuzz"]
 resolver = "3"
 
 [workspace.package]

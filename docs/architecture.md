@@ -43,13 +43,10 @@ Paths below are relative to the repository root. Crates live under `crates/`.
 | [`knightbus-ipc`](../crates/knightbus-ipc/src/lib.rs) | OS-authenticated local management, protected host storage and the core control framing |
 | [`exporters/knightbus-macos-exporter`](../crates/exporters/knightbus-macos-exporter/src/lib.rs) | IOUSBHost discovery, capture, transfers and native callbacks |
 | [`importers/knightbus-windows-importer`](../crates/importers/knightbus-windows-importer/src/lib.rs) | Virtual controller ownership, driver channel encoding and Windows notifications |
-| [`knightbus-windows-protocol`](../crates/knightbus-windows-protocol/src/lib.rs) | Allocation-free messages and validation shared by the Windows importer and kernel driver |
-| [`drivers/windows`](../drivers/windows/src/lib.rs) | UdeCx virtual USB controller, native requests and kernel resource ownership |
 
 The core has no sockets or OS USB bindings. The transport uses the core and wire
 codec. Native adapters implement core traits; the shared crates do not depend on
-an OS adapter. The Windows kernel driver builds separately because it needs the
-WDK and a different Rust toolchain and build profile.
+an OS adapter. The upstream Windows driver ships as a separate signed binary dependency.
 
 ## Shared workers and native ownership
 
@@ -71,19 +68,47 @@ instead of freeing memory the OS may still access.
 ## Native adapters
 
 On macOS, the exporter uses IOUSBHost to access the physical device. On Windows,
-the importer communicates with the KnightBus UdeCx driver, which presents a virtual
-device to Windows USB class drivers. The driver validates its private channel
-independently using `knightbus-windows-protocol`; it does not parse USB/IP traffic.
+the importer opens the signed usbip-win2 UDE controller. Each attachment owns a
+private loopback socket with a random, one-use bus identifier. The adapter translates
+USB/IP requests into the shared worker contract, preserving sequence IDs,
+cancellation and replies. The LAN connection and access policy remain in KnightBus:
+the driver's unencrypted TCP connection never leaves the local machine.
+Admission checks USB 2 and USB 3 capacity separately and is serialized across
+KnightBus processes. The pinned driver also checks exhaustion under its kernel lock.
 
-The importer accepts one selected configuration. Bulk and interrupt endpoints
-keep one outstanding request each; ISO endpoints can queue several requests within
-the same device-wide memory limit. Windows limits descriptor trees to 4 KiB and
-transfers to 1 MiB, and does not support remote wake or bulk streams.
+The macOS desktop app requests removable-drive consent before sending a share
+request to its root helper. The permission check uses the selected USB drive's
+OS-reported raw device with a read-only open; it reads no drive data. The helper
+checks access again before registering the device. Administrator setup installs
+a small root-owned setuid launcher with one fixed operation: start the installed
+daemon for the installing account. It rejects other accounts, arbitrary arguments
+and writable executables, and clears inherited environment and file descriptors.
+The app invokes this launcher directly, retaining its user-session identity for
+removable-drive consent. The daemon itself is not setuid. The control socket still
+verifies the root server and the delegated local account. A system launch daemon
+has no logged-in user session and cannot request this consent on the app's behalf.
+Closing the UI leaves the helper running. After a reboot or full quit, start the
+helper from the app. Administrator authorization is needed for installation or repair.
 
-ISO packets keep their individual lengths and errors across USB/IP. The exporter
-queues physical transfers ASAP. Windows uses a local virtual frame clock and holds
-early replies until their scheduled frames finish; the two hosts do not share a
-USB clock. These timing buffers apply only to ISO transfers.
+The importer accepts one configuration, descriptor trees up to 4 KiB, transfers
+up to 1 MiB, and up to 1,024 ISO packets. Bulk and interrupt endpoints have one
+forwarded request per endpoint; ISO may use spare slots. Requests awaiting a slot
+have a separate bounded queue. When that queue fills, the adapter stops reading
+until completions free space, applying backpressure without detaching the device.
+These budgets cover KnightBus userspace, not the upstream kernel driver's allocations.
+
+The driver selects a virtual USB 2 or USB 3 port from the negotiated speed.
+SuperSpeed and physical SuperSpeedPlus use USB 3 ports; KnightBus preserves physical
+device descriptors, endpoint companions and BOS. This does not imply a 10 Gbit/s
+virtual link or network throughput. Remote wake, bulk streams and scheduled ISO are
+not supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
+Frame scheduling is handled by the upstream driver.
+
+A clean detach verifies the attachment's private location, removes its virtual
+device and stops reconnect attempts for that location. Pending control I/O retains
+its storage until completion or acknowledged cancellation. If retirement cannot
+be confirmed, the session is quarantined. Socket loss makes the driver retire the
+virtual device; KnightBus does not persist attachments in the driver's registry.
 
 Core also owns configuration changes, alternate-setting changes and halt recovery.
 It validates each target and drains only the affected requests. Native adapters

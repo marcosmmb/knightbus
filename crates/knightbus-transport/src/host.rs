@@ -17,9 +17,11 @@ use std::{
     task::{Wake, Waker},
     time::{Duration, Instant},
 };
-const MAX_CONNECTIONS: usize = 16;
+const MAX_CONNECTIONS: usize = 32;
+// Bound listener work independently from the number of active forwarding workers.
+const ACCEPT_BATCH: usize = 16;
 const MANAGEMENT_RESERVE: usize = 2;
-const MAX_LINKS_PER_PEER: usize = 4;
+const MAX_LINKS_PER_PEER: usize = MAX_PEER_CONTROL_LINKS;
 const HEARTBEAT: Duration = Duration::from_secs(3);
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
@@ -251,6 +253,20 @@ impl<B: ExporterBackend, C: Clock> Host<B, C> {
         self.record(AuditKind::Revoked, Some(peer), None);
         Ok(())
     }
+    /// Add trusted local inventory without replacing the host or active leases.
+    pub fn register_backend(
+        &self,
+        device: Device,
+        name: Option<String>,
+        install: impl FnOnce(&mut B) -> Result<()>,
+    ) -> Result<()> {
+        self.engine
+            .lock()
+            .map_err(|_| Error::Internal)?
+            .register_backend(device, name, install)?;
+        self.wakes.signal();
+        Ok(())
+    }
     /// Execute locally authenticated management. Callers come from OS credentials,
     /// never from a network message. Both hosts retain the same core contract.
     pub fn execute(&self, caller: Caller, command: Command, deadline: u64) -> Result<Reply> {
@@ -374,6 +390,10 @@ impl<B: ExporterBackend, C: Clock> Host<B, C> {
         subscription: u64,
     ) -> Result<()> {
         wire.send(&Message::Hello(ticket).encode()?)?;
+        let Reply::Devices(devices) = self.execute(caller, Command::List, u64::MAX)? else {
+            return Err(Error::Internal);
+        };
+        wire.send(&Message::Inventory(devices).encode()?)?;
         let mut sequence = 0u64;
         let mut rate = Rate::new();
         loop {
@@ -565,7 +585,7 @@ impl Listeners {
             if !self.ready[token.0] {
                 continue;
             }
-            for _ in 0..MAX_CONNECTIONS {
+            for _ in 0..ACCEPT_BATCH {
                 let (stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -586,6 +606,7 @@ impl Listeners {
 /// An importer control link. A worker sends heartbeats and receives bounded events;
 /// dropping it closes the link and causes the exporter to drain its device lease.
 pub struct Remote {
+    inventory: Vec<DeviceInfo>,
     ticket: Option<[u8; TICKET_BYTES]>,
     alive: Arc<Lease>,
     events: Arc<Mutex<std::collections::VecDeque<Event>>>,
@@ -625,6 +646,12 @@ impl Remote {
         let Message::Hello(ticket) = Message::decode(&hello)? else {
             return Err(Error::Version);
         };
+        let metadata = wire
+            .receive_until(TIMEOUT, operation)?
+            .ok_or(Error::Deadline)?;
+        let Message::Inventory(inventory) = Message::decode(&metadata)? else {
+            return Err(Error::Version);
+        };
         let alive = Arc::new(Lease::new());
         let events = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let worker_alive = alive.clone();
@@ -637,6 +664,7 @@ impl Remote {
             })
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
+            inventory,
             ticket: Some(ticket),
             alive,
             events,
@@ -702,6 +730,10 @@ impl Remote {
             queue.push_back(event);
         }
         Ok(())
+    }
+    /// Grant-filtered display metadata captured during this authenticated handshake.
+    pub fn inventory(&self) -> &[DeviceInfo] {
+        &self.inventory
     }
     /// Bind one new USB stream to this link using its one-use capability.
     pub fn usb(&mut self, stream: TcpStream, identity: &Identity, peers: &Peers) -> Result<Stream> {
@@ -789,13 +821,13 @@ mod tests {
         let control = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = usb.local_addr().unwrap();
         let mut listeners = Listeners::new(usb, control).unwrap();
-        let clients: Vec<_> = (0..MAX_CONNECTIONS + 1)
+        let clients: Vec<_> = (0..ACCEPT_BATCH + 1)
             .map(|_| TcpStream::connect(address).unwrap())
             .collect();
         let mut rate = Rate::new();
         assert_eq!(
             listeners.accept(MAX_CONNECTIONS, &mut rate).unwrap().len(),
-            MAX_CONNECTIONS
+            ACCEPT_BATCH
         );
         // No new connection arrives to produce another edge.
         assert_eq!(
@@ -859,7 +891,13 @@ mod tests {
             .map(|_| TcpStream::connect(address).unwrap())
             .collect();
         let capacity = MAX_CONNECTIONS - MANAGEMENT_RESERVE;
-        let accepted = listeners.accept(capacity, &mut Rate::new()).unwrap();
+        let mut rate = Rate::new();
+        let mut accepted = listeners.accept(capacity, &mut rate).unwrap();
+        accepted.extend(
+            listeners
+                .accept(capacity - accepted.len(), &mut rate)
+                .unwrap(),
+        );
         assert_eq!(accepted.len(), capacity);
         assert!(accepted.iter().all(|(channel, _)| *channel == Channel::Usb));
         drop(clients);

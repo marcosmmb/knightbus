@@ -46,7 +46,7 @@ impl Default for Config {
             grants: 1024,
             batch: 16,
             subscriptions: 32,
-            subscriptions_per_peer: 4,
+            subscriptions_per_peer: MAX_PEER_CONTROL_LINKS,
             admin_subscriptions: 1,
             events: 64,
             lease_ms: 20_000,
@@ -55,6 +55,7 @@ impl Default for Config {
     }
 }
 struct Inventory {
+    name: Option<String>,
     device: Device,
     present: bool,
     _credit: Credit,
@@ -185,6 +186,23 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
     /// Register trusted backend inventory after descriptor validation. Replug
     /// requires a greater generation and clears grants (explicit reauthorization).
     pub fn register(&mut self, device: Device) -> Result<()> {
+        self.register_backend(device, None, |_| Ok(()))
+    }
+    /// Register named inventory and install its backend in one engine mutation.
+    /// The installer runs after validation and reservation; errors must leave the
+    /// backend unchanged. Existing sessions and grants are preserved.
+    pub fn register_backend(
+        &mut self,
+        device: Device,
+        name: Option<String>,
+        install: impl FnOnce(&mut B) -> Result<()>,
+    ) -> Result<()> {
+        if name
+            .as_ref()
+            .is_some_and(|n| n.len() > crate::host::MAX_DEVICE_NAME_BYTES)
+        {
+            return Err(Error::Invalid);
+        }
         if self.stopped {
             return Err(Error::State);
         }
@@ -210,14 +228,17 @@ impl<B: ExporterBackend, C: Clock> Engine<B, C> {
             device
                 .storage_bytes()?
                 .checked_add(std::mem::size_of::<Inventory>())
+                .and_then(|bytes| bytes.checked_add(name.as_ref().map_or(0, String::capacity)))
                 .ok_or(Error::Exhausted)?,
             0,
         )?;
+        install(&mut self.backend)?;
         self.grants.retain(|(id, _), _| *id != device.key.id);
         let device_id = device.key.id;
         self.inventory.insert(
             device.key.id,
             Inventory {
+                name,
                 device,
                 present: true,
                 _credit: credit,
@@ -1010,6 +1031,11 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
             return Err(Error::Deadline);
         }
         match command {
+            Command::Host(_) => Err(if caller.administrator {
+                Error::Unsupported
+            } else {
+                Error::Denied
+            }),
             Command::Info => Ok(Reply::Info {
                 version: CONTROL_VERSION,
                 epoch: self.epoch,
@@ -1054,8 +1080,14 @@ impl<B: ExporterBackend, C: Clock> ControlTarget for Engine<B, C> {
                     .values()
                     .filter(|d| self.allowed(caller, d.device.key))
                     .map(|d| DeviceInfo {
+                        name: d.name.clone(),
                         key: d.device.key,
                         busy: self.busy(d.device.key),
+                        shared: self.grants.keys().any(|(id, _)| *id == d.device.key.id),
+                        vendor: d.device.wire.vendor_id,
+                        product: d.device.wire.product_id,
+                        speed: d.device.wire.speed,
+                        class: d.device.wire.class,
                     })
                     .collect(),
             )),

@@ -1,19 +1,16 @@
 //! Shared operator commands. Parsing and presentation only; all policy and native
 //! lifecycle decisions remain in the control target.
 use crate::{
-    Client,
     config::{Configuration, number},
-    policy::{ATTACH_TIMEOUT_MS, CONTROL_TIMEOUT_MS},
+    policy::{ATTACH_TIMEOUT_MS, CONTROL_POLL_INTERVAL, CONTROL_TIMEOUT_MS},
 };
 use knightbus_core::*;
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 const MAX_WATCH_SECONDS: u64 = 3_600;
-// Ten requests/second leaves room under the IPC limit for negotiation and queries.
-const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Command help for the unified KnightBus CLI.
-pub const HELP: &str = "Usage: knightbus COMMAND [ARGUMENTS]\n\nlocal-list | local-inspect REGISTRY_ID\nidentity STATE | fingerprint STATE | pair STATE CERT.der CONFIRMED_FINGERPRINT | unpair STATE FINGERPRINT\nmanage ENDPOINT info|list|sessions|inspect ID GENERATION|permissions ID GENERATION|share ID GENERATION PEER|deny ID GENERATION PEER|unshare ID GENERATION|attach ID GENERATION|status EPOCH SERIAL|detach EPOCH SERIAL|forget EPOCH SERIAL|watch SECONDS|diagnostics OUTPUT|shutdown\ndiscover IMPORTER_CONFIG | browse SECONDS (mdns feature)\nIDs accept decimal or 0x-prefixed hex.";
+pub const HELP: &str = "Usage: knightbus COMMAND [ARGUMENTS]\n\nlocal-list | local-inspect REGISTRY_ID\nidentity STATE | fingerprint STATE | pair STATE CERT.der CONFIRMED_FINGERPRINT | unpair STATE FINGERPRINT\nmanage ENDPOINT info|list|sessions|inspect ID GENERATION|permissions ID GENERATION|share ID GENERATION PEER|deny ID GENERATION PEER|unshare ID GENERATION|attach ID GENERATION|status EPOCH SERIAL|detach EPOCH SERIAL|forget EPOCH SERIAL|watch SECONDS|diagnostics OUTPUT|shutdown\ndiscover IMPORTER_CONFIG | browse SECONDS (mdns feature)\nHost setup (manage ENDPOINT): host-status | physical | physical-inspect GENERATION | enroll CERT_HEX FINGERPRINT | revoke FINGERPRINT | clear | browse\nIDs accept decimal or 0x-prefixed hex.";
 /// Parse one management operation before opening an endpoint.
 pub fn command(args: &[String]) -> Result<Command> {
     let key = |id: &str, generation: &str| -> Result<DeviceKey> {
@@ -29,6 +26,20 @@ pub fn command(args: &[String]) -> Result<Command> {
         })
     };
     Ok(match args {
+        [c] if c == "host-status" => Command::Host(host::Request::Status),
+        [c] if c == "physical" => Command::Host(host::Request::Physical),
+        [c] if c == "clear" => Command::Host(host::Request::Clear),
+        [c] if c == "browse" => Command::Host(host::Request::Browse),
+        [c, registry] if c == "physical-inspect" => Command::Host(host::Request::Inspect {
+            registry: registry.clone(),
+        }),
+        [c, fingerprint] if c == "revoke" => Command::Host(host::Request::Revoke {
+            fingerprint: fingerprint.clone(),
+        }),
+        [c, certificate, fingerprint] if c == "enroll" => Command::Host(host::Request::Pair {
+            certificate: certificate.clone(),
+            fingerprint: fingerprint.clone(),
+        }),
         [c] if c == "info" => Command::Info,
         [c] if c == "list" => Command::List,
         [c] if c == "sessions" => Command::Sessions,
@@ -109,7 +120,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
                 if !(1..=MAX_WATCH_SECONDS).contains(&seconds) {
                     return Err(Error::Invalid.into());
                 }
-                let mut client = Client::connect(Path::new(endpoint))?;
+                let mut client = crate::connect_local(Path::new(endpoint))?;
                 let Reply::Subscription(id) =
                     client.request(Command::Subscribe, CONTROL_TIMEOUT_MS)?
                 else {
@@ -129,7 +140,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
                 let [output] = rest else {
                     return Err(Error::Invalid.into());
                 };
-                let mut client = Client::connect(Path::new(endpoint))?;
+                let mut client = crate::connect_local(Path::new(endpoint))?;
                 let mut report = format!(
                     "KnightBus metadata diagnostics\nplatform={} arch={}\n",
                     std::env::consts::OS,
@@ -182,7 +193,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), Box<dyn std::error::Error
                 } else {
                     CONTROL_TIMEOUT_MS
                 };
-                let mut client = Client::connect(Path::new(endpoint))?;
+                let mut client = crate::connect_local(Path::new(endpoint))?;
                 println!("{}", format_reply(&client.request(command, timeout)?));
             }
         }
@@ -211,6 +222,9 @@ pub fn format_reply(reply: &Reply) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     match reply {
+        Reply::Host(value) => {
+            let _ = writeln!(out, "{value:?}");
+        }
         Reply::Info {
             version,
             epoch,
@@ -223,8 +237,8 @@ pub fn format_reply(reply: &Reply) -> String {
             for d in devices {
                 let _ = writeln!(
                     out,
-                    "id=0x{:x} generation={} busy={}",
-                    d.key.id.0, d.key.generation, d.busy
+                    "id=0x{:x} generation={} busy={} vid={:04x} pid={:04x} speed={} class={:02x}",
+                    d.key.id.0, d.key.generation, d.busy, d.vendor, d.product, d.speed, d.class
                 );
             }
         }

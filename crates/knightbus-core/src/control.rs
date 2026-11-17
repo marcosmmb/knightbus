@@ -1,12 +1,18 @@
 use crate::{Caller, DeviceKey, Error, PeerId, Result, Session, SessionId};
 
 /// Major version of the control contract (independent of USB/IP).
-pub const CONTROL_VERSION: u16 = 1;
+pub const CONTROL_VERSION: u16 = 4;
 /// Maximum peers granted one device; fits a complete control response.
 pub const MAX_DEVICE_GRANTS: usize = 255;
+/// Maximum simultaneous attachments admitted by one importer host.
+pub const MAX_IMPORT_ATTACHMENTS: usize = 8;
+/// Each attachment owns a control link; keep one extra for inventory refresh.
+pub const MAX_PEER_CONTROL_LINKS: usize = MAX_IMPORT_ATTACHMENTS + 1;
 /// Host-neutral management request. Contains no USB payloads or credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Local host setup; remote peers never receive administrative authority.
+    Host(crate::host::Request),
     /// Negotiate the contract and learn the host's monotonic clock and epoch.
     Info,
     /// Authorized descriptor topology, without claiming the device.
@@ -50,14 +56,28 @@ pub enum Command {
 /// Filtered discovery entry; stable IDs are selectors, not credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
+    /// Optional bounded product label; display only, never authorization.
+    pub name: Option<String>,
     /// Current physical generation.
     pub key: DeviceKey,
     /// Whether an exclusive lease currently owns this device.
     pub busy: bool,
+    /// Whether this generation currently has any access grants.
+    pub shared: bool,
+    /// Descriptor vendor ID; display only, never authorization.
+    pub vendor: u16,
+    /// Descriptor product ID; display only, never authorization.
+    pub product: u16,
+    /// Standard USB/IP speed value.
+    pub speed: u32,
+    /// Device class; zero means class information is per interface.
+    pub class: u8,
 }
 /// Control result, identical in direct and service hosts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    /// Host setup metadata; never includes private keys.
+    Host(crate::host::Reply),
     /// Negotiation result; clocks are local to this host epoch.
     Info {
         /// Control schema version.
