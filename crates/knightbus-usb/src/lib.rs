@@ -201,6 +201,8 @@ pub const MAX_BOS: usize = u16::MAX as usize;
 pub const BOS_TYPE: u8 = 15;
 /// BOS header size.
 pub const BOS_HEADER: usize = 5;
+/// Offset of wTotalLength in the BOS header.
+pub const BOS_TOTAL_LENGTH: usize = 2;
 /// All nondefault USB endpoint addresses (15 in each direction).
 pub const MAX_ENDPOINTS: usize = 30;
 /// Maximum interface/alternate pairs in a configuration.

@@ -151,6 +151,7 @@ pub struct Controller {
     handle: HANDLE,
     budget: Option<Budget>,
     reader: Option<Io>,
+    read_frame: ReadFrame,
     wake: Option<Arc<DriverWake>>,
     failed: bool,
     attached: bool,
@@ -164,6 +165,7 @@ impl Controller {
             handle: INVALID_HANDLE_VALUE,
             budget: None,
             reader: None,
+            read_frame: ReadFrame::default(),
             wake: None,
             failed: false,
             attached: false,
@@ -230,12 +232,13 @@ impl Controller {
             return Ok(());
         }
         let mut count = 0;
+        let remaining = self.read_frame.remaining();
         // SAFETY: buffer and OVERLAPPED are heap-owned until completion/cancel.
         let success = unsafe {
             ReadFile(
                 self.handle,
-                io.buffer.as_mut_slice().as_mut_ptr(),
-                MAX_MESSAGE as u32,
+                io.buffer.as_mut_slice()[remaining.clone()].as_mut_ptr(),
+                remaining.len() as u32,
                 &mut count,
                 &mut *io.overlapped,
             )
@@ -252,6 +255,7 @@ impl Driver for Controller {
         if self.handle != INVALID_HANDLE_VALUE {
             return Err(Error::State);
         }
+        self.read_frame = ReadFrame::default();
         let plug = channel::plugin(descriptors, budget)?;
         self.budget = Some(budget.clone());
         self.handle = open()?;
@@ -285,12 +289,15 @@ impl Driver for Controller {
         let Some(count) = io.poll(self.handle, 0)? else {
             return Ok(0);
         };
-        if count == 0 || count > output.len() || count > io.buffer.as_slice().len() {
-            return Err(Error::Invalid);
+        let complete = self.read_frame.advance(io.buffer.as_slice(), count)?;
+        if let Some(length) = complete {
+            output
+                .get_mut(..length)
+                .ok_or(Error::Invalid)?
+                .copy_from_slice(&io.buffer.as_slice()[..length]);
         }
-        output[..count].copy_from_slice(&io.buffer.as_slice()[..count]);
         self.start_read()?;
-        Ok(count)
+        Ok(complete.unwrap_or(0))
     }
     fn write(&mut self, input: &[u8]) -> Result<()> {
         self.transaction(None, input, 0).map(|_| ())

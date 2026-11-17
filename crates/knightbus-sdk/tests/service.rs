@@ -210,6 +210,7 @@ fn host_frames_fit_the_existing_credential_and_pairing_limits() {
             pin_pairing: true,
             process_id: 1,
             capture_ready: false,
+            storage_consent_ready: false,
             driver: None,
             role: "idle".into(),
             selection: String::new(),

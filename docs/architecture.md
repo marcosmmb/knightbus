@@ -74,6 +74,20 @@ shared worker contract, preserving native sequence IDs, cancellation and replies
 The encrypted network connection and access policy remain entirely in KnightBus.
 Shutdown targets only the device associated with that handle.
 
+The macOS desktop app requests removable-drive consent before sending a share
+request to its root helper. The permission check uses the selected USB drive's
+OS-reported raw device with a read-only open; it reads no drive data. The helper
+checks access again before registering the device. Administrator setup installs
+a small root-owned setuid launcher with one fixed operation: start the installed
+daemon for the installing account. It rejects other accounts, arbitrary arguments
+and writable executables, and clears inherited environment and file descriptors.
+The app invokes this launcher directly, retaining its user-session identity for
+removable-drive consent. The daemon itself is not setuid. The control socket still
+verifies the root server and the delegated local account. A system launch daemon
+has no logged-in user session and cannot request this consent on the app's behalf.
+Closing the UI leaves the helper running. After a reboot or full quit, start the
+helper from the app. Administrator authorization is needed for installation or repair.
+
 The importer accepts one configuration, descriptor trees up to 4 KiB, transfers
 up to 1 MiB, and up to 1,024 ISO packets. Bulk and interrupt endpoints have one
 forwarded request per endpoint; ISO may use spare slots. Requests awaiting a slot
@@ -81,11 +95,14 @@ have a separate bounded queue. Exhaustion terminates the attachment rather than
 growing the queue indefinitely. These budgets cover KnightBus userspace, not the
 upstream kernel driver’s allocations.
 
-The pinned package cannot accept BOS descriptors, so the Windows path currently
-excludes SuperSpeed. It also infers speed from bcdUSB. KnightBus adapts only the
-virtual descriptor revision to the negotiated link speed, including forwarded
-device-descriptor replies; the physical descriptors and device identity stay intact. Remote wake, bulk streams and scheduled ISO are not
-supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
+The pinned driver selects its virtual port from exact bcdUSB revisions. KnightBus
+publishes SuperSpeed and physical SuperSpeedPlus devices on its USB 3 port using
+revision 3.0, including forwarded device-descriptor replies. The physical link,
+identity, endpoint companions and BOS remain intact; Windows fetches BOS through
+forwarded control requests. This does not imply a 10 Gbit/s virtual link or network
+throughput. Native reads collect the header and payload separately to accommodate
+the driver's OUT-transfer length reporting. Remote wake, bulk streams and scheduled
+ISO are not supported. ISO uses ASAP scheduling and preserves packet lengths and errors.
 Frame scheduling is handled by the upstream driver.
 
 A clean detach issues the upstream handle-scoped shutdown command and drains

@@ -2,7 +2,11 @@
 import hashlib
 import importlib.util
 import io
+import os
+import platform
+import subprocess
 import plistlib
+import re
 from pathlib import Path
 import tarfile
 import tempfile
@@ -23,7 +27,7 @@ class PackageTests(unittest.TestCase):
             target = root / "build"
             release = target / "release"
             release.mkdir(parents=True)
-            for name in ("knightbus", "knightbusd", "knightbus-desktop"):
+            for name in ("knightbus", "knightbusd", "knightbus-desktop", "knightbus-launcher"):
                 (release / name).write_bytes(name.encode())
             output = root / "package"
             args = ["package.py", "--skip-build", "--output", str(output), "--target-dir", str(target)]
@@ -31,8 +35,35 @@ class PackageTests(unittest.TestCase):
                 package.main()
             contents = output / "KnightBus.app" / "Contents"
             self.assertEqual((contents / "MacOS" / "knightbusd").read_bytes(), b"knightbusd")
+            self.assertEqual((contents / "MacOS" / "knightbus-launcher").read_bytes(), b"knightbus-launcher")
+            self.assertEqual((output / "knightbus-launcher").read_bytes(), b"knightbus-launcher")
             info = plistlib.loads((contents / "Info.plist").read_bytes())
+            self.assertIn("NSRemovableVolumesUsageDescription", info)
             self.assertTrue((contents / "Resources" / info["CFBundleIconFile"]).is_file())
+
+    def test_privileged_launcher_and_installer_agree_on_fixed_paths(self):
+        paths = dict(re.findall(r'^pub const (\w+): &str = "([^"]+)";',
+                               (ROOT / "crates/knightbus-sdk/src/macos.rs").read_text(), re.MULTILINE))
+        launcher = dict(re.findall(r'^#define (\w+) "([^"]+)"',
+                                  (ROOT / "applications/knightbusd/src/launcher.c").read_text(), re.MULTILINE))
+        for native, shared in (("DAEMON_PATH", "DAEMON_FILE"), ("OWNER_PATH", "OWNER_FILE"),
+                               ("STATE_PATH", "IDENTITY_DIR"), ("LOG_PATH", "LOG_FILE"),
+                               ("ENDPOINT_PATH", "CONTROL_ENDPOINT")):
+            self.assertEqual(launcher[native], paths[shared], native)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS launcher")
+    def test_launcher_rejects_unprivileged_execution_and_extra_arguments(self):
+        no_permission, usage_error = 77, 64  # sysexits.h
+        with tempfile.TemporaryDirectory() as temporary:
+            launcher = str(Path(temporary) / "knightbus-launcher")
+            subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", f"-mmacosx-version-min={package.MACOS_MINIMUM}",
+                            str(ROOT / "applications/knightbusd/src/launcher.c"),
+                            "-lbsm", "-o", launcher], check=True)
+            for arguments in (["--unknown"], ["--check", "extra"]):
+                self.assertEqual(subprocess.run([launcher, *arguments]).returncode, usage_error)
+            if os.geteuid() != 0:
+                for arguments in ([], ["--check"]):
+                    self.assertEqual(subprocess.run([launcher, *arguments]).returncode, no_permission)
 
     def test_pinned_files_and_source_are_required_before_signature_verification(self):
         with tempfile.TemporaryDirectory() as temporary:

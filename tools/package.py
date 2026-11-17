@@ -44,19 +44,25 @@ def main():
     if not args.skip_build:
         run("cargo", "build", "--release", "--locked", "-p", "knightbus", "-p", "knightbusd", "--features", "knightbus-sdk/mdns", env=env)
         run("cargo", "build", "--release", "--locked", "--manifest-path", "applications/knightbus-desktop/Cargo.toml", env=env)
+        if system == "Darwin":
+            run("clang", "-Wall", "-Wextra", "-Werror", "-O2", f"-mmacosx-version-min={MACOS_MINIMUM}", "applications/knightbusd/src/launcher.c", "-lbsm", "-o", str(target / "release/knightbus-launcher"))
     output.mkdir(parents=True)
     release = target / "release"
     suffix = ".exe" if system == "Windows" else ""
     for name in ("knightbus", "knightbusd"):
         shutil.copy2(release / (name + suffix), output)
     if system == "Darwin":
+        shutil.copy2(release / "knightbus-launcher", output)
         contents = output / "KnightBus.app" / "Contents"
         executable = contents / "MacOS"
         executable.mkdir(parents=True)
         shutil.copy2(release / "knightbus-desktop", executable)
         shutil.copy2(release / "knightbusd", executable)
+        shutil.copy2(release / "knightbus-launcher", executable)
+        run("codesign", "--force", "--sign", "-", str(executable / "knightbus-launcher"))
         run("codesign", "--force", "--sign", "-", str(executable / "knightbusd"))
         info = dict(CFBundleName="KnightBus", CFBundleDisplayName="KnightBus", CFBundleIdentifier="io.knightbus.desktop", CFBundleExecutable="knightbus-desktop", CFBundlePackageType="APPL", CFBundleIconFile="KnightBus.icns", CFBundleVersion=VERSION, CFBundleShortVersionString=VERSION, LSMinimumSystemVersion=MACOS_MINIMUM, NSHighResolutionCapable=True)
+        info.update(plistlib.loads((ROOT / "applications/knightbus-desktop/Info.plist").read_bytes()))
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))
         resources = contents / "Resources"
         resources.mkdir()
@@ -66,7 +72,7 @@ def main():
         run("xattr", "-cr", str(output / "KnightBus.app"))
         # Local integrity signature only. Distribution requires Developer ID/notarization.
         run("codesign", "--force", "--sign", "-", str(output / "KnightBus.app"))
-        for name in ("knightbus", "knightbusd"):
+        for name in ("knightbus", "knightbusd", "knightbus-launcher"):
             run("codesign", "--force", "--sign", "-", str(output / name))
     else:
         shutil.copy2(release / "knightbus-desktop.exe", output / "knightbus-desktop.exe")
@@ -77,9 +83,9 @@ def main():
             shutil.copytree(args.driver_package.resolve(), driver)
         else:
             windows_driver.prepare(driver, target / "upstream-driver")
-        for name in ("install-windows.ps1", "install-driver.ps1", "windows-installation.ps1", "uninstall-windows.ps1", "INSTALL.md"):
+        for name in ("install-windows.ps1", "install-driver.ps1", "windows-installation.ps1", "uninstall-windows.ps1"):
             shutil.copy2(ROOT / "tools/install" / name, output)
-    for source in ("LICENSE", "docs/desktop-manager.md", "docs/standalone.md", "docs/architecture.md"):
+    for source in ("LICENSE", "tools/install/INSTALL.md", "docs/standalone.md", "docs/architecture.md"):
         shutil.copy2(ROOT / source, output)
     def checksums():
         records = []

@@ -1,3 +1,31 @@
+# The constructor rewrites a SID to a short name, which can be ambiguous when
+# the account and computer have the same name. Restore the SID before registering.
+function New-KnightBusTaskPrincipal([string]$UserSid) {
+ $sid=([Security.Principal.SecurityIdentifier]$UserSid).Value
+ $principal=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest
+ $principal.UserId=$sid
+ return $principal
+}
+
+# Get-ScheduledTask may expose a short display name that Windows cannot resolve.
+# The exported task retains the registered principal, normally already a SID.
+function Get-KnightBusTaskOwnerSid([string]$TaskName, [string]$TaskPath) {
+ [xml]$definition=Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+ $namespaces=New-Object System.Xml.XmlNamespaceManager($definition.NameTable)
+ $namespaces.AddNamespace('task','http://schemas.microsoft.com/windows/2004/02/mit/task')
+ $principals=$definition.SelectNodes('/task:Task/task:Principals/task:Principal',$namespaces)
+ if ($principals.Count -ne 1) {throw 'Cannot verify the existing KnightBus task owner. The task was not changed.'}
+ $user=$principals[0].SelectSingleNode('task:UserId',$namespaces)
+ if (!$user -or [string]::IsNullOrWhiteSpace($user.InnerText)) {throw 'The existing KnightBus task has no user owner. The task was not changed.'}
+ $owner=$user.InnerText.Trim()
+ try {
+  if ($owner.StartsWith('S-1-')) {return ([Security.Principal.SecurityIdentifier]$owner).Value}
+  return ([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value
+ } catch {
+  throw 'Windows cannot resolve the account registered for the KnightBus task. Use the original Windows account or repair that task before retrying. The task was not changed.'
+ }
+}
+
 # Recognize only the dependency-only folder left by older uninstallers.
 function Test-RetainedDriverDirectory([string]$Install, [string]$PackageDriver) {
  $entries=@(Get-ChildItem -LiteralPath $Install -Force -ErrorAction Stop)

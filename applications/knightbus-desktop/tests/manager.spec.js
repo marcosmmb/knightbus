@@ -8,7 +8,7 @@ async function fixture(page,role='exporter') {
       const f=window.fixture;
       if(command==='defaults') return {endpoint:'/test/control',localEndpoint:'/test/local-control',name:'Test Mac',address:'192.168.1.42'};
       if(command==='quit_service') { f.quitCalls=(f.quitCalls||0)+1; if(f.quitFailure) throw f.quitFailure; f.quit=true; return; }
-      if(command==='enable_capture') { f.captureCalls=(f.captureCalls||0)+1; if(f.captureFailure) throw f.captureFailure; f.captureReady=true; f.role='idle'; return '/test/control'; }
+      if(command==='enable_capture') { f.captureCalls=(f.captureCalls||0)+1; if(f.captureFailure) throw f.captureFailure; f.captureReady=true; f.consentReady=true; f.role='idle'; return '/test/control'; }
       if(command==='start_service') {
         f.starts=(f.starts||0)+1;
         if(f.startFailure) throw f.startFailure;
@@ -19,7 +19,7 @@ async function fixture(page,role='exporter') {
       const req=args.request; f.calls.push(req);
       if(req.kind==='host') {
         const r=req.value;
-        if(r.operation==='status') return {host:{value:{fingerprint:peer,certificate:'cafe',peers:f.peers,exporter:role!=='importer',importer:role!=='exporter',discovery:f.discovery!==false,pin_pairing:f.pinSupport!==false,capture_ready:f.captureReady,driver:f.driver,role:f.role,selection:'Selected backend',guidance:'Capture permission is untested.'}}};
+        if(r.operation==='status') return {host:{value:{fingerprint:peer,certificate:'cafe',peers:f.peers,exporter:role!=='importer',importer:role!=='exporter',discovery:f.discovery!==false,pin_pairing:f.pinSupport!==false,capture_ready:f.captureReady,storage_consent_ready:f.consentReady,driver:f.driver,role:f.role,selection:'Selected backend',guidance:'Capture permission is untested.'}}};
         if(r.operation==='pairing_start') { f.pinProgress={state:'waiting',expires_in:120,attempts_left:5}; return {host:{value:{pin:'123456',address:'192.168.1.42:45678',expires_in:120}}}; }
         if(r.operation==='pairing_join') { f.pinProgress={state:'connecting'}; return {text:'done'}; }
         if(r.operation==='pairing_cancel') { f.pinProgress={state:'idle'}; return {text:'done'}; }
@@ -27,6 +27,7 @@ async function fixture(page,role='exporter') {
         if(r.operation==='pair') {f.peers=[...new Set([...f.peers,r.fingerprint])];return {text:'done'};}
         if(r.operation==='revoke') {f.peers=f.peers.filter(p=>p!==r.fingerprint);return {text:'done'};}
         if(r.operation==='clear') { f.role='idle'; return {text:'done'}; }
+        if(r.operation==='export' && f.exportFailure) throw f.exportFailure;
         if(r.operation==='import' || r.operation==='export') { f.role=r.operation==='import'?'importer':'exporter'; return {text:'done'}; }
         if(r.operation==='inspect') return {storage:!!f.storage,speed:f.speed||2,text:'USB Test Controller descriptors'};
         if(r.operation==='discover') return {host:{value:f.nearby||[]}};
@@ -474,6 +475,32 @@ test('capture setup precedes sharing and cancellation never grants the device', 
   expect(await page.evaluate(()=>fixture.captureCalls)).toBe(2);
 });
 
+test('legacy privileged helper is migrated before storage sharing', async({page}) => {
+  await fixture(page,'idle');
+  await page.evaluate(()=>{fixture.captureReady=true;fixture.consentReady=false;fixture.storage=true;});
+  await page.getByRole('button',{name:'Refresh local devices'}).click();
+  await page.locator('#physical').getByRole('button',{name:'Share',exact:true}).click();
+  await page.locator('#storage-unmounted').check();
+  await page.getByRole('button',{name:'Share device',exact:true}).click();
+  await expect(page.locator('#notice')).toContainText('USB Test Controller can now be used');
+  expect(await page.evaluate(()=>fixture.captureCalls)).toBe(1);
+});
+
+test('removable-drive permission denial leaves sharing ungranted and retryable', async({page}) => {
+  await fixture(page,'idle');
+  await page.evaluate(()=>{fixture.storage=true;fixture.exportFailure='Removable-drive access was not allowed. Allow Removable Volumes in Files & Folders, then try sharing again.';});
+  await page.locator('#physical').getByRole('button',{name:'Share',exact:true}).click();
+  await page.locator('#storage-unmounted').check();
+  await page.getByRole('button',{name:'Share device',exact:true}).click();
+  await expect(page.getByRole('alert')).toContainText('Removable Volumes');
+  expect(await page.evaluate(()=>fixture.calls.some(c=>c.kind==='control'&&c.value[0]==='share'))).toBe(false);
+  await expect(page.locator('#share-dialog')).toBeVisible();
+  await page.getByRole('button',{name:'Close error'}).click();
+  await page.evaluate(()=>fixture.exportFailure=null);
+  await page.getByRole('button',{name:'Share device',exact:true}).click();
+  await expect(page.locator('#notice')).toContainText('USB Test Controller can now be used');
+});
+
 test('clearing computer overrides restores defaults for discovery and pairing after reload',async({page})=>{
   await fixture(page);
   await page.getByRole('tab',{name:'Settings'}).click();
@@ -586,7 +613,7 @@ test('storage consent is visible and required before sharing',async({page})=>{
   await page.evaluate(()=>{fixture.storage=true;fixture.speed=6;});
   await page.locator('#physical').getByRole('button',{name:'Share',exact:true}).click();
   await expect(page.locator('#storage-confirmation')).toBeVisible();
-  await expect(page.locator('#share-message')).toContainText('USB 2');
+  await expect(page.locator('#share-message')).toBeEmpty();
   await page.getByRole('button',{name:'Share device',exact:true}).click();
   await expect(page.locator('#error-message')).toContainText('Eject all volumes');
   expect(await page.evaluate(()=>fixture.calls.some(c=>c.value.operation==='export'))).toBe(false);
@@ -595,13 +622,13 @@ test('storage consent is visible and required before sharing',async({page})=>{
   await expect(page.locator('#share-dialog')).not.toBeVisible();
   expect(await page.evaluate(()=>fixture.calls.find(c=>c.value.operation==='export').value.storage_unmounted)).toBe(true);
 });
-test('SuperSpeed import is explained before capture',async({page})=>{
+for (const speed of [5,6]) test(`USB speed ${speed} can be imported`,async({page})=>{
   await fixture(page,'importer');
-  await page.evaluate(()=>fixture.devices[0].speed=6);
+  await page.evaluate(speed=>fixture.devices[0].speed=speed,speed);
   await page.getByRole('button',{name:'Refresh remote devices'}).click();
   await page.getByRole('button',{name:'Use device',exact:true}).click();
-  await expect(page.locator('#error-message')).toContainText('USB 2');
-  expect(await page.evaluate(()=>fixture.calls.some(c=>c.value[0]==='attach'))).toBe(false);
+  await expect.poll(()=>page.evaluate(()=>fixture.calls.some(c=>c.value[0]==='attach'))).toBe(true);
+  await expect(page.locator('#error')).not.toBeVisible();
 });
 test('paired computers appear once with status beside the name and addresses in details',async({page})=>{
   await fixture(page,'importer');

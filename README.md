@@ -12,7 +12,7 @@ lifecycle in shared crates. OS adapters supply native USB access.
 The current adapters are a **macOS exporter** and a **Windows x64 importer**.
 Windows uses the bundled, Microsoft-signed usbip-win UDE driver. Other OS directions are not implemented.
 
-Control, bulk, interrupt and isochronous transfers are implemented, within the Windows adapter’s current USB 1.x/2.0 limits. Device support also depends
+Control, bulk, interrupt and isochronous transfers are implemented, within the Windows adapter’s USB 1.x, USB 2 and SuperSpeed limits. Device support also depends
 on the adapter's descriptor and feature limits; see the
 [architecture](docs/architecture.md#native-adapters).
 
@@ -41,7 +41,7 @@ The standalone daemon, unified CLI and embedded C library use the same native
 forwarding implementation. See [standalone operation](docs/standalone.md) for
 pairing, sharing, native attachment, diagnostics and platform prerequisites.
 
-The optional [Desktop Manager](docs/desktop-manager.md) provides pairing, device
+The optional [Desktop Manager](tools/install/INSTALL.md) provides pairing, device
 permissions, attachment and session diagnostics through the same daemon.
 
 ## Documentation

@@ -36,18 +36,20 @@ pub(crate) const PLUG_SIZE: usize = 296;
 pub(crate) const PLUG_DEVICE: usize = 4;
 #[cfg(windows)]
 pub(crate) const PLUG_PORT: usize = 8;
-const PLUG_DESCRIPTOR: usize = 266;
-const PLUG_CONFIGURATION: usize = PLUG_DESCRIPTOR + usb::device::BYTES;
+pub(crate) const PLUG_DESCRIPTOR: usize = 266;
+pub(crate) const PLUG_CONFIGURATION: usize = PLUG_DESCRIPTOR + usb::device::BYTES;
 const USB_1_0: u16 = 0x0100;
 const USB_1_1: u16 = 0x0110;
 const USB_2_0: u16 = 0x0200;
-// The UDE ABI encodes link speed through bcdUSB, not a separate speed field.
+const USB_3_0: u16 = 0x0300;
+// The UDE ABI recognizes exact bcdUSB revisions, including 3.0 for its USB 3 port.
+// SuperPlus uses that virtual port; the physical link and descriptors stay intact.
 pub(crate) fn virtual_revision(speed: usb::Speed) -> Result<u16> {
     match speed {
         usb::Speed::Low => Ok(USB_1_0),
         usb::Speed::Full => Ok(USB_1_1),
         usb::Speed::High => Ok(USB_2_0),
-        _ => Err(Error::Unsupported),
+        usb::Speed::Super | usb::Speed::SuperPlus => Ok(USB_3_0),
     }
 }
 pub(crate) fn patch_revision(bytes: &mut [u8], revision: u16) {
@@ -60,9 +62,6 @@ pub(crate) fn patch_revision(bytes: &mut [u8], revision: u16) {
 
 pub(crate) fn plugin(descriptors: &DescriptorSet, budget: &Budget) -> Result<Buffer> {
     let revision = virtual_revision(descriptors.speed())?;
-    if !descriptors.bos().is_empty() {
-        return Err(Error::Unsupported);
-    }
     let size = PLUG_SIZE + descriptors.configuration().len() - usb::configuration::BYTES;
     let mut bytes = budget.buffer(size)?;
     let out = bytes.as_mut_slice();
@@ -73,6 +72,7 @@ pub(crate) fn plugin(descriptors: &DescriptorSet, budget: &Budget) -> Result<Buf
     patch_revision(&mut out[PLUG_DESCRIPTOR..PLUG_CONFIGURATION], revision);
     out[PLUG_CONFIGURATION..PLUG_CONFIGURATION + descriptors.configuration().len()]
         .copy_from_slice(descriptors.configuration());
+    // BOS is fetched through forwarded EP0 requests, outside the plugin ABI.
     Ok(bytes)
 }
 pub(crate) fn word(bytes: &[u8], offset: usize) -> u32 {
@@ -97,6 +97,19 @@ pub(crate) enum Frame {
     Unlink { sequence: u32, target: u32 },
 }
 pub(crate) fn decode(bytes: &[u8]) -> Result<Frame> {
+    let frame = decode_header(bytes)?;
+    if bytes.len() != frame_length(&frame) {
+        return Err(Error::Invalid);
+    }
+    Ok(frame)
+}
+fn frame_length(frame: &Frame) -> usize {
+    match frame {
+        Frame::Submit(h) => HEADER + h.payload + h.packets * PACKET_BYTES,
+        Frame::Unlink { .. } => HEADER,
+    }
+}
+fn decode_header(bytes: &[u8]) -> Result<Frame> {
     use field::*;
     if bytes.len() < HEADER || word(bytes, DEVICE) != LOCAL_DEVICE_ID || word(bytes, SEQUENCE) == 0
     {
@@ -104,12 +117,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Frame> {
     }
     let sequence = word(bytes, SEQUENCE);
     match word(bytes, COMMAND) {
-        CMD_UNLINK if bytes.len() == HEADER && word(bytes, FLAGS_STATUS_TARGET) != 0 => {
-            Ok(Frame::Unlink {
-                sequence,
-                target: word(bytes, FLAGS_STATUS_TARGET),
-            })
-        }
+        CMD_UNLINK if word(bytes, FLAGS_STATUS_TARGET) != 0 => Ok(Frame::Unlink {
+            sequence,
+            target: word(bytes, FLAGS_STATUS_TARGET),
+        }),
         CMD_SUBMIT => {
             let input = match word(bytes, DIRECTION) {
                 0 => false,
@@ -132,7 +143,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Frame> {
             let payload = if input { 0 } else { length as usize };
             if length as usize > MAX_TRANSFER
                 || packets > MAX_PACKETS
-                || bytes.len() != HEADER + payload + packets * PACKET_BYTES
                 || flags & !(SHORT_NOT_OK | usbip::ISO_ASAP) != 0
                 || (packets != 0 && (endpoint == 0 || flags & usbip::ISO_ASAP == 0))
                 || (packets == 0 && flags & usbip::ISO_ASAP != 0)
@@ -163,5 +173,49 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Frame> {
             }))
         }
         _ => Err(Error::Invalid),
+    }
+}
+
+/// Read the header first so usbip-win reports OUT payload bytes on a separate read.
+/// Some upstream handlers copy a combined payload but report only HEADER bytes.
+#[cfg(any(windows, test))]
+pub(crate) struct ReadFrame {
+    filled: usize,
+    length: usize,
+}
+#[cfg(any(windows, test))]
+impl Default for ReadFrame {
+    fn default() -> Self {
+        Self {
+            filled: 0,
+            length: HEADER,
+        }
+    }
+}
+#[cfg(any(windows, test))]
+impl ReadFrame {
+    pub fn remaining(&self) -> std::ops::Range<usize> {
+        self.filled..self.length
+    }
+    pub fn advance(&mut self, buffer: &[u8], count: usize) -> Result<Option<usize>> {
+        // Each upstream handler returns the whole requested header or body.
+        // A short read must not consume bytes from a later, unrelated request.
+        if count == 0 || count != self.length - self.filled || self.length > buffer.len() {
+            return Err(Error::Invalid);
+        }
+        self.filled += count;
+        if self.length == HEADER {
+            self.length = frame_length(&decode_header(&buffer[..HEADER])?);
+            if self.length > buffer.len() {
+                return Err(Error::Invalid);
+            }
+        }
+        if self.filled == self.length {
+            let length = self.length;
+            *self = Self::default();
+            Ok(Some(length))
+        } else {
+            Ok(None)
+        }
     }
 }

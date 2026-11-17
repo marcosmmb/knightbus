@@ -25,10 +25,11 @@ with the app and service; no separate driver download or test mode is needed.
 Restart Windows if setup requests it. The driver license and matching source are
 in `driver/`. The KnightBus installer itself is not yet publisher-signed.
 
-This Windows adapter currently supports compatible USB 1.x/2.0 devices with one
-configuration. SuperSpeed, remote wake, and devices whose physical speed differs
-from the speed inferred by the upstream driver are rejected. See the adapter
-limits in `desktop-manager.md` and the project architecture documentation.
+The Windows adapter supports compatible USB 1.x, USB 2 and SuperSpeed devices
+with one configuration. Physical SuperSpeedPlus devices use the driver's virtual
+USB 3 port without changing the physical connection speed. Remote wake and bulk
+streams are unsupported; storage devices need a compatible Bulk-Only Transport
+mode. See `architecture.md` for the adapter limits.
 
 ## Find your computers
 
@@ -59,11 +60,15 @@ permissions configured there.
    enter its six-digit PIN and click **Pair**. Both computers are paired together.
    The PIN expires after two minutes, accepts at most five attempts and is single-use.
 3. On the Mac, select **Share…** beside a local device, select the Windows computer
-   and confirm **Share device**. On the first share, approve macOS administrator setup so KnightBus can capture USB devices; the UI stays unprivileged and pairings are preserved. Unmount storage before sharing it.
+   and confirm **Share device**. On the first share, approve macOS administrator setup so KnightBus can capture USB devices; the UI stays unprivileged and pairings are preserved. Unmount storage before sharing it. For a removable drive, allow the macOS removable-volume permission when prompted. This permission covers removable drives, not just the selected drive; KnightBus still shares only devices you select. If denied, enable **Removable Volumes** under **System Settings → Privacy & Security → Files & Folders → KnightBus**, then retry. Full Disk Access is not needed.
 4. On Windows, under **Remote devices**, select the Mac and click **Connect**.
    If its address is missing, enter the Mac's LAN IP.
 5. Choose **Use device**. Check **Computers → Connections** for **In use**.
 6. To finish, choose **Disconnect** and wait for **Disconnected**.
+
+On macOS, closing the UI leaves sharing running. After a reboot or **Quit
+KnightBus**, use **Start local service** in the app. Administrator approval is
+needed for initial setup or repair. Existing pairings are preserved.
 
 The default Mac listener ports are TCP **3337** and **3338**. Allow those ports on
 its trusted private LAN if a firewall blocks the connection. Pairing and LAN
@@ -98,7 +103,7 @@ Uninstall removes the programs and login task. It retains pairing state, the
 separate USB driver and the installing account marker. Setup recognizes the
 unchanged driver files left by earlier uninstallers and reinstalls normally.
 Unrecognized files in an existing installation folder are preserved. For upgrades, simply quit the tray app and run the new setup.
-See `desktop-manager.md` beside this file for detailed app usage.
+See `architecture.md` beside this file for supported platforms and adapter limits.
 
 ## Quit completely
 

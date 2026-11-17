@@ -3,6 +3,10 @@ use knightbus_sdk::{
     SYSTEM_ENDPOINT,
     core::{Error, Result},
     ipc::private::Directory,
+    macos::{
+        DAEMON_FILE, ENDPOINT_DIR, IDENTITY_DIR, LAUNCHER_FILE, LEGACY_LAUNCHD_LABEL,
+        LEGACY_LAUNCHD_PLIST, OWNER_FILE, PROGRAM_DIR, STATE_DIR,
+    },
 };
 use knightbus_transport::security::{self, Store};
 use rustix::fs::{Mode, OFlags};
@@ -14,14 +18,12 @@ use std::{
     process::Command,
 };
 
-const PROGRAM_DIR: &str = "/Library/Application Support/KnightBus";
-const STATE_DIR: &str = "/var/db/knightbus";
-const PLIST: &str = "/Library/LaunchDaemons/io.knightbus.daemon.plist";
-const LABEL: &str = "system/io.knightbus.daemon";
 const ROOT_UID: u32 = 0;
 const PRIVATE_MODE: u32 = 0o700;
 const PROGRAM_MODE: u32 = 0o755;
-const PLIST_MODE: u32 = 0o644;
+const LAUNCHER_MODE: u32 = 0o4755;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const MAX_UID_BYTES: u64 = 10;
 const NON_OWNER_WRITE: u32 = 0o022;
 const NON_OWNER_ACCESS: u32 = 0o077;
 const IDENTITY_RECORDS: usize = 2;
@@ -121,10 +123,10 @@ pub(super) fn install(uid: u32, source: &Path, expected: &str) -> Result<()> {
     }
     protected_directory(Path::new(PROGRAM_DIR), PROGRAM_MODE)?;
     protected_directory(Path::new(STATE_DIR), PRIVATE_MODE)?;
-    protected_directory(Path::new("/var/run/knightbus"), PROGRAM_MODE)?;
-    let identity = Path::new(STATE_DIR).join("identity");
+    protected_directory(Path::new(ENDPOINT_DIR), PROGRAM_MODE)?;
+    let identity = Path::new(IDENTITY_DIR);
     if identity.exists() {
-        if security::display_fingerprint(Store::open(&identity)?.identity()?.peer()) != expected {
+        if security::display_fingerprint(Store::open(identity)?.identity()?.peer()) != expected {
             return Err(Error::Denied);
         }
     } else {
@@ -134,18 +136,90 @@ pub(super) fn install(uid: u32, source: &Path, expected: &str) -> Result<()> {
             let _ = fs::remove_dir_all(&staging);
         }
         result?;
-        fs::rename(staging, &identity).map_err(|_| Error::Unavailable)?;
+        fs::rename(staging, identity).map_err(|_| Error::Unavailable)?;
     }
-    let daemon = Path::new(PROGRAM_DIR).join("knightbusd");
-    let staged = Path::new(PROGRAM_DIR).join(format!("knightbusd-install-{}", std::process::id()));
+    let source_program = std::env::current_exe().map_err(|_| Error::Unavailable)?;
+    install_program(&source_program, Path::new(DAEMON_FILE), PROGRAM_MODE)?;
+    install_program(
+        &source_program.with_file_name("knightbus-launcher"),
+        Path::new(LAUNCHER_FILE),
+        LAUNCHER_MODE,
+    )?;
+    if Command::new("/bin/launchctl")
+        .args(["print", LEGACY_LAUNCHD_LABEL])
+        .output()
+        .map_err(|_| Error::Unavailable)?
+        .status
+        .success()
+        && !Command::new("/bin/launchctl")
+            .args(["bootout", LEGACY_LAUNCHD_LABEL])
+            .status()
+            .map_err(|_| Error::Unavailable)?
+            .success()
+    {
+        return Err(Error::State);
+    }
+    // A system launch daemon loses the app's user-session privacy identity.
+    // Retire the legacy registration before starting the app-authorized helper.
+    match fs::remove_file(LEGACY_LAUNCHD_PLIST) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(Error::Denied),
+    }
+    let owner_staging =
+        Path::new(STATE_DIR).join(format!("desktop-user-install-{}", std::process::id()));
+    write_new(
+        &owner_staging,
+        uid.to_string().as_bytes(),
+        PRIVATE_FILE_MODE,
+    )?;
+    fs::rename(owner_staging, OWNER_FILE).map_err(|_| Error::Unavailable)?;
+    Ok(())
+}
+
+pub(super) fn restart(uid: u32) -> Result<()> {
+    if !rustix::process::geteuid().is_root() || uid == ROOT_UID {
+        return Err(Error::Denied);
+    }
+    let owner = File::from(
+        rustix::fs::open(
+            OWNER_FILE,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| Error::Denied)?,
+    );
+    let metadata = owner.metadata().map_err(|_| Error::Denied)?;
+    if !metadata.is_file()
+        || metadata.uid() != ROOT_UID
+        || metadata.mode() & NON_OWNER_ACCESS != 0
+        || metadata.len() > MAX_UID_BYTES
+    {
+        return Err(Error::Denied);
+    }
+    let mut bytes = String::new();
+    owner
+        .take(MAX_UID_BYTES)
+        .read_to_string(&mut bytes)
+        .map_err(|_| Error::Denied)?;
+    if bytes.parse::<u32>() != Ok(uid) {
+        return Err(Error::Denied);
+    }
+    let state = Path::new(IDENTITY_DIR);
+    let fingerprint = security::display_fingerprint(Store::open(state)?.identity()?.peer());
+    install(uid, state, &fingerprint)
+}
+
+fn install_program(source: &Path, target: &Path, mode: u32) -> Result<()> {
+    let name = target.file_name().ok_or(Error::Invalid)?.to_string_lossy();
+    let staged = Path::new(PROGRAM_DIR).join(format!("{name}-install-{}", std::process::id()));
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(PROGRAM_MODE)
         .open(&staged)
         .map_err(|_| Error::Denied)?;
-    let mut input = File::open(std::env::current_exe().map_err(|_| Error::Unavailable)?)
-        .map_err(|_| Error::Unavailable)?;
+    let mut input = File::open(source).map_err(|_| Error::Unavailable)?;
     std::io::copy(&mut input, &mut output).map_err(|_| Error::Unavailable)?;
     output.sync_all().map_err(|_| Error::Unavailable)?;
     drop(output);
@@ -156,48 +230,12 @@ pub(super) fn install(uid: u32, source: &Path, expected: &str) -> Result<()> {
         .map_err(|_| Error::Unavailable)?
         .success()
     {
+        let _ = fs::remove_file(&staged);
         return Err(Error::Denied);
     }
-    fs::rename(staged, &daemon).map_err(|_| Error::Unavailable)?;
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>io.knightbus.daemon</string>
-<key>ProgramArguments</key><array><string>{PROGRAM_DIR}/knightbusd</string><string>--desktop-user</string><string>{STATE_DIR}/identity</string><string>{SYSTEM_ENDPOINT}</string><string>{uid}</string></array>
-<key>RunAtLoad</key><true/>
-<key>StandardOutPath</key><string>{STATE_DIR}/service.log</string>
-<key>StandardErrorPath</key><string>{STATE_DIR}/service.log</string>
-</dict></plist>"#
-    );
-    let staged_plist =
-        Path::new(STATE_DIR).join(format!("service-install-{}.plist", std::process::id()));
-    write_new(&staged_plist, plist.as_bytes(), PLIST_MODE)?;
-    if Command::new("/bin/launchctl")
-        .args(["print", LABEL])
-        .output()
-        .map_err(|_| Error::Unavailable)?
-        .status
-        .success()
-        && !Command::new("/bin/launchctl")
-            .args(["bootout", LABEL])
-            .status()
-            .map_err(|_| Error::Unavailable)?
-            .success()
-    {
-        return Err(Error::State);
-    }
-    fs::rename(staged_plist, PLIST).map_err(|_| Error::Unavailable)?;
-    if !Command::new("/bin/launchctl")
-        .args(["bootstrap", "system", PLIST])
-        .status()
-        .map_err(|_| Error::Unavailable)?
-        .success()
-    {
-        return Err(Error::Unavailable);
-    }
-    // No KeepAlive: an explicit UI shutdown stays stopped until started again.
-    Ok(())
+    // Set the launcher's privilege only after verification, in a root-owned directory.
+    fs::set_permissions(&staged, fs::Permissions::from_mode(mode)).map_err(|_| Error::Denied)?;
+    fs::rename(staged, target).map_err(|_| Error::Unavailable)
 }
 
 /// Recreate the volatile root-owned endpoint directory after a reboot.
@@ -205,7 +243,7 @@ pub(super) fn prepare_endpoint() -> Result<()> {
     if !rustix::process::geteuid().is_root() {
         return Err(Error::Denied);
     }
-    protected_directory(Path::new("/var/run/knightbus"), PROGRAM_MODE)
+    protected_directory(Path::new(ENDPOINT_DIR), PROGRAM_MODE)
 }
 
 #[cfg(test)]

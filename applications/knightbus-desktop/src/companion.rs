@@ -174,7 +174,9 @@ pub async fn start_service(
             .lock()
             .map_err(|_| "Service startup lock failed.")?;
         #[cfg(target_os = "macos")]
-        if Path::new("/Library/LaunchDaemons/io.knightbus.daemon.plist").exists() {
+        if Path::new(knightbus_sdk::macos::LEGACY_LAUNCHD_PLIST).exists()
+            || Path::new(knightbus_sdk::macos::LAUNCHER_FILE).exists()
+        {
             return super::capture::start_installed();
         }
         #[cfg(windows)]
@@ -203,13 +205,16 @@ $ErrorActionPreference='Stop'
 $task=Get-ScheduledTask -TaskName 'KnightBus daemon'
 $expected=Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'KnightBus\knightbusd.exe'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
-$owner=$task.Principal.UserId
-if (!$owner.StartsWith('S-1-')) { $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+$owner=Get-KnightBusTaskOwnerSid -TaskName $task.TaskName -TaskPath $task.TaskPath
 if ($owner -ne $identity.User.Value -or @($task.Actions).Count -ne 1 -or $task.Actions[0].Execute -ne $expected) { throw 'Repair the installed KnightBus service for this account.' }
 Start-ScheduledTask -TaskName 'KnightBus daemon'
 "#;
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!(
+            "{}\n{SCRIPT}",
+            include_str!("../../../tools/install/windows-installation.ps1")
+        ))
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| e.to_string())?;

@@ -125,10 +125,35 @@ pub fn guidance(error: Error) -> &'static str {
 
 /// Idle-capable service administration using the common control contract.
 pub mod service;
+#[cfg(target_os = "macos")]
+pub use knightbus_macos_exporter::storage_access;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
 /// Installed macOS service endpoint, protected by the root installer.
 #[cfg(target_os = "macos")]
-pub const SYSTEM_ENDPOINT: &str = "/var/run/knightbus/control";
+pub use macos::CONTROL_ENDPOINT as SYSTEM_ENDPOINT;
+
+#[cfg(target_os = "macos")]
+impl Client {
+    /// Request removable-drive consent in the app, then share through its authenticated helper.
+    pub fn request_export(&mut self, command: Command) -> Result<Reply> {
+        let Command::Host(host::Request::Export {
+            registry,
+            storage_unmounted,
+            ..
+        }) = &command
+        else {
+            return Err(Error::Invalid);
+        };
+        if *storage_unmounted {
+            knightbus_macos_exporter::native::request_storage_consent(
+                registry.parse().map_err(|_| Error::Invalid)?,
+            )?;
+        }
+        self.request(command, CONTROL_TIMEOUT_MS)
+    }
+}
 /// Connect to the installed system service or an explicitly selected same-account endpoint.
 pub fn connect_local(path: &Path) -> Result<Client> {
     #[cfg(target_os = "macos")]

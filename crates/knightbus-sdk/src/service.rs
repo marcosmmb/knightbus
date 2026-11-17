@@ -32,6 +32,7 @@ struct Presence {
 /// Account-scoped administrator host. No device is selected at startup.
 pub struct Service {
     state: PathBuf,
+    app_context: bool,
     clock: Instant,
     driver: Option<host::DriverStatus>,
     epoch: u64,
@@ -50,6 +51,7 @@ impl Service {
         Store::open(state)?;
         Ok(Self {
             state: state.into(),
+            app_context: false,
             clock: Instant::now(),
             driver: driver_status(),
             epoch: security::epoch()?,
@@ -59,6 +61,16 @@ impl Service {
             presence: Mutex::new(None),
             pairing: Mutex::new(None),
         })
+    }
+    /// Open the privileged desktop helper after the app authorizes its startup.
+    #[cfg(target_os = "macos")]
+    pub fn open_desktop(state: &Path) -> Result<Self> {
+        if !capture_ready() {
+            return Err(Error::Denied);
+        }
+        let mut service = Self::open(state)?;
+        service.app_context = true;
+        Ok(service)
     }
     /// Cancel admission. Native retirement is performed by the serving owner.
     pub fn shutdown(&self) {
@@ -147,7 +159,7 @@ impl Service {
                 Ok(Reply::Host(host::Reply::Status(host::Status {
                     fingerprint: security::display_fingerprint(identity.peer()), certificate: hex(identity.certificate()),
                     peers: store.peers()?.identities().map(security::display_fingerprint).collect(),
-                    exporter: cfg!(target_os = "macos"), importer: cfg!(windows), discovery: cfg!(feature = "mdns"), pin_pairing: true, process_id: std::process::id(), capture_ready: capture_ready(), driver: self.driver, role: role.into(), selection,
+                    exporter: cfg!(target_os = "macos"), importer: cfg!(windows), discovery: cfg!(feature = "mdns"), pin_pairing: true, process_id: std::process::id(), capture_ready: capture_ready(), storage_consent_ready: capture_ready() && self.app_context, driver: self.driver, role: role.into(), selection,
                     guidance: if cfg!(target_os = "macos") {
                         if capture_ready() { "Administrator capture is available. Only an authorized device attachment takes control from OS drivers; replug or release requires a fresh selection." } else { "Approve administrator setup when sharing a device to enable USB capture. Pairing and inspection do not need capture access." }
                     } else if cfg!(windows) {

@@ -6,8 +6,6 @@ const MAX_ACTIONS = 40;
 const MAX_CONTACTS = 128;
 const SHORT_FINGERPRINT_LENGTH = 8;
 const USB_ID_HEX_WIDTH = 4;
-const USB_SUPER_SPEED = 5;
-const USB_SUPER_PLUS_SPEED = 6;
 const JSON_INDENT = 2;
 const PROFILE_KEY = 'knightbus.contacts.v1.';
 const PREFERENCES_KEY = 'knightbus.preferences.v1';
@@ -207,9 +205,6 @@ function openShare(target) {
       ? await control('inspect', target.key.id, target.key.generation)
       : await host('inspect', { registry });
     $('storage-confirmation').hidden = !shareInspection.storage;
-    if ([USB_SUPER_SPEED, USB_SUPER_PLUS_SPEED].includes(shareInspection.speed)) {
-      $('share-message').textContent = 'The Windows USB driver cannot import USB 3 devices at SuperSpeed. Reconnect this device through a USB 2 port or hub, then refresh local devices.';
-    }
   });
 }
 function drawDevices() {
@@ -251,7 +246,6 @@ function drawDevices() {
     const row = box($('remote-devices'), 'device-card'); const heading = box(row, 'row'); const copy = box(heading, '');
     text('h4', deviceName(d), copy); text('p', d.busy ? 'Currently in use' : 'Ready to connect', copy);
     deviceActions(row, 'Use device', () => act('Device connection requested', async () => {
-      if ([USB_SUPER_SPEED, USB_SUPER_PLUS_SPEED].includes(d.speed)) throw new Error('The Windows USB driver cannot import USB 3 devices at SuperSpeed. Reconnect the device through a USB 2 port or hub on the sharing computer, then refresh both device lists.');
       if (status.driver === 'missing') throw new Error('The USB/IP driver is missing on this computer. Run the KnightBus installer again before using remote devices.');
       await control('attach', d.key.id, d.key.generation); selectTab('tab-computers');
     }), () => inspect(async () => (await control('inspect', d.key.id, d.key.generation)).text), 'importer');
@@ -421,7 +415,7 @@ $('share').addEventListener('submit', event => {
   if (!shareInspection) return error('Device inspection did not finish. Close this dialog and refresh local devices before trying again.');
   if (shareInspection.storage && !$('storage-unmounted').checked) return error('Eject all volumes on this storage device in Finder, then confirm that they are unmounted before sharing.');
   act('Device access allowed', async () => {
-    if (status.capture_ready === false) {
+    if (status.capture_ready === false || status.storage_consent_ready === false) {
       notice('macOS authorization is required to take control of USB devices.');
       const endpoint = await invoke('enable_capture', { endpoint: $('endpoint').value.trim() });
       $('endpoint').value = endpoint; epoch = null;

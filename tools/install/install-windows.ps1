@@ -17,7 +17,7 @@ $ownerFile=Join-Path $install 'owner-sid.txt'
 $cli=Join-Path $install 'knightbus.exe'
 $daemonPath=Join-Path $install 'knightbusd.exe'
 $daemonArguments="--desktop `"$state\identity`" $endpoint"
-$files=@('knightbus-desktop.exe','knightbus.exe','knightbusd.exe','LICENSE','INSTALL.md','desktop-manager.md','standalone.md','architecture.md','uninstall-windows.ps1')
+$files=@('knightbus-desktop.exe','knightbus.exe','knightbusd.exe','LICENSE','INSTALL.md','standalone.md','architecture.md','uninstall-windows.ps1')
 
 function Invoke-Control([string[]]$Arguments) {
  $result=& $cli manage $endpoint @Arguments
@@ -57,10 +57,7 @@ if ((Test-Path $ownerFile) -and (Get-Content $ownerFile -Raw).Trim() -ne $identi
  throw 'Run this upgrade using the Windows account that originally installed KnightBus.'
 }
 if ($task) {
- $taskUser=$task.Principal.UserId
- if (!$taskUser.StartsWith('S-1-')) {
-  $taskUser=([Security.Principal.NTAccount]$taskUser).Translate([Security.Principal.SecurityIdentifier]).Value
- }
+ $taskUser=Get-KnightBusTaskOwnerSid -TaskName $task.TaskName -TaskPath $task.TaskPath
  if ($taskUser -ne $identity.User.Value -or @($task.Actions).Count -ne 1 -or $task.Actions[0].Execute -ne $daemonPath -or $task.Actions[0].Arguments -ne $daemonArguments) {
   throw 'The existing KnightBus task belongs to another account or installation. It was not changed.'
  }
@@ -122,8 +119,8 @@ try {
  Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'driver') -File | Copy-Item -Destination $installedDriver -Force
  New-Item -ItemType Directory -Force $state | Out-Null
  $action=New-ScheduledTaskAction -Execute $daemonPath -Argument $daemonArguments
- $trigger=New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
- $principal=New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
+ $trigger=New-ScheduledTaskTrigger -AtLogOn -User $identity.User.Value
+ $principal=New-KnightBusTaskPrincipal -UserSid $identity.User.Value
  $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -Description 'KnightBus native service; independent of the optional desktop UI.' | Out-Null
  $taskDisabled=$false

@@ -69,12 +69,12 @@ pub fn new<D: Driver>(
     importer::Backend::new(move || Ok(Channel::new(factory()?)), descriptors, budget)
 }
 /// Limits of the adapter and pinned upstream UDE package.
-/// SuperSpeed is excluded: this package cannot publish the required BOS descriptor.
+/// SuperSpeed uses the USB 3 port; BOS requests are forwarded to the exporter.
 pub const CAPABILITIES: knightbus_core::Capabilities = knightbus_core::Capabilities {
     transfer_bytes: MAX_TRANSFER,
     requests: SLOTS,
     iso_packets: MAX_PACKETS,
-    speeds: (1 << Speed::Low as u32) | (1 << Speed::Full as u32) | (1 << Speed::High as u32),
+    speeds: Speed::ALL_MASK,
     descriptor_bytes: 4096,
     configurations: 1,
     remote_wakeup: false,
@@ -629,6 +629,137 @@ mod tests {
         assert_eq!(&published.as_slice()[266..284], &expected);
         assert_eq!(full.device(), &DEVICE); // Physical descriptors remain unchanged.
     }
+    const SUPER_DEVICE: [u8; 18] = [18, 1, 0x20, 3, 0, 0, 0, 9, 9, 18, 1, 0, 0, 1, 0, 0, 0, 1];
+    const SUPER_CONFIG: [u8; 44] = [
+        9, 2, 44, 0, 1, 1, 0, 128, 50, 9, 4, 0, 0, 2, 255, 0, 0, 0, 7, 5, 2, 2, 0, 4, 0, 6, 48, 0,
+        0, 0, 0, 7, 5, 130, 2, 0, 4, 0, 6, 48, 0, 0, 0, 0,
+    ];
+    const SUPER_BOS: [u8; 22] = [
+        5, 15, 22, 0, 2, 7, 16, 2, 0, 0, 0, 0, 10, 16, 3, 0, 14, 0, 1, 0, 0, 0,
+    ];
+
+    #[test]
+    fn superspeed_publication_and_ep0_preserve_companions_and_bos() {
+        use knightbus_core::topology as usb;
+        for speed in [Speed::Super, Speed::SuperPlus] {
+            let (_, _, budget) = setup();
+            {
+                let descriptors =
+                    DescriptorSet::new(&budget, &SUPER_DEVICE, &SUPER_CONFIG, &SUPER_BOS, speed)
+                        .unwrap();
+                CAPABILITIES.descriptors(&descriptors).unwrap();
+                let bytes = plugin(&descriptors, &budget).unwrap();
+                let mut virtual_device = SUPER_DEVICE;
+                patch_revision(&mut virtual_device, 0x0300);
+                assert_eq!(
+                    &bytes.as_slice()[PLUG_DESCRIPTOR..PLUG_CONFIGURATION],
+                    &virtual_device
+                );
+                assert_eq!(
+                    &bytes.as_slice()[PLUG_CONFIGURATION..PLUG_CONFIGURATION + SUPER_CONFIG.len()],
+                    &SUPER_CONFIG
+                );
+                assert_eq!(descriptors.device(), &SUPER_DEVICE);
+                assert_eq!(descriptors.speed(), speed);
+                let mut channel = Channel::new(Mock::default());
+                channel.attach(&descriptors, &budget).unwrap();
+                let mut scratch = vec![0; MAX_MESSAGE];
+                for (index, (kind, physical, expected)) in [
+                    (usb::device::TYPE, &SUPER_DEVICE[..], &virtual_device[..]),
+                    (
+                        usb::configuration::TYPE,
+                        &SUPER_CONFIG[..],
+                        &SUPER_CONFIG[..],
+                    ),
+                    (usb::BOS_TYPE, &SUPER_BOS[..], &SUPER_BOS[..]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let sequence = index as u32 + 1;
+                    let mut request = submit(sequence, usb::DIRECTION_IN, physical.len() as u32);
+                    request[field::SETUP..HEADER].copy_from_slice(&usb::setup(
+                        usb::DIRECTION_IN,
+                        usb::GET_DESCRIPTOR,
+                        u16::from(kind) << u8::BITS,
+                        0,
+                        physical.len() as u16,
+                    ));
+                    channel.driver.incoming.push_back(request);
+                    channel.receive().unwrap();
+                    channel
+                        .fetch(u32::MAX, descriptors.topology(), &mut scratch)
+                        .unwrap()
+                        .unwrap();
+                    let header = channel.slots[0].as_ref().unwrap().header;
+                    let done = completion(&budget, header, physical);
+                    channel
+                        .complete(u64::from(sequence), &done, &mut scratch)
+                        .unwrap();
+                    assert_eq!(&channel.driver.outgoing.last().unwrap()[HEADER..], expected);
+                    assert_eq!(&done.transfer.buffer()[..physical.len()], physical);
+                }
+            }
+            assert_eq!(budget.usage().bytes, 0);
+        }
+    }
+
+    #[test]
+    fn native_reads_request_header_then_bounded_out_payload() {
+        const STORAGE_COMMAND_BYTES: usize = 31;
+        const LARGE_STORAGE_TRANSFER: usize = 397312;
+        for length in [
+            0,
+            STORAGE_COMMAND_BYTES,
+            LARGE_STORAGE_TRANSFER,
+            MAX_TRANSFER,
+        ] {
+            let mut frame = ReadFrame::default();
+            let bytes = submit(1, 2, length as u32);
+            assert_eq!(frame.remaining(), 0..HEADER);
+            let ready = frame.advance(&bytes, HEADER).unwrap();
+            if length == 0 {
+                assert_eq!(ready, Some(HEADER));
+            } else {
+                assert_eq!(ready, None);
+                assert_eq!(frame.remaining(), HEADER..bytes.len());
+                assert_eq!(frame.advance(&bytes, length).unwrap(), Some(bytes.len()));
+            }
+            assert_eq!(frame.remaining(), 0..HEADER);
+            assert!(decode(&bytes).is_ok());
+        }
+        let mut frame = ReadFrame::default();
+        let mut header = submit(1, 130, 0);
+        put(&mut header, field::LENGTH, MAX_TRANSFER as u32 + 1);
+        assert!(matches!(
+            frame.advance(&header, HEADER),
+            Err(Error::Unsupported)
+        ));
+        assert!(ReadFrame::default().advance(&header, 0).is_err());
+        assert!(ReadFrame::default().advance(&header, HEADER - 1).is_err());
+        assert!(ReadFrame::default().advance(&header, HEADER + 1).is_err());
+        let bytes = submit(1, 2, STORAGE_COMMAND_BYTES as u32);
+        let mut frame = ReadFrame::default();
+        assert_eq!(frame.advance(&bytes, HEADER).unwrap(), None);
+        assert!(frame.advance(&bytes, STORAGE_COMMAND_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn native_reads_iso_packet_layout_even_for_input() {
+        const PACKETS: usize = 2;
+        let mut bytes = submit(1, 130, 8);
+        put(&mut bytes, field::FLAGS_STATUS_TARGET, usbip::ISO_ASAP);
+        put(&mut bytes, field::PACKETS, PACKETS as u32);
+        bytes.resize(HEADER + PACKETS * PACKET_BYTES, 0);
+        let mut frame = ReadFrame::default();
+        assert_eq!(frame.advance(&bytes, HEADER).unwrap(), None);
+        assert_eq!(frame.remaining(), HEADER..bytes.len());
+        assert_eq!(
+            frame.advance(&bytes, PACKETS * PACKET_BYTES).unwrap(),
+            Some(bytes.len())
+        );
+    }
+
     #[test]
     fn iso_packet_layout_and_asap_flags_are_decoded_without_changing_payload() {
         let mut bytes = submit(1, 130, 8);

@@ -16,6 +16,12 @@ fn run() -> Result<(), Error> {
             fingerprint,
         );
     }
+    #[cfg(target_os = "macos")]
+    if let [mode, uid] = args.as_slice()
+        && mode == "--start-desktop-service"
+    {
+        return install::restart(uid.parse().map_err(|_| Error::Invalid)?);
+    }
     if args.is_empty() || matches!(args.as_slice(), [help] if help == "--help") {
         println!(
             "usage: knightbusd CONFIG ENDPOINT | --desktop STATE ENDPOINT\nmacOS root service: --desktop-user STATE ENDPOINT UID\nCreate a private endpoint parent first. Stop with knightbus manage ENDPOINT shutdown."
@@ -24,7 +30,7 @@ fn run() -> Result<(), Error> {
     }
     #[cfg(target_os = "macos")]
     if let [mode, state, endpoint, uid] = args.as_slice()
-        && mode == "--desktop-user"
+        && (mode == "--desktop-user" || mode == "--desktop-app-user")
     {
         if endpoint == knightbus_sdk::SYSTEM_ENDPOINT {
             install::prepare_endpoint()?;
@@ -33,7 +39,18 @@ fn run() -> Result<(), Error> {
             Path::new(endpoint),
             uid.parse().map_err(|_| Error::Invalid)?,
         )?;
-        let service = std::sync::Arc::new(knightbus_sdk::service::Service::open(Path::new(state))?);
+        let app_context = mode == "--desktop-app-user";
+        if app_context
+            && knightbus_sdk::storage_access::session_user()
+                != Some(uid.parse().map_err(|_| Error::Invalid)?)
+        {
+            return Err(Error::Denied);
+        }
+        let service = std::sync::Arc::new(if app_context {
+            knightbus_sdk::service::Service::open_desktop(Path::new(state))?
+        } else {
+            knightbus_sdk::service::Service::open(Path::new(state))?
+        });
         let signal = service.clone();
         ctrlc::set_handler(move || signal.shutdown()).map_err(|_| Error::Unavailable)?;
         return service.serve(&listener);

@@ -30,7 +30,8 @@
     "category": "Utility",
     "shortDescription": "Manage USB sharing through KnightBus",
     "macOS": {
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "infoPlist": "Info.plist"
     },
     "windows": {
       "nsis": {

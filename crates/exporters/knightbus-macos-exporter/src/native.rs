@@ -45,10 +45,17 @@ unsafe extern "C" {
     fn IOServiceGetMatchingService(port: u32, matching: *mut c_void) -> u32;
     fn IORegistryEntryIDMatching(id: u64) -> *mut c_void;
     fn IOIteratorNext(iterator: u32) -> u32;
+    fn IOIteratorIsValid(iterator: u32) -> i32;
     fn IOObjectRelease(object: u32) -> i32;
     fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> i32;
     fn IORegistryEntryGetChildIterator(entry: u32, plane: *const c_char, iterator: *mut u32)
     -> i32;
+    fn IORegistryEntryCreateIterator(
+        entry: u32,
+        plane: *const c_char,
+        options: u32,
+        iterator: *mut u32,
+    ) -> i32;
     fn IOObjectConformsTo(object: u32, class: *const c_char) -> i32;
     fn IORegistryEntryCreateCFProperty(
         entry: u32,
@@ -194,17 +201,16 @@ pub fn share_candidate(id: Identity) -> bool {
 /// Names are untrusted display metadata and never identify an authorized device.
 pub fn display_name(id: Identity) -> Option<String> {
     let entry = find(id).ok()?;
+    string_property(entry.0, c"USB Product Name")
+}
+fn string_property(entry: u32, name: &std::ffi::CStr) -> Option<String> {
     // SAFETY: retained CF property, checked string type, bounded writable buffer.
     unsafe {
-        let key = CFStringCreateWithCString(
-            ptr::null(),
-            c"USB Product Name".as_ptr(),
-            CF_STRING_ENCODING_UTF8,
-        );
+        let key = CFStringCreateWithCString(ptr::null(), name.as_ptr(), CF_STRING_ENCODING_UTF8);
         if key.is_null() {
             return None;
         }
-        let value = IORegistryEntryCreateCFProperty(entry.0, key, ptr::null(), 0);
+        let value = IORegistryEntryCreateCFProperty(entry, key, ptr::null(), 0);
         CFRelease(key);
         if value.is_null() {
             return None;
@@ -229,6 +235,100 @@ pub fn display_name(id: Identity) -> Option<String> {
         }
         Some(name.to_owned())
     }
+}
+
+/// Ask macOS for removable-volume access without reading, writing or claiming a drive.
+/// The helper must inherit the app's user-session identity at startup.
+pub fn request_storage_access(registry: u64) -> Result<()> {
+    storage_access(registry, false)
+}
+/// Trigger removable-volume consent in the foreground app before asking its helper.
+/// The ordinary account may still lack BSD access to the raw device after consent.
+pub fn request_storage_consent(registry: u64) -> Result<()> {
+    storage_access(registry, true)
+}
+fn storage_access(registry: u64, allow_bsd_denial: bool) -> Result<()> {
+    const MAX_REGISTRY_ATTEMPTS: usize = 3;
+    // Darwin sys/errno.h: BSD file permissions, distinct from TCC's EPERM denial.
+    const BSD_ACCESS_DENIED: i32 = 13;
+    let id = enumerate()?
+        .into_iter()
+        .find(|id| id.registry_id == registry)
+        .ok_or(Error::NotFound)?;
+    if !share_candidate(id) {
+        return Err(Error::Unsupported);
+    }
+    let mut names = Err(Error::Unavailable);
+    for _ in 0..MAX_REGISTRY_ATTEMPTS {
+        names = storage_media(id);
+        if names != Err(Error::Unavailable) {
+            break;
+        }
+    }
+    // Do not hold a live registry iterator across the interactive permission dialog.
+    for name in names? {
+        find(id)?;
+        match std::fs::File::open(format!("/dev/r{name}")) {
+            Ok(file) => drop(file),
+            Err(error) if allow_bsd_denial && error.raw_os_error() == Some(BSD_ACCESS_DENIED) => {}
+            Err(error) => {
+                return Err(match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => Error::Denied,
+                    std::io::ErrorKind::NotFound => Error::NotFound,
+                    _ => Error::Unavailable,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+fn storage_media(id: Identity) -> Result<Vec<String>> {
+    const MAX_MEDIA_ENTRIES: usize = 1024;
+    let entry = find(id)?;
+    let mut iterator = 0;
+    // SAFETY: the retained USB entry anchors a recursive iterator to this device only.
+    if unsafe {
+        IORegistryEntryCreateIterator(
+            entry.0,
+            c"IOService".as_ptr(),
+            objc2_io_kit::kIORegistryIterateRecursively,
+            &mut iterator,
+        )
+    } != 0
+    {
+        return Err(Error::Unavailable);
+    }
+    let iterator = Service(iterator);
+    let mut names = Vec::new();
+    for _ in 0..MAX_MEDIA_ENTRIES {
+        let media = Service(unsafe { IOIteratorNext(iterator.0) });
+        if media.0 == 0 {
+            if unsafe { IOIteratorIsValid(iterator.0) } == 0 {
+                return Err(Error::Unavailable);
+            }
+            return if names.is_empty() {
+                Err(Error::NotFound)
+            } else {
+                Ok(names)
+            };
+        }
+        if unsafe { IOObjectConformsTo(media.0, c"IOMedia".as_ptr()) } == 0 {
+            continue;
+        }
+        let Some(name) = string_property(media.0, c"BSD Name") else {
+            continue;
+        };
+        if !whole_disk_name(&name) {
+            continue;
+        }
+        // The kernel supplies the name. Never accept a path from an IPC caller.
+        names.push(name);
+    }
+    Err(Error::Exhausted)
+}
+fn whole_disk_name(name: &str) -> bool {
+    name.strip_prefix("disk")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 /// Physical descriptors and validated inventory, without any native handles.
 #[derive(Clone, Debug)]
@@ -1115,6 +1215,22 @@ impl Identity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_kernel_whole_disk_names_can_form_permission_paths() {
+        assert!(super::whole_disk_name("disk4"));
+        assert!(super::whole_disk_name("disk123"));
+        for name in [
+            "disk",
+            "disk4s3",
+            "disk-1",
+            "../disk4",
+            "disk4/../../etc/passwd",
+            "/dev/disk4",
+            "disk４",
+        ] {
+            assert!(!super::whole_disk_name(name), "{name}");
+        }
+    }
     #[test]
     fn disconnected_user_client_port_retires_the_device_generation() {
         // Rejected enqueue observed after physical unplug in

@@ -225,6 +225,9 @@ pub struct Status {
     /// macOS service has the privileges needed for explicit device capture.
     #[serde(default)]
     pub capture_ready: bool,
+    /// The desktop helper was started in the app's user session for privacy consent.
+    #[serde(default)]
+    pub storage_consent_ready: bool,
     /// Driver-store result at service startup, absent outside Windows.
     #[serde(default)]
     pub driver: Option<DriverStatus>,

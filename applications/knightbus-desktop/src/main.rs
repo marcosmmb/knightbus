@@ -52,6 +52,7 @@ fn failure(error: core::Error) -> String {
 
 #[tauri::command]
 async fn request(
+    app: tauri::AppHandle,
     endpoint: String,
     request: Request,
     state: tauri::State<'_, State>,
@@ -59,6 +60,8 @@ async fn request(
     if endpoint.len() > MAX_ENDPOINT_BYTES {
         return Err(failure(core::Error::Invalid));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
     let state = state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let command = match request {
@@ -75,6 +78,19 @@ async fn request(
         } else {
             CONTROL_TIMEOUT_MS
         };
+        #[cfg(target_os = "macos")]
+        if endpoint == SYSTEM_ENDPOINT && matches!(command, Command::Host(core::host::Request::Export { .. })) {
+            capture::prepare(app.path().app_data_dir().map_err(|e| e.to_string())?, endpoint.clone())?;
+            // Helper migration replaces the socket; discard the previous metadata link.
+            state.lock().map_err(|_| failure(core::Error::Internal))?.client = None;
+            let storage = matches!(command, Command::Host(core::host::Request::Export { storage_unmounted: true, .. }));
+            let mut client = knightbus_sdk::Client::connect_system(Path::new(&endpoint)).map_err(failure)?;
+            return client.request_export(command).map(present).map_err(|error| match error {
+                core::Error::Denied if storage => "macOS blocked removable-drive access; the device was not shared. Check Removable Volumes under System Settings → Privacy & Security → Files & Folders → KnightBus. If it is already allowed, quit KnightBus completely and restart its helper from the app.".into(),
+                core::Error::Deadline => "Sharing timed out. Refresh local devices before trying again.".into(),
+                other => failure(other),
+            });
+        }
         let mut link = state.lock().map_err(|_| failure(core::Error::Internal))?;
         if let Some(last) = link.last {
             std::thread::sleep(CONTROL_POLL_INTERVAL.saturating_sub(last.elapsed()));

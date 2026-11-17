@@ -284,6 +284,9 @@ impl Managed for MacExporter {
             .into_iter()
             .find(|d| d.registry_id == *registry)
             .ok_or(Error::NotFound)?;
+        if *storage_unmounted {
+            native::request_storage_access(id.registry_id)?;
+        }
         // Capture generations advance even when the physical device was not replugged.
         let generation = self
             .generation
