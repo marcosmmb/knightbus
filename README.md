@@ -1,51 +1,76 @@
-# KnightBus
+<p align="center">
+  <img src="applications/knightbus-desktop/frontend/icon.svg" alt="KnightBus icon" width="112" height="112">
+</p>
 
-KnightBus forwards USB devices between computers using USB/IP 1.1.1. The
-**exporter** owns the physical device; the **importer** presents it to the remote
-computer's USB stack so applications can use its normal device drivers.
+<h1 align="center">KnightBus</h1>
 
-The Rust implementation puts protocol handling, resource limits and device
-lifecycle in shared crates. OS adapters supply native USB access.
+<p align="center">Share USB devices between your computers.</p>
 
-## Supported path
+<p align="center">
+  <a href="https://github.com/marcosmmb/knightbus/actions/workflows/ci.yml?query=branch%3Amain">
+    <img src="https://github.com/marcosmmb/knightbus/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status on main">
+  </a>
+</p>
 
-The current adapters are a **macOS exporter** and a **Windows x64 importer**.
-Windows uses the bundled, Microsoft-signed usbip-win2 UDE driver. Other OS directions are not implemented.
+KnightBus lets one computer use a USB device plugged into another over your
+network. Pair your computers, share a device, and connect to it from the other
+computer. Your apps use their normal USB drivers.
 
-Control, bulk, interrupt and isochronous transfers are implemented, within the Windows adapter’s USB 1.x, USB 2 and SuperSpeed limits. Device support also depends
-on the adapter's descriptor and feature limits; see the
-[architecture](docs/architecture.md#native-adapters).
+## Features
 
-The standalone programs support mutually authenticated TLS 1.3. Peers must be
-explicitly paired, and the exporter grants device access separately; see
-[pairing and sharing](docs/architecture.md#pairing-and-sharing). Raw USB/IP
-is an explicit loopback compatibility option requiring an authenticated tunnel.
+- **One desktop app** to share local devices and connect to remote ones.
+- **Nearby discovery and PIN pairing** to connect computers on your LAN.
+- **Encrypted connections** with access granted separately for each device.
+- **USB 1.x, USB 2 and SuperSpeed support**, including isochronous transfers.
+- **Connection controls** to see active devices, disconnect, or stop sharing.
+- **CLI and embedding APIs** for automation and use in other applications.
 
-## Build
+## Platform support
 
-Install Rust using the pinned [toolchain](rust-toolchain.toml), then run:
+KnightBus is in early development. Current platform support:
+
+| OS | Share local devices (export) | Use remote devices (import) |
+| --- | :---: | :---: |
+| macOS | ✅ | ❌ |
+| Windows 11 x64 | ❌ | ✅ |
+| Linux | ❌ | ❌ |
+| Android | ❌ | ❌ |
+
+✅ Supported · ❌ Not implemented yet
+
+Windows packages include the Microsoft-signed **usbip-win2** driver.
+Device compatibility depends on USB features
+and OS permissions; see the [adapter limits](docs/architecture.md#native-adapters).
+
+## Getting started
+
+See the [Windows installation and pairing guide](tools/install/INSTALL.md) for
+setup and connecting to a Mac. For the daemon and CLI, see
+[standalone operation](docs/standalone.md).
+
+To build from source, install [Rust](https://rustup.rs/) and your platform's C/C++
+build tools. The repository pins its Rust toolchain. With GNU Make available:
 
 ```sh
-cargo build --workspace --release --locked
+make build                 # Build the daemon, CLI and libraries
+make cli ARGS="local-list" # List local USB devices on macOS
+make desktop               # Build and open the desktop app
 ```
 
-Native adapters run on their respective OS. The Windows driver is an unmodified upstream binary;
-see [Contributing](CONTRIBUTING.md#windows-driver) for packaging.
-On macOS, list connected USB devices without capturing them:
+The desktop app needs native webview dependencies. See
+[Contributing](CONTRIBUTING.md#build-and-check) for prerequisites and test commands.
+Without Make, build the workspace with `cargo build --workspace --locked`.
 
-```sh
-target/release/knightbus local-list
-```
+## Development
 
-The standalone daemon, unified CLI and embedded C library use the same native
-forwarding implementation. See [standalone operation](docs/standalone.md) for
-pairing, sharing, native attachment, diagnostics and platform prerequisites.
+The Rust core handles USB/IP, device lifecycles and resource limits. OS adapters
+handle native USB access. The desktop app, CLI and C API use the same core.
 
-The optional [Desktop Manager](tools/install/INSTALL.md) provides pairing, device
-permissions, attachment and session diagnostics through the same daemon.
+- [Contributing](CONTRIBUTING.md): build, test and add an OS adapter; `make help` lists shortcuts.
+- [Architecture](docs/architecture.md): how the components fit together.
+- [Control API](docs/control-api.md): manage devices and sessions from your own code.
 
-## Documentation
+## License
 
-- [Architecture](docs/architecture.md): data flow, crate boundaries and native adapters.
-- [Contributing](CONTRIBUTING.md): checks, implementation rules and adding an OS adapter.
-- [MIT license](LICENSE). Third-party dependencies retain their own licenses.
+KnightBus is licensed under [MIT](LICENSE). The bundled Windows driver and other
+third-party components retain their own licenses and notices.
